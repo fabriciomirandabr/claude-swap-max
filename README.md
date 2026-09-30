@@ -2,7 +2,7 @@
 
 **Unlimited Claude Code.** Pool all your Max accounts into one terminal, switch at the limit automatically, and keep everything you see and touch on ONE account.
 
-- **One Remote Control, four accounts.** Sessions, mobile push notifications and Artifacts always belong to your main account — inference bills whichever account has room. No more "signed-in account or organization changed".
+- **One Remote Control, unlimited accounts.** Add as many subscriptions as you want: sessions, mobile push notifications and Artifacts always belong to your main account, and inference bills whichever account has room. No more "signed-in account or organization changed".
 - **Per-account limits.** `cswap threshold 1 95` keeps the account you use on Desktop and mobile from being drained by the rotation; mark one as standby to hold it in reserve.
 - **Balanced pacing.** The `balance` strategy spreads weekly usage across accounts so none burns ahead of its reset.
 - **Desktop notifications** when the auto loop switches, quarantines an account, or runs out of room.
