@@ -17,7 +17,6 @@ cswap config set autoswitch.notify true
 
 Agent shells inherit the proxy variables; if a tool complains about the local CA, add `set -e HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy NODE_EXTRA_CA_CERTS` to your fish config (or the `unset` equivalent in `~/.zshenv`). Claude Code keeps the pin, the agents don't see it.
 
-Built on the pin from [PR #210](https://github.com/realiti4/claude-swap/pull/210) and [`cswap-pin`](https://github.com/codeslake/cswap-pin), plus [#318](https://github.com/realiti4/claude-swap/pull/318), [#385](https://github.com/realiti4/claude-swap/pull/385) and [#285](https://github.com/realiti4/claude-swap/pull/285).
 
 ---
 
