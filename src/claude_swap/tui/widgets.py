@@ -189,6 +189,26 @@ def pin_is_broken(acc: AccountSnapshot) -> bool:
     )
 
 
+def _policy_badges(acc: AccountSnapshot, gap: str) -> list[str]:
+    """Badge strings for the account's per-account policy, in display order.
+
+    Returns an empty list for an account carrying no policy, which is every
+    account in a store that has never used the feature — that is what keeps
+    those rows byte-identical to their pre-policy render.
+
+    ``gap`` is the leading separator each render path already uses for its own
+    badges (three spaces on the card, two on the minimized row).
+    """
+    badges: list[str] = []
+    if acc.policy.standby:
+        badges.append(f"{gap}(standby)")
+    if acc.policy.threshold is not None:
+        # ``:g`` so 75.0 reads as "75%" and 82.5 keeps its fraction — the store
+        # accepts one decimal place and the row shows back exactly what was set.
+        badges.append(f"{gap}th {acc.policy.threshold:g}%")
+    return badges
+
+
 def account_card_text(
     acc: AccountSnapshot,
     width: int,
@@ -232,6 +252,8 @@ def account_card_text(
             text.append(" (not applying)", style=f"bold {palette.sev_crit}")
     if acc.disabled:
         text.append("   (disabled)", style=palette.muted)
+    for badge in _policy_badges(acc, "   "):
+        text.append(badge, style=palette.muted)
     age = data.format_age(acc.usage.age_s)
     if age:
         text.append(f"   {age}", style=palette.muted)
@@ -319,6 +341,8 @@ def mini_account_text(
             text.append(" (not applying)", style=f"bold {palette.sev_crit}")
     if acc.disabled:
         text.append("  (disabled)", style=palette.muted)
+    for badge in _policy_badges(acc, "  "):
+        text.append(badge, style=palette.muted)
     text.append("   ")
 
     sentinel = acc.usage.sentinel
