@@ -1,4 +1,20 @@
-# claude-swap
+# claude-swap-max
+
+> Fork of [realiti4/claude-swap](https://github.com/realiti4/claude-swap) that ships the account **pin** today: every Max account feeds inference, while Remote Control, mobile push notifications and Artifacts stay on ONE account — no more "signed-in claude.ai account or organization changed" after a swap.
+
+The pin comes from [codeslake's PR #210](https://github.com/realiti4/claude-swap/pull/210) and the [`cswap-pin`](https://github.com/codeslake/cswap-pin) proxy; this fork tracks that branch on `main` so it can be installed with one command until upstream merges it.
+
+```bash
+uv tool install 'claude-swap[pin] @ git+https://github.com/fabriciomirandabr/claude-swap-max@main'
+cswap pin 1        # Remote Control / push / Artifacts -> account 1; inference follows cswap auto
+cswap pin          # show the pin
+cswap pin --clear  # remove it
+```
+
+Agent shells inherit the proxy variables; if a tool complains about the local CA, add `set -e HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy NODE_EXTRA_CA_CERTS` to your fish config (or the `unset` equivalent in `~/.zshenv`). Claude Code keeps the pin, the agents don't see it.
+
+---
+
 
 Multi-account switcher for Claude Code. Easily switch between multiple Claude accounts without logging out, or let it switch for you before you hit a rate limit. Track usage for every account in a live dashboard, and run accounts in parallel. Works with both the Claude Code CLI and the VS Code extension.
 
