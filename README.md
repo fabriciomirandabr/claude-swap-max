@@ -13,6 +13,8 @@ cswap pin          # show the pin
 cswap pin --clear  # remove it
 ```
 
+Also carried on `main`, from upstream PRs not merged yet: [#318](https://github.com/realiti4/claude-swap/pull/318) per-account thresholds and standby accounts (`cswap threshold 1 95`), [#385](https://github.com/realiti4/claude-swap/pull/385) the `balance` strategy that paces weekly usage across accounts (`cswap config set autoswitch.strategy balance`), and [#285](https://github.com/realiti4/claude-swap/pull/285) desktop notifications for the headless `cswap auto` loop (`cswap config set autoswitch.notify true`).
+
 Agent shells inherit the proxy variables; if a tool complains about the local CA, add `set -e HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy NODE_EXTRA_CA_CERTS` to your fish config (or the `unset` equivalent in `~/.zshenv`). Claude Code keeps the pin, the agents don't see it.
 
 ---
