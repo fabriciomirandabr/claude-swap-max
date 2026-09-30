@@ -1,21 +1,23 @@
-# claude-swap MAX — Unlimited Claude
+# Claude Swap Max
 
-**Pool every Max account into one Claude Code. Auto-switch at the limit. Remote Control, push notifications and Artifacts always on your main account. Zero friction.**
+**Unlimited Claude Code.** Pool all your Max accounts into one terminal, switch at the limit automatically, and keep everything you see and touch on ONE account.
 
-> Fork of [realiti4/claude-swap](https://github.com/realiti4/claude-swap) that ships the account **pin** today: every Max account feeds inference, while Remote Control, mobile push notifications and Artifacts stay on ONE account — no more "signed-in claude.ai account or organization changed" after a swap.
-
-The pin comes from [codeslake's PR #210](https://github.com/realiti4/claude-swap/pull/210) and the [`cswap-pin`](https://github.com/codeslake/cswap-pin) proxy; this fork tracks that branch on `main` so it can be installed with one command until upstream merges it.
+- **One Remote Control, four accounts.** Sessions, mobile push notifications and Artifacts always belong to your main account — inference bills whichever account has room. No more "signed-in account or organization changed".
+- **Per-account limits.** `cswap threshold 1 95` keeps the account you use on Desktop and mobile from being drained by the rotation; mark one as standby to hold it in reserve.
+- **Balanced pacing.** The `balance` strategy spreads weekly usage across accounts so none burns ahead of its reset.
+- **Desktop notifications** when the auto loop switches, quarantines an account, or runs out of room.
 
 ```bash
 uv tool install 'claude-swap[pin] @ git+https://github.com/fabriciomirandabr/claude-swap-max@main'
-cswap pin 1        # Remote Control / push / Artifacts -> account 1; inference follows cswap auto
-cswap pin          # show the pin
-cswap pin --clear  # remove it
+cswap pin 1                                        # Remote Control, push and Artifacts on account 1
+cswap threshold 1 95                               # switch away from account 1 at 95%
+cswap config set autoswitch.strategy balance
+cswap config set autoswitch.notify true
 ```
 
-Also carried on `main`, from upstream PRs not merged yet: [#318](https://github.com/realiti4/claude-swap/pull/318) per-account thresholds and standby accounts (`cswap threshold 1 95`), [#385](https://github.com/realiti4/claude-swap/pull/385) the `balance` strategy that paces weekly usage across accounts (`cswap config set autoswitch.strategy balance`), and [#285](https://github.com/realiti4/claude-swap/pull/285) desktop notifications for the headless `cswap auto` loop (`cswap config set autoswitch.notify true`).
-
 Agent shells inherit the proxy variables; if a tool complains about the local CA, add `set -e HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy NODE_EXTRA_CA_CERTS` to your fish config (or the `unset` equivalent in `~/.zshenv`). Claude Code keeps the pin, the agents don't see it.
+
+Built on the pin from [PR #210](https://github.com/realiti4/claude-swap/pull/210) and [`cswap-pin`](https://github.com/codeslake/cswap-pin), plus [#318](https://github.com/realiti4/claude-swap/pull/318), [#385](https://github.com/realiti4/claude-swap/pull/385) and [#285](https://github.com/realiti4/claude-swap/pull/285).
 
 ---
 
