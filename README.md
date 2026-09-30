@@ -1,4 +1,6 @@
-# claude-swap-max
+# claude-swap MAX — Unlimited Claude
+
+**Pool every Max account into one Claude Code. Auto-switch at the limit. Remote Control, push notifications and Artifacts always on your main account. Zero friction.**
 
 > Fork of [realiti4/claude-swap](https://github.com/realiti4/claude-swap) that ships the account **pin** today: every Max account feeds inference, while Remote Control, mobile push notifications and Artifacts stay on ONE account — no more "signed-in claude.ai account or organization changed" after a swap.
 
