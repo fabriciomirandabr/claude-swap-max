@@ -1,0 +1,93 @@
+[project]
+name = "cswap-pin"
+version = "0.1.306.1"
+description = "Keep Claude Code's Remote Control and Artifacts on one account while inference follows cswap's account swap"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Junyong Lee" }]
+keywords = ["claude", "claude-code", "claude-swap", "cswap", "proxy", "remote-control"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Utilities",
+]
+
+# claude-swap is a PEER, not a dependency. cswap-pin is loaded BY claude-swap
+# (via `claude-swap[pin]`), so depending on it here would make the pair
+# circular and let `pip install cswap-pin` drag in the whole switcher for
+# someone who already has it. The import surface it needs is small and
+# declared in _host.py.
+# 42.0, NOT 41.0. `_certs_consistent` reads `not_valid_after_utc`, which landed
+# in 42.0 — on 41.x the attribute does not exist, the AttributeError is caught,
+# and the function returns False FOREVER. Every launch then regenerates the CA
+# and the daemon serves a leaf signed by a CA the session was never told about.
+# Measured on a clean 41.0.7 venv: `not_valid_after_utc` MISSING, CA unstable
+# across two ensure_ca calls, and the handshake fails with
+# CERTIFICATE_VERIFY_FAILED. 42.0.0 is stable. `pip install cswap-pin` resolves
+# whatever satisfies the floor, so a constrained environment can land on 41.x
+# and get a pin that breaks every request, silently.
+dependencies = ["cryptography>=42.0"]
+
+[dependency-groups]
+# The suite runs on 4 xdist workers by default (see `addopts` below), so
+# pytest-xdist is REQUIRED, not optional: without it pytest refuses the `-n`
+# in addopts and the suite does not run at all. Measured on a venv with plain
+# pytest: "error: unrecognized arguments: -n".
+#
+# claude-swap is DELIBERATELY ABSENT, though the tests import it. Listing it
+# here made `uv run` unresolvable and took the publish workflow down with it:
+#
+#   Because the requested Python version (>=3.10) does not satisfy
+#   Python>=3.12 and all versions of claude-swap depend on Python>=3.12 ...
+#   your project's requirements are unsatisfiable.
+#
+# This package supports 3.10+; the host requires 3.12+. A dev group is
+# resolved against the FULL `requires-python` range, so naming the host here
+# would force this package's floor up to the host's — for a peer it does not
+# even depend on. The workflow installs it with `--with claude-swap`
+# instead, which resolves against the interpreter actually running.
+dev = ["pytest", "pytest-xdist"]
+
+[project.urls]
+Homepage = "https://github.com/codeslake/cswap-pin"
+Repository = "https://github.com/codeslake/cswap-pin"
+Issues = "https://github.com/codeslake/cswap-pin/issues"
+"Upstream discussion" = "https://github.com/realiti4/claude-swap/issues/198"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cswap_pin"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# PARALLEL BY DEFAULT. 12.2s -> ~5.0s on 4 workers, measured; 8 and 12 workers
+# were no faster, because the floor is the single longest test (the real
+# spawned-successor handover, 3.1s) and no number of workers splits that.
+#
+# SAFE TO SPLIT, checked rather than assumed. Every listener in this suite
+# binds port 0, so two workers cannot collide on a port; the orphan sweep is
+# scoped to a certdir and every case has its own tmp_path; and the conftest
+# redirects HOME, CLAUDE_CONFIG_DIR and XDG_DATA_HOME per case, so a worker
+# cannot see another's config, store or daemon state.
+#
+# Override with `-p no:xdist` or `-n 0` when a failure needs a serial repro —
+# xdist gives no live output and truncates tracebacks it cannot attribute.
+addopts = "-n 4"
+markers = [
+    # Needs a claude-swap whose seam is not released yet. The publish gate
+    # installs the RELEASED host — that is the world a `pip install
+    # cswap-pin` user is in — so a test of an unreleased seam would fail
+    # there for a reason that is not a defect. Deselected by marker rather
+    # than skipped inside the test, so the exclusion is a visible `-m`
+    # expression in the workflow instead of a silent skip nobody reads.
+    "needs_host_seam: requires an unreleased claude_swap seam",
+]

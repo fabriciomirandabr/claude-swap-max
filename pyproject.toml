@@ -53,7 +53,7 @@ menubar = ["rumps>=0.4.0"]
 # NO `; sys_platform != 'win32'` MARKER (proposed twice): the dev group
 # installs this so the seam test runs on Windows too, and a marker makes that
 # test decorative instead of red.
-pin = ["cswap-pin>=0.1.303"]
+pin = ["cswap-pin>=0.1.306.1"]
 
 [project.urls]
 Homepage = "https://github.com/realiti4/claude-swap"
@@ -91,6 +91,9 @@ dev = [
     "pytest-xdist>=3.5",
     "claude-swap[pin]",
 ]
+
+[tool.uv.sources]
+cswap-pin = { path = "vendor/cswap-pin" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

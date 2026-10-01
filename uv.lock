@@ -115,7 +115,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cswap-pin", marker = "extra == 'pin'", specifier = ">=0.1.303" },
+    { name = "cswap-pin", marker = "extra == 'pin'", directory = "vendor/cswap-pin" },
     { name = "keyring", marker = "sys_platform == 'win32'", specifier = ">=25.0.0" },
     { name = "rumps", marker = "extra == 'menubar'", specifier = ">=0.4.0" },
     { name = "textual", specifier = ">=8.2.8,<9" },
@@ -192,14 +192,19 @@ wheels = [
 
 [[package]]
 name = "cswap-pin"
-version = "0.1.303"
-source = { registry = "https://pypi.org/simple" }
+version = "0.1.306.1"
+source = { directory = "vendor/cswap-pin" }
 dependencies = [
     { name = "cryptography" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/21/39/71c2799cb4f932bc12e2a3d820e34131c4bce8294a2038f9f79fa88a5a7e/cswap_pin-0.1.303.tar.gz", hash = "sha256:4bc24450d67d5f18c44da7183491905efc53b776857ac02a137f76b991aea72b", size = 1045686, upload-time = "2026-09-29T02:20:34.689Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/82/f0/61b63a5f76c7ef3f7b9e4c4a65ed71200b0d2ed74a888a7323293a2f6346/cswap_pin-0.1.303-py3-none-any.whl", hash = "sha256:0030b6ba58fabd8f1159db0fab1dfa0b37996d380643037d1c708837ce400a44", size = 393538, upload-time = "2026-09-29T02:20:32.696Z" },
+
+[package.metadata]
+requires-dist = [{ name = "cryptography", specifier = ">=42.0" }]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest" },
+    { name = "pytest-xdist" },
 ]
 
 [[package]]
@@ -261,7 +266,7 @@ dependencies = [
     { name = "jaraco-classes" },
     { name = "jaraco-context" },
     { name = "jaraco-functools" },
-    { name = "pywin32-ctypes", marker = "sys_platform == 'win32'" },
+    { name = "pywin32-ctypes" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/43/4b/674af6ef2f97d56f0ab5153bf0bfa28ccb6c3ed4d1babf4305449668807b/keyring-25.7.0.tar.gz", hash = "sha256:fe01bd85eb3f8fb3dd0405defdeac9a5b4f6f0439edbb3149577f244a2e8245b", size = 63516, upload-time = "2025-11-16T16:26:09.482Z" }
 wheels = [

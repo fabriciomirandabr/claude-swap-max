@@ -1,0 +1,208 @@
+name: Publish to PyPI
+
+# Trusted publishing: PyPI accepts the upload because GitHub vouches for this
+# workflow via OIDC, so there is no API token anywhere — not in the repo, not
+# in a secret, not on a laptop. A leaked token is the failure this avoids.
+#
+# Fires on a release tag rather than on push, so publishing is an act someone
+# takes deliberately. A version cannot be re-uploaded once it exists, which
+# makes an accidental publish permanent.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:  # first release, before any tag convention exists
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Without this a hung step burns the full 6h GitHub cap and the run reads as
+    # "still going" rather than "stuck" — so nothing reports a failure at all.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      # NOTHING RAN THE TESTS BEFORE AN UPLOAD. This job was checkout, build,
+      # import-smoke, upload — and the smoke proves the package IMPORTS
+      # without claude-swap, which says nothing about whether it still works.
+      # Three releases went out on the strength of a developer's local run,
+      # with no machine anywhere checking. A version cannot be un-uploaded, so
+      # the one gate that matters has to be the one before the upload.
+      #
+      # In the BUILD job deliberately: `publish` needs `build`, so a failure
+      # here means the publish job never starts and the tag produces no
+      # release at all.
+      # ci.yml runs this same command on every push and on both platforms. It
+      # is duplicated rather than shared because a `workflow_call` that fails to
+      # load would take the release with it, and "no release, no error anyone
+      # reads" is a worse failure than two copies of eight lines.
+      # THE CI WORKFLOW ON THIS SAME COMMIT MUST HAVE PASSED. This job runs
+      # the suite once, single-process; ci.yml runs it on every push with
+      # workers and on macOS too. They are different runs and can disagree --
+      # a commit went out with its CI red on one platform while this suite
+      # was green -- and a release cannot be un-uploaded. Wait for CI to
+      # settle (the tag lands seconds after the push that started it), then
+      # refuse anything but success. No CI run for the sha is a refusal too.
+      #
+      # `all(...=="success")`, GUARDED ON A NON-ZERO COUNT, NOT `join(",")`. A
+      # commit routinely gets more than one CI run (once on the branch, once
+      # again on main after landing), and `map(.conclusion)|join(",")` turned
+      # two greens into the string "success,success", which matches no case
+      # arm but `*)`. Measured on 3a90985 (v0.1.254): "REFUSED: CI concluded
+      # 'success,success' ... nothing is uploaded" — publish skipped, the tag
+      # left pointing at a release PyPI never received, while 764a44d
+      # (v0.1.253, one CI run) went out clean. `all` alone is not enough: jq's
+      # `all` over an empty array is vacuously true, which would read "no CI
+      # ran at all" as green — so the emptiness is asserted explicitly
+      # (`length>0`) rather than trusted to the elif chain alone.
+      - name: CI on this commit must be green
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          for i in $(seq 1 60); do
+            v=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow CI --commit "$GITHUB_SHA" \
+                  --json status,conclusion --jq 'if length==0 then "none" elif any(.[]; .status!="completed") then "pending" elif (length>0 and all(.[]; .conclusion=="success")) then "success" else (map(.conclusion)|join(",")) end')
+            case "$v" in
+              success) echo "CI green on $GITHUB_SHA"; exit 0 ;;
+              pending) echo "CI still running on $GITHUB_SHA ($i/60) — waiting"; sleep 20 ;;
+              none)    [ "$i" -lt 6 ] && { echo "no CI run yet for $GITHUB_SHA — waiting"; sleep 20; } \
+                       || { echo "REFUSED: no CI run for $GITHUB_SHA"; exit 1; } ;;
+              *)       echo "REFUSED: CI concluded '$v' on $GITHUB_SHA — nothing is uploaded"; exit 1 ;;
+            esac
+          done
+          echo "REFUSED: CI did not settle in 20 minutes"; exit 1
+      - name: The suite must pass before anything is uploaded
+        run: |
+          # HOME and XDG_DATA_HOME redirected: the suite drives real cert
+          # dirs and daemon state, and a runner's real HOME is the one place
+          # a test must never write.
+          #
+          # `--with claude-swap` because the suite imports the HOST. cswap-pin
+          # is a peer, not a dependency (see pyproject), so nothing installs
+          # it for us — and without it collection dies with HostMissing, which
+          # is precisely why no CI had ever run these tests.
+          #
+          # THE RELEASED HOST, deliberately. Testing against a developer's
+          # checkout would gate on a seam users cannot install yet; testing
+          # against the release gates on what a `pip install cswap-pin` world
+          # actually looks like. The cost is that tests of an UNRELEASED seam
+          # fail here — those are marked `needs_host_seam` and deselected, not
+          # silently skipped, so the exclusion is visible in the log.
+          #
+          # `--with pytest-xdist` is NOT optional: pyproject's addopts carries
+          # `-n 4`, and a pytest without xdist refuses the flag outright
+          # ("error: unrecognized arguments: -n") rather than ignoring it, so
+          # the suite would not run at all. Measured on a clean venv.
+          # ONE PROCESS, EVERY PLATFORM, AND ON THIS WORKFLOW ONLY.
+          #
+          # It began as a macOS carve-out: three runs there ended in
+          # `INTERNALERROR> BrokenPipeError` from xdist's controller AFTER every
+          # test had passed — a worker gone at teardown, naming no test. It does
+          # not reproduce on real macOS hardware: measured at this commit and at
+          # the last commit CI passed, single-process and with `-n 4`, 116
+          # passed every time. Four workers on a runner with far fewer cores is
+          # the variable.
+          #
+          # THEN IT HAPPENED ON LINUX, HERE, AND COST A RELEASE. 0.1.148's
+          # publish logged `120 passed, 6 skipped in 25.19s` and then
+          # `INTERNALERROR> OSError: cannot send (already closed?)`, exit 3.
+          # Nothing was uploaded. PyPI's latest stayed 0.1.147 while the repo,
+          # the tag and the green test summary all said otherwise, and the
+          # version that did not ship was itself an observability fix. One in
+          # fifteen publishes, and the failure is invisible in exactly the way
+          # that matters: the log reads as a passing suite.
+          #
+          # So the release gate does not run workers at all. `-n 0` distributes
+          # nothing and deselects nothing, so coverage is unchanged, and a test
+          # that really does take a worker down becomes a named failure instead
+          # of a silent one. It costs about twenty seconds.
+          #
+          # ci.yml keeps `-n 4` on Linux deliberately: a flake there is red,
+          # visible, and one click from a re-run. Here it is a version that
+          # looks released and is not.
+          WORKERS=0
+          S="$(mktemp -d)"
+          HOME="$S" XDG_DATA_HOME="$S/.local/share" \
+            uv run --with pytest --with pytest-xdist --with cryptography \
+            --with claude-swap \
+            python -m pytest tests/ -q -p no:randomly \
+            -n "$WORKERS" \
+            -m "not needs_host_seam"
+      - run: uv build
+      # The wheel is what users install; a build that produces an importable
+      # package but a broken one still uploads cleanly. Import it from the
+      # built artifact, not from the checkout, so this tests what ships.
+      - name: The built wheel must import without claude-swap
+        # `uv venv` + `uv pip`, not stdlib venv + pip. Same empty environment,
+        # same wheel, same assertion — but `python3 -m venv` bootstraps pip by
+        # copying it in (1.70s measured, against 0.01s for `uv venv`), and the
+        # whole step was 5.2s of a 29s job for one import.
+        run: |
+          uv venv /tmp/check
+          # `--python`, not VIRTUAL_ENV=. This step runs in a repo the earlier
+          # `uv run` may have materialised a .venv for, and `uv pip` resolves
+          # its target by discovery when the env var merely hints at one.
+          # Naming the interpreter is immune to that ordering.
+          uv pip install --python /tmp/check/bin/python dist/*.whl
+          /tmp/check/bin/python -c '
+          import cswap_pin
+          assert cswap_pin.host_available() is False, "host_available lied with no host installed"
+          print("ok", cswap_pin.__version__)'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: pypi
+    permissions:
+      id-token: write  # mint the OIDC token PyPI verifies; nothing else needed
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      # Trusted publishing needs a publisher registered on PyPI's side, and it
+      # is NOT registered for this project: both 0.1.1 and 0.1.2 failed here
+      # with `invalid-publisher` while the release itself went out by hand.
+      # A workflow that fails on every release trains people to ignore it, and
+      # the manual fallback leaves no record of what was uploaded.
+      #
+      # So: OIDC when the publisher exists, an API token when it does not, and
+      # a loud failure when NEITHER is available — rather than the silent
+      # divergence where the tag says released and PyPI says otherwise.
+      - name: Publish via trusted publishing
+        id: oidc
+        continue-on-error: true
+        uses: pypa/gh-action-pypi-publish@release/v1
+      # `secrets` is not available in an `if:` expression, so the presence of
+      # the token is hoisted into a job-level output first. Referencing it
+      # directly makes the condition silently false and the step never runs.
+      - name: Note whether a token is configured
+        id: tok
+        if: steps.oidc.outcome == 'failure'
+        env:
+          TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then echo "have=true" >> "$GITHUB_OUTPUT"
+          else echo "have=false" >> "$GITHUB_OUTPUT"; fi
+      - name: Publish with an API token
+        if: steps.oidc.outcome == 'failure' && steps.tok.outputs.have == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+      - name: Fail if nothing published
+        if: steps.oidc.outcome == 'failure' && steps.tok.outputs.have != 'true'
+        run: |
+          echo "::error::Trusted publishing was refused (invalid-publisher) and"
+          echo "::error::no PYPI_API_TOKEN secret is set, so NOTHING was uploaded."
+          echo "::error::Register the publisher at"
+          echo "::error::https://pypi.org/manage/project/cswap-pin/settings/publishing/"
+          echo "::error::  owner: codeslake   repo: cswap-pin"
+          echo "::error::  workflow: publish.yml   environment: pypi"
+          echo "::error::or add a PYPI_API_TOKEN repository secret."
+          exit 1

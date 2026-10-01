@@ -1,0 +1,101 @@
+name: CI
+
+# THE GATE THAT COVERS THE PATH PEOPLE PUSH ON. Until this existed the repo had
+# exactly one workflow, publish.yml, and its only trigger was `push: tags`. So
+# nothing broken could SHIP — the release job runs the suite and publish needs
+# build — but `main` could sit red between releases with nobody looking, and
+# every untagged commit was unverified by construction. Measured on 2026-08-06:
+# ba01b99 changed src/cswap_pin/proxy.py and had never been through the suite,
+# because it carried no tag.
+#
+# NOT FOLDED INTO publish.yml VIA workflow_call. The release gate must not
+# depend on another workflow resolving: a `workflow_call` that fails to load
+# takes the release with it, and the failure mode is "no release, no error
+# anyone reads". The eight lines below are duplicated from publish.yml
+# deliberately, and that file names this one in return.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  suite:
+    # BOTH PLATFORMS, and macOS is the point rather than the bonus. The pin has
+    # Darwin-only branches that Linux never executes — `_holder_owns` falls back
+    # to `ps` because macs have no /proc, `_arm_parent_death_signal` returns
+    # early off Linux, and the SO_ACCEPTCONN probe answers on Linux and raises
+    # errno 42 on Darwin. Those were established by hand-measurement on a work
+    # Mac; no suite run had ever executed on the platform they describe.
+    #
+    # Two cases guard `sys.platform != "linux"` and SKIP here, so the macOS run
+    # is slightly smaller, not larger. That is expected and is not a reason to
+    # drop the job: the value is exercising the paths a mac actually takes.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    # A hung step otherwise burns the full 6h GitHub cap and reads as "still
+    # going" rather than "stuck", so nothing reports a failure at all.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      # THE LOCKFILE IS DERIVED AND NOTHING WAS CHECKING IT. Bumping the
+      # version in pyproject.toml changes `uv.lock`, and the suite never opens
+      # it -- `uv run` resolves on its own -- so a release could ship with a
+      # lock naming the previous version and every job stayed green. Measured:
+      # two version bumps landed with the lock left behind, and it surfaced as
+      # an unexplained modified file in the working tree rather than as a
+      # failure anyone was told about.
+      - name: The lockfile matches pyproject
+        run: uv lock --check
+
+      - name: Suite
+        run: |
+          # Kept in step with publish.yml's copy — see the header. HOME and
+          # XDG_DATA_HOME redirected because the suite drives real cert dirs and
+          # daemon state, and a runner's real HOME is the one place a test must
+          # never write. `--with claude-swap` because the suite imports the HOST
+          # and cswap-pin is a peer, not a dependency. `--with pytest-xdist` is
+          # not optional: pyproject's addopts carries `-n 4`, and a pytest
+          # without xdist refuses the flag outright rather than ignoring it.
+          # ONE PROCESS ON macOS. Three runs there ended in
+          # `INTERNALERROR> BrokenPipeError` from xdist's controller AFTER every
+          # test had passed — a worker gone at teardown, naming no test. It does
+          # not reproduce on real macOS hardware: measured at this commit and at
+          # the last commit CI passed, single-process and with `-n 4`, 116
+          # passed every time. Four workers on a runner with far fewer cores is
+          # the variable. `-n 0` distributes nothing and deselects nothing, so
+          # coverage is unchanged — and a test that really does take a worker
+          # down becomes a named failure instead of a silent one.
+          # ONE PROCESS EVERYWHERE NOW, for the reason the macOS line above
+          # already records. The linux job started killing a worker with no
+          # traceback and no named test, and the case it was attributed to
+          # MOVED between runs -- four different classes across one evening.
+          # Bisected: the same tests against the PREVIOUS release's source
+          # crash too, on a different case, so the source is not involved and
+          # the trigger is the distribution. Adding four unrelated tests was
+          # enough to change which case paid.
+          #
+          # The mechanism is a leaked daemon thread reaching the REAL
+          # `os._exit` after a case's monkeypatch was restored: the worker
+          # exits instantly, which is why there is never a traceback. Several
+          # cases stub that call, so this is a suite-wide property and not one
+          # case's bug.
+          #
+          # `-n 0` distributes nothing and deselects nothing, so coverage is
+          # unchanged and a case that really does take the process down becomes
+          # a NAMED failure. Restore parallelism when the thread hygiene is
+          # fixed, not before -- a green that depends on which worker got which
+          # test is not a green.
+          WORKERS=0
+          S="$(mktemp -d)"
+          HOME="$S" XDG_DATA_HOME="$S/.local/share" \
+            uv run --with pytest --with pytest-xdist --with cryptography \
+            --with pytest-timeout --with claude-swap \
+            python -m pytest tests/ -v -p no:randomly \
+            -n "$WORKERS" \
+            -m "not needs_host_seam" \
+            --timeout=300 -o faulthandler_timeout=280
