@@ -22,6 +22,7 @@ from claude_swap.json_output import (
     USAGE_RELOGIN_REQUIRED,
 )
 from claude_swap.models import AccountSnapshot
+from claude_swap.oauth import FIVE_HOUR_LABEL
 from claude_swap.switcher import ERROR_NOTES
 from claude_swap.usage_store import STALE_OK_S
 from claude_swap.tui import data
@@ -138,7 +139,7 @@ def usage_rows(
         suffix = f"{reset}  {amounts}" if reset else amounts
         suffix_full = f"{reset_full}  {amounts}" if reset_full else amounts
         rows.append(("$$", float(spend["pct"]), suffix, suffix_full))
-    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+    for key, label in (("five_hour", FIVE_HOUR_LABEL), ("seven_day", "7d")):
         window = last_good.get(key)
         if window:
             reset, reset_full = _reset_parts(window, now)
@@ -214,11 +215,15 @@ def account_card_text(
     width: int,
     *,
     threshold: float | None = None,
+    weekly_threshold: float | None = None,
     now: float | None = None,
     palette: Palette = Palette.DARK,
     cloud_pinned: bool = False,
 ) -> Text:
-    """The full account card: header line + per-window bar rows.
+    """The full account card: header line + per-window bar rows. Each row's
+    tick is the switch line that row is judged against: ``threshold`` on the
+    5h (and spend) rows, ``weekly_threshold`` — when set — on the 7d and
+    per-model rows, which reset weekly.
 
     ``cloud_pinned`` marks the account that owns the claude.ai-side assets
     (Remote Control sessions, Artifacts). It is independent of ``is_active``
@@ -296,6 +301,11 @@ def account_card_text(
         # spend row degrading doesn't cost the 5h/7d rows their clocks
         if suffix_full != suffix and row_overhead + len(suffix_full) <= width:
             suffix = suffix_full
+        row_line = (
+            weekly_threshold
+            if weekly_threshold is not None and label not in ("$$", FIVE_HOUR_LABEL)
+            else threshold
+        )
         text.append("\n    ")
         text.append(
             usage_bar(
@@ -304,7 +314,7 @@ def account_card_text(
                 suffix or None,
                 bar_width,
                 stale=stale,
-                threshold=threshold,
+                threshold=row_line,
                 palette=palette,
             )
         )
@@ -440,7 +450,8 @@ class AccountsPanel(Static):
             if acc.is_active:
                 blocks.append(
                     account_card_text(
-                        acc, width, threshold=app.threshold_pct, now=now,
+                        acc, width, threshold=app.threshold_pct,
+                        weekly_threshold=app.weekly_threshold_pct, now=now,
                         palette=palette, cloud_pinned=pinned,
                     )
                 )

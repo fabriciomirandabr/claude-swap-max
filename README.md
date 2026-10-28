@@ -16,7 +16,7 @@ Claude Swap Max fixes that. Many accounts, one experience: it watches every acco
 - **Balanced weekly pacing.** The `balance` strategy spreads usage across accounts so none burns ahead of its reset.
 - **Desktop notifications** when the auto loop switches, quarantines an account, or runs out of room.
 
-On top of everything upstream [`claude-swap`](https://github.com/realiti4/claude-swap) already does: automatic switching, a live usage dashboard, parallel sessions per account, backup and import.
+On top of everything upstream [`claude-swap`](https://github.com/realiti4/claude-swap) already does: automatic switching, a live usage dashboard, parallel sessions per account, a separate weekly switch line (`--weekly-threshold`), priority tiers (`cswap priority`), backup and import.
 
 ## Install
 

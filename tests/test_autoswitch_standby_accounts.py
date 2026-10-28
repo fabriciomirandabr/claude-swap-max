@@ -435,7 +435,7 @@ class TestFailbackUnderBest:
         outcome, _ = _tick(h, [{"1": _u(20.0), "2": _u(90.0)}])
         assert outcome is TickOutcome.NO_ACTION
         assert _reasons(h) == ["below-threshold"]
-        assert _details(h) == ["20% < 90%"]
+        assert _details(h) == ["5h 20% < 90%"]
         assert _switches(h) == []
 
 
@@ -881,7 +881,7 @@ class TestFailbackSurvivesTheTargetLoop:
             outcome, _ = _tick(h, [self._snapshot()])
         assert outcome is TickOutcome.NO_ACTION
         assert _reasons(h) == ["below-threshold"]
-        assert _details(h) == ["20% < 90%"]
+        assert _details(h) == ["5h 20% < 90%"]
         assert h.active_number() == 1
 
     def test_b_dead_credentials_hold_and_the_quarantine_survives(
@@ -1070,6 +1070,25 @@ class TestTheActiveAccountCountsAsANonStandby:
         premise is false and the trigger must fire exactly as MEU-04 shipped
         it."""
         h = _fleet(temp_home, n=2, strategy="consume-first")
+        _standby(h, 1)
+        t = h.clock.now
+        outcome, _ = _tick(h, [{
+            "1": _u(20.0, seven_day_reset=t + 3_600),
+            "2": _u(10.0, seven_day_reset=t + 36_000),
+        }])
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert _triggers(h) == ["failback"]
+
+
+class TestFailbackUnderPriorityConsumeFirst:
+    """The reserve is the active account, so it must not be offered to the
+    priority ranking as a rival the primary has to beat: a primary on the same
+    tier that resets later than the reserve still takes the work back."""
+
+    def test_the_primary_returns_though_the_reserve_resets_sooner(self, temp_home):
+        h = _fleet(temp_home, n=2, strategy="priority-consume-first")
         _standby(h, 1)
         t = h.clock.now
         outcome, _ = _tick(h, [{

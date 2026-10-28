@@ -42,20 +42,19 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import unicodedata
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
-from claude_swap import macos_keychain
+from claude_swap import macos_keychain, spawn
 from claude_swap.claude_locks import proper_lockfile
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
     CredentialReadError,
     SessionError,
 )
-from claude_swap.fsutil import replace_with_retry
+from claude_swap.fsutil import atomic_write_text
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
 from claude_swap.paths import get_default_global_config_path
@@ -948,9 +947,7 @@ class SessionManager:
             os.chmod(session_dir, 0o700)
 
         creds_path = session_dir / ".credentials.json"
-        creds_path.write_text(creds, encoding="utf-8")
-        if sys.platform != "win32":
-            os.chmod(creds_path, 0o600)
+        atomic_write_text(creds_path, creds)
 
         # Merge the identity seed into any existing .claude.json so a
         # re-bootstrap preserves the profile's own projects/history. The
@@ -966,9 +963,7 @@ class SessionManager:
         existing["oauthAccount"] = oauth_account
         existing["hasCompletedOnboarding"] = True
         existing.setdefault("theme", config_data.get("theme") or "dark")
-        config_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
-        if sys.platform != "win32":
-            os.chmod(config_path, 0o600)
+        atomic_write_text(config_path, json.dumps(existing, indent=2))
 
         self._logger.info(
             f"Bootstrapped session profile for account {account_num} at {session_dir}"
@@ -1024,7 +1019,7 @@ class SessionManager:
         # nothing at all the run below still raises, and that is "unknown".
         claude_bin = shutil.which("claude") or "claude"
         try:
-            result = subprocess.run(
+            result = spawn.run(
                 [claude_bin, "auth", "status", "--json"],
                 env=_probe_env(session_dir),
                 capture_output=True,
@@ -1430,7 +1425,11 @@ class SessionManager:
                 return False
             try:
                 self._merge_history_into_source(src, dest)
-            except OSError as e:
+            except (OSError, ValueError) as e:
+                # ValueError covers UnicodeDecodeError: a byte-corrupt
+                # history file is "nothing readable to merge", and losing a
+                # launch to a stray byte in ~/.claude/history.jsonl would
+                # strand every account that has not migrated yet.
                 self._logger.warning(
                     f"Could not merge {dest.name} into {src}: {e}"
                 )
@@ -1471,8 +1470,9 @@ class SessionManager:
         Directories merge file-by-file (transcript filenames are UUIDs, so
         collisions mean identical sessions — first writer wins and the
         duplicate is dropped). ``history.jsonl`` merges by appending lines
-        not already present. ``dest`` is removed once empty; any failure
-        raises OSError and leaves remaining files in place for the next try.
+        not already present. ``dest`` is removed once empty; any failure —
+        an OSError, or a UnicodeDecodeError on a byte-corrupt history file —
+        propagates and leaves remaining files in place for the next try.
         """
         if dest.is_dir():
             _mkdir_private(src)
@@ -1489,9 +1489,10 @@ class SessionManager:
                 shutil.move(str(path), str(target))
             dest.rmdir()
         else:
-            existing: set[str] = set()
+            existing_text = ""
             if src.exists():
-                existing = set(src.read_text(encoding="utf-8").splitlines())
+                existing_text = src.read_text(encoding="utf-8")
+            existing = set(existing_text.splitlines())
             lines = [
                 line
                 for line in dest.read_text(encoding="utf-8").splitlines()
@@ -1501,8 +1502,14 @@ class SessionManager:
                 src.parent.mkdir(parents=True, exist_ok=True)
                 if not src.exists():
                     src.touch(mode=0o600)  # match Claude Code's history mode
+                # A history.jsonl torn by a crashed append ends mid-line, and
+                # appending onto it would weld that tail to the first merged
+                # entry — one line that parses as neither, with no second
+                # copy to recover from once dest is unlinked below.
+                torn = bool(existing_text) and not existing_text.endswith("\n")
+                terminator = "\n" if torn else ""
                 with src.open("a", encoding="utf-8") as f:
-                    f.write("\n".join(lines) + "\n")
+                    f.write(terminator + "\n".join(lines) + "\n")
             dest.unlink()
 
     @staticmethod
@@ -1518,18 +1525,10 @@ class SessionManager:
     def _write_manifest(self, manifest_path: Path, items: list[str]) -> None:
         mode = "symlink" if self.switcher.platform != Platform.WINDOWS else "copy"
         payload = json.dumps({"items": items, "mode": mode}, indent=2)
-        fd, tmp = tempfile.mkstemp(
-            dir=str(manifest_path.parent), prefix=".cswap-shared-", suffix=".tmp"
-        )
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(payload)
-            replace_with_retry(tmp, manifest_path)
+            atomic_write_text(manifest_path, payload)
         except OSError:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+            pass  # best effort: a failed manifest must not fail a launch
 
     @staticmethod
     def _remove_managed(dest: Path) -> None:

@@ -12,7 +12,12 @@ import sys
 from claude_swap import __version__, paths, printer
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import error_envelope
-from claude_swap.models import ACCOUNT_THRESHOLD_MAX, ACCOUNT_THRESHOLD_MIN
+from claude_swap.models import (
+    ACCOUNT_PRIORITY_MAX,
+    ACCOUNT_THRESHOLD_MAX,
+    ACCOUNT_THRESHOLD_MIN,
+    Platform,
+)
 from claude_swap.printer import (
     accent,
     bolded,
@@ -22,7 +27,12 @@ from claude_swap.printer import (
     muted,
     warning,
 )
-from claude_swap.settings import load_ui_settings
+from claude_swap.settings import (
+    AUTOSWITCH_STRATEGIES,
+    load_run_settings,
+    load_ui_settings,
+    load_update_settings,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -331,13 +341,14 @@ Examples:
     parser.add_argument(
         "--share-history",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=None,
         help=(
             "Share conversation history (projects/ and history.jsonl) from "
             "~/.claude into the session profile, so every account sees one "
             "unified history. History the profile already accumulated is "
             "merged into ~/.claude first. --no-share-history restores "
-            "per-account history (the default). Not supported on Windows."
+            "per-account history (the default, unless `cswap config set "
+            "run.shareHistory true`). Not supported on Windows."
         ),
     )
     parser.add_argument(
@@ -369,7 +380,7 @@ Examples:
                 args.account,
                 tail,
                 share=not args.no_share,
-                share_history=args.share_history,
+                share_history=_resolve_share_history(args, switcher),
                 require_session=args.require_session,
             )
             return  # only reachable in tests where exec/exit is mocked
@@ -381,7 +392,7 @@ Examples:
                 slot,
                 tail,
                 share=not args.no_share,
-                share_history=args.share_history,
+                share_history=_resolve_share_history(args, switcher),
                 require_session=args.require_session,
             )
             return  # only reachable in tests
@@ -416,6 +427,26 @@ def _is_refused_root(switcher: ClaudeAccountSwitcher) -> bool:
     if sys.platform == "win32":  # no euid; the guard does not apply
         return False
     return os.geteuid() == 0 and not switcher._is_running_in_container()
+
+
+def _resolve_share_history(args: argparse.Namespace, switcher) -> bool:
+    """The flag wins; otherwise run.shareHistory, which Windows can't honor.
+
+    An explicit --share-history still reaches SessionManager.run and errors
+    there; a setting-derived one just warns and falls back to per-account
+    history. Only called on account-targeting paths, so a bare unmapped run
+    (plain claude) stays silent.
+    """
+    if args.share_history is not None:
+        return args.share_history
+    enabled = load_run_settings(switcher.backup_dir).share_history
+    if enabled and switcher.platform == Platform.WINDOWS:
+        warning(
+            "run.shareHistory is not supported on Windows yet — "
+            "using per-account history."
+        )
+        return False
+    return enabled
 
 
 def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
@@ -870,6 +901,47 @@ def _print_threshold_table(switcher: ClaudeAccountSwitcher) -> None:
         print(f"  Account-{num}  {value:g}%")
 
 
+def _priority_command(argv: list[str]) -> None:
+    """Set, clear, or inspect tiers without enabling the strategy implicitly."""
+    parser = argparse.ArgumentParser(
+        prog="cswap priority",
+        description=(
+            "Set or list account priority tiers for the optional "
+            "priority-consume-first strategy. Higher numbers are used first; "
+            "accounts in the same tier are ordered by soonest weekly reset."
+        ),
+    )
+    parser.add_argument("account", nargs="?", metavar="NUM|EMAIL|ALIAS")
+    parser.add_argument(
+        "priority", nargs="?", metavar="TIER",
+        help=f"Integer from 0 to {ACCOUNT_PRIORITY_MAX} (default 0)",
+    )
+    parser.add_argument("--unset", action="store_true", help="Return to priority 0")
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args(argv)
+    if args.unset and args.priority is not None:
+        parser.error("--unset does not take a TIER argument")
+    if args.unset and args.account is None:
+        parser.error("NUM|EMAIL|ALIAS is required with --unset")
+    if args.account is not None and args.priority is None and not args.unset:
+        parser.error("TIER is required (or pass --unset)")
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        if args.account is None:
+            print(bolded("Account priorities (higher first; default 0):"))
+            for num, policy in switcher.account_policies().items():
+                print(f"  Account-{num}  {switcher.account_email(num)}  {policy.priority}")
+            print(dimmed("Used only by: cswap auto --strategy priority-consume-first"))
+            return
+        switcher.set_account_priority(args.account, None if args.unset else args.priority)
+    except (ValueError, ClaudeSwitchError) as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
 def _auto_command(argv: list[str]) -> None:
     """Handle `cswap auto [--once] [--json] [...]`.
 
@@ -899,8 +971,9 @@ Exit codes with --once:
   3  blocked: wanted to switch but no viable target / all exhausted
 
 Examples:
-  cswap auto                       # foreground loop, switch at 90%% used
+  cswap auto                       # foreground loop, switch at 90% used
   cswap auto --threshold 80        # switch earlier
+  cswap auto --weekly-threshold 97 # let the weekly window run higher before switching
   cswap auto --model Fable         # also switch when the Fable weekly limit is hit
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --notify              # desktop notification on switch/exhaustion
@@ -931,8 +1004,19 @@ Defaults live in settings.json in the backup root; flags override them.
         type=float,
         metavar="PCT",
         help=(
-            "Switch when the active account's binding 5h/7d window reaches "
-            "this utilization (50-99.9; default 90)"
+            "Switch when the active account's 5h window (or any window, "
+            "without a weekly line) reaches this utilization (50-99.9; "
+            "default 90)"
+        ),
+    )
+    parser.add_argument(
+        "--weekly-threshold",
+        type=float,
+        metavar="PCT",
+        help=(
+            "Separate switch line for the 7-day and per-model weekly windows "
+            "(50-99.9; default: the threshold). A flag cannot unset a "
+            "configured value; use 'cswap config unset'"
         ),
     )
     parser.add_argument(
@@ -962,13 +1046,15 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     parser.add_argument(
         "--strategy",
-        choices=("best", "consume-first", "balance"),
+        choices=AUTOSWITCH_STRATEGIES,
         default=None,
         help=(
             "Target selection: 'best' (most quota left; default), "
             "'consume-first' (proactively use the account whose weekly window "
-            "resets soonest), or 'balance' (when switching, pick the account "
-            "furthest behind an even weekly schedule)"
+            "resets soonest), 'balance' (when switching, pick the account "
+            "furthest behind an even weekly schedule), or 'priority-consume-first' "
+            "(highest account priority, then soonest weekly reset; only targets "
+            "below all switch lines)"
         ),
     )
     parser.add_argument(
@@ -993,7 +1079,7 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     args = parser.parse_args(argv)
 
-    from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
+    from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent, pct_label
     from claude_swap.printer import accent, yellowed
     from claude_swap.settings import load_settings, merged_with_cli
 
@@ -1037,10 +1123,15 @@ Defaults live in settings.json in the backup root; flags override them.
         # Loop mode: SIGTERM (systemd stop) exits the loop cleanly.
         signal.signal(signal.SIGTERM, lambda *_: engine.stop())
         if not args.json:
+            weekly = (
+                f", weekly {pct_label(settings.weekly_threshold)}%"
+                if settings.weekly_threshold is not None
+                else ""
+            )
             print(
                 dimmed(
-                    f"Auto-switch running: threshold {settings.threshold:.0f}%, "
-                    f"every {settings.interval_seconds:.0f}s"
+                    f"Auto-switch running: threshold {pct_label(settings.threshold)}%"
+                    f"{weekly}, every {settings.interval_seconds:.0f}s"
                     f"{' (dry-run)' if args.dry_run else ''} — Ctrl-C to stop"
                 )
             )
@@ -1097,6 +1188,7 @@ Examples:
   cswap config                              # list effective settings
   cswap config get autoswitch.threshold
   cswap config set autoswitch.threshold 80
+  cswap config set autoswitch.weeklyThreshold 97  # own line for the 7d/per-model windows
   cswap config unset autoswitch.threshold   # back to the default
   cswap config path                         # where settings.json lives
         """,
@@ -1361,6 +1453,9 @@ def main() -> None:
     if argv and argv[0] == "threshold":
         _threshold_command(argv[1:])
         return
+    if argv and argv[0] == "priority":
+        _priority_command(argv[1:])
+        return
     if argv and argv[0] == "swap":
         _swap_command(argv[1:])
         return
@@ -1400,6 +1495,8 @@ Commands:
   %(prog)s threshold <num|email> <pct>  set one account's switch-away point
   %(prog)s threshold <num|email> --unset  clear it (use the global default)
   %(prog)s threshold                  list the global default and overrides
+  %(prog)s priority <num|email> <tier>  set priority (higher first; default 0)
+  %(prog)s priority                   list account priorities
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
   %(prog)s run                        run the current dir's mapped account
   %(prog)s map <num|email> [path]     map a directory to an account
@@ -1881,8 +1978,14 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     # Passive update notification (never fails). Skipped after --purge so we
     # don't immediately recreate <backup_root>/cache/update_check.json inside
     # the directory we just deleted. Skipped after --upgrade as a safety guard
-    # in case the dispatch is later refactored to fall through.
-    if not args.purge and not args.upgrade and not args.json:
+    # in case the dispatch is later refactored to fall through. Skipped when
+    # `updates.check` is false, so no request goes to PyPI at all.
+    if (
+        not args.purge
+        and not args.upgrade
+        and not args.json
+        and load_update_settings(paths.get_backup_root()).check
+    ):
         from claude_swap.update_check import check_for_update
 
         msg = check_for_update(__version__)

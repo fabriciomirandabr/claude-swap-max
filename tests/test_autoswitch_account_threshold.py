@@ -1,14 +1,15 @@
-"""MEU-PAP-03 - per-account threshold across every gate call site.
+"""Per-account threshold across every gate call site.
 
-Covers AC-16..AC-23 plus AC-41 (escalation band), AC-42 (`PollEvent.threshold`)
-and AC-47 (the departure-gate detail string).
+Covers the departure and landing gates, the ranking, the anti-flap checks,
+poll cadence, the escalation band, `PollEvent.threshold` and the
+departure-gate detail string.
 
 The engine resolves a threshold **map** once per tick and passes it down as a
 parameter; `_rank_candidates` is documented pure and is called twice per tick
 under the consume-first two-phase commit, so nothing here may read the store
 from inside the ranking. Every integration test below drives a **real tick**
-through `EngineHarness`, not a helper in isolation - the plan's AC-41 and AC-47
-are specifically written that way because a helper-level assertion passes
+through `EngineHarness`, not a helper in isolation - the escalation-band and
+detail-string classes most of all, because a helper-level assertion passes
 against the defect each is meant to catch.
 
 Synthetic fixtures only: `EngineHarness` seeds a throwaway store under
@@ -21,19 +22,32 @@ from unittest.mock import patch
 
 import pytest
 
+from claude_swap import oauth
 from claude_swap.autoswitch import (
     HORIZON_HEADROOM_RATIO,
     SPENT_HEADROOM_PCT,
+    ErrorEvent,
     NoSwitchEvent,
     PollEvent,
+    SwitchEvent,
     ThresholdMap,
     TickOutcome,
+    _binding_recovery_ts,
     _every_account_above_threshold,
+    _parse_reset_ts,
     pct_label,
 )
 from claude_swap.settings import AutoSwitchSettings
 
-from tests.test_autoswitch import EngineHarness, _entry_for, _iso_at, _usage
+from tests.test_autoswitch import (
+    _R_LATEST,
+    _R_SOON,
+    EngineHarness,
+    _entry_for,
+    _iso_at,
+    _usage,
+    _usage7,
+)
 
 # The global default the engine ships with; every override below is chosen to
 # sit on a different side of some gate than this value.
@@ -60,6 +74,16 @@ def _details(h: EngineHarness) -> list[str]:
 
 def _polls(h: EngineHarness) -> list[PollEvent]:
     return [e for e in h.events if isinstance(e, PollEvent)]
+
+
+def _over(h: EngineHarness, headroom: float | None, line: float) -> bool | None:
+    """One account's census flag, in the form `_every_account_above_threshold`
+    takes it: is its binding window at/over its own line? `None` for an
+    unread row. `_usage` puts 7d at 0, so the 5h window at `100 - headroom`
+    binds and the flag is `100 - headroom >= line`."""
+    if headroom is None:
+        return None
+    return h.engine._binding(_usage(100.0 - headroom), h.settings, line).over
 
 
 class TestThresholdMap:
@@ -113,7 +137,7 @@ class TestResolveThresholds:
 
 
 class TestDepartureGateUsesActiveThreshold:
-    """AC-16 - the gate fires on the **active account's own** threshold."""
+    """The gate fires on the **active account's own** threshold."""
 
     def test_active_above_its_lower_override_switches(self, temp_home):
         h = _fleet(temp_home)
@@ -158,7 +182,7 @@ class TestDepartureGateUsesActiveThreshold:
 
 
 class TestLandingGateIsPerCandidate:
-    """AC-17 - the discriminating case: two candidates, one tick, opposite verdicts.
+    """The discriminating case: two candidates, one tick, opposite verdicts.
 
     Fixture shape, chosen so the assertion cannot pass by accident: candidate 2
     holds **more** headroom than candidate 3, so today's engine picks 2. Giving
@@ -206,7 +230,7 @@ class TestLandingGateIsPerCandidate:
         `_left_account_recovered`): if the gate rejects every measured
         candidate while the active account is over its own line, then by
         definition every account is at/over its line, `all_above` is True, and
-        the landing gate is bypassed by the soonest-recovery escape. So the
+        the landing gate is bypassed by the all-above room ranking. So the
         per-account rewrite must feed **both** sides the same map - a version
         that made the landing gate per-account but left the all-above census on
         the global scalar would disagree with itself here and hold.
@@ -216,9 +240,11 @@ class TestLandingGateIsPerCandidate:
         h.switcher.set_account_threshold("3", 85.0)
         h.engine = h._make_engine()
         # Both candidates are over their own (lowered) lines, and so is 1.
+        thresholds = ThresholdMap({"2": 85.0, "3": 85.0}, GLOBAL)
         assert _every_account_above_threshold(
-            ["2", "3"], {"2": 12.0, "3": 11.0}, 1.0,
-            ThresholdMap({"2": 85.0, "3": 85.0}, GLOBAL), "1",
+            ["2", "3"],
+            {n: _over(h, hr, thresholds[n]) for n, hr in {"2": 12.0, "3": 11.0}.items()},
+            _over(h, 1.0, thresholds["1"]),
         ) is True
         outcome = h.tick_with_usage(self._usage_map())
         assert outcome is TickOutcome.SWITCHED, _reasons(h)
@@ -243,63 +269,85 @@ class TestLandingGateIsPerCandidate:
 
 
 class TestEveryAccountAboveThreshold:
-    """AC-18 - each account is compared against **its own** line."""
+    """Each account is compared against **its own** line."""
 
     HEADROOM = {"2": 12.0, "3": 11.0}     # utilization 88 / 89
     ACTIVE_HEADROOM = 1.0                 # utilization 99
 
+    @staticmethod
+    def _census(
+        h: EngineHarness,
+        candidates: list[str],
+        headroom: dict[str, float | None],
+        active_headroom: float | None,
+        thresholds: ThresholdMap,
+    ) -> bool:
+        """Main's census signature, fed one `_over` flag per account."""
+        return _every_account_above_threshold(
+            candidates,
+            {n: _over(h, hr, thresholds[n]) for n, hr in headroom.items()},
+            _over(h, active_headroom, thresholds["1"]),
+        )
+
     def test_a_fleet_uniformly_above_the_default_engages(self, temp_home):
-        assert _every_account_above_threshold(
-            ["2", "3"], {"2": 5.0, "3": 5.0}, self.ACTIVE_HEADROOM,
-            ThresholdMap({}, GLOBAL), "1",
+        h = _fleet(temp_home)
+        assert self._census(
+            h, ["2", "3"], {"2": 5.0, "3": 5.0}, self.ACTIVE_HEADROOM,
+            ThresholdMap({}, GLOBAL),
         ) is True
 
     def test_one_account_below_its_own_higher_line_does_not_engage(self, temp_home):
         """3 is at 89 but its own line is 95, so it is *not* above it."""
-        assert _every_account_above_threshold(
-            ["2", "3"], self.HEADROOM, self.ACTIVE_HEADROOM,
-            ThresholdMap({"2": 85.0, "3": 95.0}, GLOBAL), "1",
+        h = _fleet(temp_home)
+        assert self._census(
+            h, ["2", "3"], self.HEADROOM, self.ACTIVE_HEADROOM,
+            ThresholdMap({"2": 85.0, "3": 95.0}, GLOBAL),
         ) is False
 
     def test_every_account_above_its_own_line_engages(self, temp_home):
-        assert _every_account_above_threshold(
-            ["2", "3"], self.HEADROOM, self.ACTIVE_HEADROOM,
-            ThresholdMap({"2": 85.0, "3": 85.0}, GLOBAL), "1",
+        h = _fleet(temp_home)
+        assert self._census(
+            h, ["2", "3"], self.HEADROOM, self.ACTIVE_HEADROOM,
+            ThresholdMap({"2": 85.0, "3": 85.0}, GLOBAL),
         ) is True
 
     def test_the_active_is_measured_against_its_own_line(self, temp_home):
         """Active at 88 with a 95 line is below it, so the state cannot hold."""
-        assert _every_account_above_threshold(
-            ["2", "3"], {"2": 5.0, "3": 5.0}, 12.0,
-            ThresholdMap({"1": 95.0}, GLOBAL), "1",
+        h = _fleet(temp_home)
+        assert self._census(
+            h, ["2", "3"], {"2": 5.0, "3": 5.0}, 12.0,
+            ThresholdMap({"1": 95.0}, GLOBAL),
         ) is False
 
     def test_an_unreadable_active_still_returns_false(self, temp_home):
-        assert _every_account_above_threshold(
-            ["2"], {"2": 1.0}, None, ThresholdMap({}, GLOBAL), "1"
+        h = _fleet(temp_home)
+        assert self._census(
+            h, ["2"], {"2": 1.0}, None, ThresholdMap({}, GLOBAL)
         ) is False
 
     def test_no_measured_candidate_still_returns_false(self, temp_home):
-        assert _every_account_above_threshold(
-            ["2"], {"2": None}, self.ACTIVE_HEADROOM,
-            ThresholdMap({}, GLOBAL), "1",
+        h = _fleet(temp_home)
+        assert self._census(
+            h, ["2"], {"2": None}, self.ACTIVE_HEADROOM,
+            ThresholdMap({}, GLOBAL),
         ) is False
 
     def test_a_uniform_default_fleet_matches_todays_verdict(self, temp_home):
         """Identity control - the default path must be bit-identical."""
+        h = _fleet(temp_home)
         thresholds = ThresholdMap({}, GLOBAL)
         for active_h, cand_h, expected in [
             (1.0, 5.0, True),      # 99 and 95, both over 90
             (1.0, 50.0, False),    # candidate at 50 is well under
             (50.0, 5.0, False),    # active at 50 is well under
         ]:
-            assert _every_account_above_threshold(
-                ["2"], {"2": cand_h}, active_h, thresholds, "1"
+            assert self._census(
+                h, ["2"], {"2": cand_h}, active_h, thresholds
             ) is expected
 
 
 class TestAntiFlapUsesTheBarredAccountsThreshold:
-    """AC-19 - the anti-flap machinery evaluates the **barred** account against
+    """The anti-flap machinery evaluates the **barred** account against
     *its own* line, so it cannot contradict the gate that barred it.
 
     Both reachable sites take the unreadable-active fallback leg, which asks
@@ -325,6 +373,7 @@ class TestAntiFlapUsesTheBarredAccountsThreshold:
         assert h.engine._no_return_account(
             "proactive", dict(self.STATE), {"2": 12.0}, None, True,
             h.settings, "1", thresholds=ThresholdMap({"2": 95.0}, GLOBAL),
+            usage={"2": _usage(88.0)},
         ) is None
 
     def test_no_return_holds_when_the_barred_account_is_over_its_own_line(
@@ -335,6 +384,7 @@ class TestAntiFlapUsesTheBarredAccountsThreshold:
         assert h.engine._no_return_account(
             "proactive", dict(self.STATE), {"2": 12.0}, None, True,
             h.settings, "1", thresholds=ThresholdMap({"2": 85.0}, GLOBAL),
+            usage={"2": _usage(88.0)},
         ) == "2"
 
     def test_no_return_at_the_default_matches_todays_verdict(self, temp_home):
@@ -343,6 +393,7 @@ class TestAntiFlapUsesTheBarredAccountsThreshold:
         assert h.engine._no_return_account(
             "proactive", dict(self.STATE), {"2": 12.0}, None, True,
             h.settings, "1", thresholds=ThresholdMap({}, GLOBAL),
+            usage={"2": _usage(88.0)},
         ) is None
 
     def test_recovered_uses_the_barred_line_on_the_failover_leg(self, temp_home):
@@ -400,11 +451,12 @@ class TestAntiFlapUsesTheBarredAccountsThreshold:
             "proactive", dict(self.STATE), {"2": 12.0}, None, True,
             h.settings, "1",
             thresholds=ThresholdMap({"1": 50.0, "3": 99.0}, GLOBAL),
+            usage={"2": _usage(88.0)},
         ) is None
 
 
 class TestPollPolicyMinimumThreshold:
-    """AC-20 - `set_poll_policy_inputs` receives the fleet **minimum**.
+    """`set_poll_policy_inputs` receives the fleet **minimum**.
 
     `poll_policy`'s urgent mode compares `new_pct >= threshold - 15`, so a
     minimum can only make collection *earlier*, never lazier - the safe
@@ -454,7 +506,7 @@ class TestPollPolicyMinimumThreshold:
 
 
 class TestRankCandidatesStaysPure:
-    """AC-21 - thresholds arrive as a parameter; the ranking never reads the store.
+    """Thresholds arrive as a parameter; the ranking never reads the store.
 
     `consume-first` calls `_rank_candidates` **twice per tick** under a
     two-phase commit, so a store read inside it would re-resolve mid-tick and
@@ -522,7 +574,7 @@ class TestRankCandidatesStaysPure:
 
 
 class TestRawHeadroomGuardsDoNotMove:
-    """AC-22 - `HORIZON_HEADROOM_RATIO` and `SPENT_HEADROOM_PCT` stay on raw
+    """`HORIZON_HEADROOM_RATIO` and `SPENT_HEADROOM_PCT` stay on raw
     headroom (upstream #262 reasoned this out and it applies identically).
 
     A ratio against distance-to-100 means something; a ratio against a policy
@@ -536,7 +588,8 @@ class TestRawHeadroomGuardsDoNotMove:
     def test_an_override_does_not_move_the_ratio_gate(self, temp_home):
         """`_no_return_account`'s ratio leg reads a *readable* active, so the
         threshold never enters it - an override on the barred account must not
-        change which side of `left >= active * RATIO` it lands on."""
+        change which side of the release margin (`_all_above_margin_met`) it
+        lands on."""
         h = _fleet(temp_home)
         state = {
             "lastSwitchFrom": 2,
@@ -545,17 +598,21 @@ class TestRawHeadroomGuardsDoNotMove:
             "leftRecoveryAt": None,
             "leftTrigger": "proactive",
         }
-        # left 12.0 vs active 5.0: 12 >= 5 * 2.0 -> beats us outright.
+        # left 12.0 vs active 5.0: 12 >= min(5 * 2.0, 5 + 3.0) == 8 -> clears
+        # the release margin.
         for override in ({}, {"2": 50.0}, {"2": 99.0}):
             assert h.engine._no_return_account(
                 "proactive", dict(state), {"2": 12.0}, 5.0, True,
                 h.settings, "1", thresholds=ThresholdMap(override, GLOBAL),
+                usage={"2": _usage(88.0)},
             ) is None
-        # left 9.0 vs active 5.0: 9 < 10 -> the ratio does not release.
+        # left 7.0 vs active 5.0: 7 < min(5 * 2.0, 5 + 3.0) == 8 -> the
+        # capped margin does not release.
         for override in ({}, {"2": 50.0}, {"2": 99.0}):
             assert h.engine._no_return_account(
-                "proactive", dict(state), {"2": 9.0}, 5.0, True,
+                "proactive", dict(state), {"2": 7.0}, 5.0, True,
                 h.settings, "1", thresholds=ThresholdMap(override, GLOBAL),
+                usage={"2": _usage(93.0)},
             ) == "2"
 
     def test_an_override_does_not_move_the_spent_gate(self, temp_home):
@@ -584,14 +641,14 @@ class TestRawHeadroomGuardsDoNotMove:
 
 
 class TestEscalationBandUsesActiveThreshold:
-    """AC-41 - the escalation band asks about the **active** account, so it
+    """The escalation band asks about the **active** account, so it
     reads that account's own line.
 
     Driven through a real tick, never `_collect_scheduled_usage` in isolation:
     the defect this discriminates against is a *stale-snapshot switch*, which
     only exists once ranking runs on what the collector returned.
 
-    Discriminating tuple from the plan: global `99.9`, active override `50`,
+    The discriminating tuple: global `99.9`, active override `50`,
     active utilization `60`. The departure gate fires at 50, but a collector
     still holding the global tests `60 >= 99.9 - 15` (i.e. `>= 84.9`), does
     not escalate, and the proactive selection that follows runs on the
@@ -671,7 +728,7 @@ class TestEscalationBandUsesActiveThreshold:
 
 
 class TestPollEventCarriesTheActiveThreshold:
-    """AC-42 - the number the UI renders equals the number the gate used."""
+    """The number the UI renders equals the number the gate used."""
 
     def test_it_carries_the_active_accounts_override(self, temp_home):
         h = _fleet(temp_home)
@@ -693,8 +750,8 @@ class TestPollEventCarriesTheActiveThreshold:
         assert _polls(h)[0].threshold == pytest.approx(GLOBAL)
 
     def test_the_no_active_account_path_keeps_the_global(self, temp_home):
-        """`:911` is the deliberate non-move in the inventory: with no active
-        account there is no account whose line could be read."""
+        """The no-active-account `PollEvent` deliberately keeps the global:
+        with no active account there is no account whose line could be read."""
         h = EngineHarness(temp_home, threshold=77.0)
         outcome = h.tick_with_usage({})
         assert outcome is TickOutcome.NO_ACTION
@@ -714,14 +771,15 @@ class TestPollEventCarriesTheActiveThreshold:
 
 
 class TestDepartureGateDetailString:
-    """AC-47 - `:989` quotes the *active account's own* effective threshold.
+    """The departure gate's detail string quotes the *active account's own*
+    effective threshold.
 
-    The plan is explicit that a hold-only assertion is insufficient: it passes
-    against the defect, because row 1 already holds correctly. The emitted
-    string is the oracle. Leaving this site on the global scalar makes the
-    engine hold on one number and display another - `90% < 85%` is not merely
-    misleading but arithmetically false, and invites the operator to conclude
-    the engine is broken.
+    A hold-only assertion is insufficient: it passes against the defect,
+    because row 1 already holds correctly. The emitted string is the oracle.
+    Leaving this site on the global scalar makes the engine hold on one
+    number and display another - `90% < 85%` is not merely misleading but
+    arithmetically false, and invites the operator to conclude the engine is
+    broken.
     """
 
     def test_the_detail_quotes_the_active_override(self, temp_home):
@@ -732,7 +790,7 @@ class TestDepartureGateDetailString:
             {"1": _usage(90.0), "2": _usage(10.0), "3": _usage(10.0)}
         )
         assert outcome is TickOutcome.NO_ACTION
-        assert _details(h)[0] == "90% < 95%"
+        assert _details(h)[0] == "5h 90% < 95%"
 
     def test_it_never_quotes_the_global_when_an_override_exists(self, temp_home):
         h = _fleet(temp_home, threshold=85.0)
@@ -756,7 +814,7 @@ class TestDepartureGateDetailString:
         # account: with peers present but unreadable the engine emits
         # `no-comparison` instead and this site is never reached.
         assert _reasons(h) == ["below-threshold"]
-        assert _details(h)[0] == "90% < 95%"
+        assert _details(h)[0] == "5h 90% < 95%"
 
     def test_with_no_override_the_detail_is_todays(self, temp_home):
         h = _fleet(temp_home, threshold=85.0)
@@ -764,7 +822,7 @@ class TestDepartureGateDetailString:
             {"1": _usage(80.0), "2": _usage(10.0), "3": _usage(10.0)}
         )
         assert outcome is TickOutcome.NO_ACTION
-        assert _details(h)[0] == "80% < 85%"
+        assert _details(h)[0] == "5h 80% < 85%"
 
     def test_both_sides_go_through_pct_label(self, temp_home):
         """`99.9` must never render as a lying `100`."""
@@ -772,18 +830,17 @@ class TestDepartureGateDetailString:
         h.switcher.set_account_threshold("1", 99.9)
         h.engine = h._make_engine()
         h.tick_with_usage({"1": _usage(99.5), "2": _usage(10.0), "3": _usage(10.0)})
-        assert _details(h)[0] == "99.5% < 99.9%"
+        assert _details(h)[0] == "5h 99.5% < 99.9%"
 
 
 class TestDefaultIdentity:
-    """AC-23 - with no per-account thresholds anywhere, nothing changes.
+    """With no per-account thresholds anywhere, nothing changes.
 
-    The whole-suite form of this AC is the phase gate (`2056 passed, 75
-    skipped, 3 warnings` baseline, and `tests/test_autoswitch.py` unchanged).
-    What is asserted here is the property that makes that outcome expected
-    rather than lucky: on a fleet with no overrides, every resolved value is
-    the global scalar, so each rewritten call site receives exactly the
-    argument it receives today.
+    The whole-suite form of this is `tests/test_autoswitch.py` passing
+    unchanged. What is asserted here is the property that makes that outcome
+    expected rather than lucky: on a fleet with no overrides, every resolved
+    value is the global scalar, so each rewritten call site receives exactly
+    the argument it receives today.
     """
 
     def test_no_policy_keys_exist_on_a_fresh_fleet(self, temp_home):
@@ -833,7 +890,7 @@ class TestDefaultIdentity:
 
 
 class TestPollCadenceFollowsALivePolicyChange:
-    """VR-1 - the pinned minimum is refreshed every tick, not only at birth.
+    """The pinned minimum is refreshed every tick, not only at birth.
 
     `cswap threshold 1 50` is written by a **different process** while
     `cswap auto` is already running - that is the ordinary way a threshold
@@ -843,12 +900,13 @@ class TestPollCadenceFollowsALivePolicyChange:
     `apply_threshold()`, and a persisted write goes through neither. Cadence
     therefore stayed pinned to the minimum as it stood when the engine booted.
 
-    That contradicts AC-20's rationale, which is not "the minimum is a tidy
-    value" but "the collector is then never lazier than the earliest possible
-    trigger, so no switch is missed". `poll_policy`'s urgent mode fires at
-    `new_pct >= threshold - 15`, so a stale 90 against a live 50 goes urgent
-    at 75% when it should go urgent at 35% - lazier, in the one direction the
-    AC-20 rationale rules out, for every tick until the engine restarts.
+    That contradicts the reason the cadence is pinned to the minimum, which
+    is not "the minimum is a tidy value" but "the collector is then never
+    lazier than the earliest possible trigger, so no switch is missed".
+    `poll_policy`'s urgent mode fires at `new_pct >= threshold - 15`, so a
+    stale 90 against a live 50 goes urgent at 75% when it should go urgent at
+    35% - lazier, in the one direction that reason rules out, for every tick
+    until the engine restarts.
 
     `TestPollPolicyMinimumThreshold` above cannot catch this: every case there
     writes the policy and *then* builds the engine, except the `apply_threshold`
@@ -943,4 +1001,319 @@ class TestPollCadenceFollowsALivePolicyChange:
                 {"1": _usage(40.0), "2": _usage(40.0), "3": _usage(40.0)}
             )
             assert h.switcher._poll_inputs_override[0] == pytest.approx(GLOBAL)
-        assert h.switcher._poll_inputs_override[1] == h.engine._models
+        assert h.switcher._poll_inputs_override[1] is None
+        assert h.switcher._poll_inputs_override[2] == h.engine._models
+
+
+class TestHysteresisComparesRoomUnderEachAccountsOwnLine:
+    """The `best` hysteresis margin is measured on room, not raw headroom.
+
+    Room is what an account has left under **its own** line, as main's
+    `lines.line_headroom` measures it on the global threshold's scale `T`:
+    `(100 - T) + T * (line - pct) / line` under the line, and
+    `(100 - T) * (100 - pct) / (100 - line)` past it. On a line equal to `T`
+    that is plain `100 - pct`, so with every line on the global the margin
+    is exactly main's raw-headroom compare.
+
+    Account 3 is parked at 99% on the global line in every case: the landing
+    gate rejects it, so it can never rescue a move the margin refused, and no
+    fixture is in the all-above regime (2 always sits under its own line).
+    """
+
+    PARKED = 99.0
+
+    def _tick(self, h: EngineHarness, active: float, cand: float) -> TickOutcome:
+        return h.tick_with_usage({
+            "1": _usage(active),
+            "2": _usage(cand),
+            "3": _usage(self.PARKED),
+        })
+
+    def _switches(self, h: EngineHarness) -> list[SwitchEvent]:
+        return [e for e in h.events if isinstance(e, SwitchEvent)]
+
+    def test_the_maintainers_case_switches_on_the_first_tick(self, temp_home):
+        """1 at 60% on a 60 line, 2 at 65% on a 90 line.
+
+        Raw headroom margin `35 - 40 = -5` refuses; room on the 90 scale is
+        `10` for 1 (exactly on its line) and `35` for 2, a margin of `25`
+        that clears the 10-point bar.
+        """
+        h = _fleet(temp_home)
+        h.switcher.set_account_threshold("1", 60.0)
+        h.switcher.set_account_threshold("2", 90.0)
+        h.engine = h._make_engine()
+        outcome = self._tick(h, 60.0, 65.0)
+        assert outcome is TickOutcome.SWITCHED, _reasons(h)
+        assert h.active_number() == 2
+        assert [e.trigger for e in self._switches(h)] == ["proactive"]
+
+    def test_too_little_room_still_refuses(self, temp_home):
+        """1 at 60/60, 2 at 85% on a 90 line: room `15 - 10 = 5`."""
+        h = _fleet(temp_home)
+        h.switcher.set_account_threshold("1", 60.0)
+        h.switcher.set_account_threshold("2", 90.0)
+        h.engine = h._make_engine()
+        outcome = self._tick(h, 60.0, 85.0)
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        assert self._switches(h) == []
+
+    def test_room_replaces_raw_headroom_rather_than_relaxing_it(self, temp_home):
+        """1 at 95% on a 95 line, 2 at 80% on an 85 line.
+
+        Raw margin `20 - 5 = 15` would accept; room on the 90 scale is `10`
+        for 1 (exactly on its line) and `10 + 90 * 5 / 85 = 15.29` for 2, a
+        margin of `5.29` that refuses. A gate that takes the looser of the
+        two still switches here.
+        """
+        h = _fleet(temp_home)
+        h.switcher.set_account_threshold("1", 95.0)
+        h.switcher.set_account_threshold("2", 85.0)
+        h.engine = h._make_engine()
+        outcome = self._tick(h, 95.0, 80.0)
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        assert self._switches(h) == []
+
+    def test_equal_lines_switch_at_exactly_the_margin(self, temp_home):
+        """Both on an 85 line that is also the global, 1 at 90%, 2 at 80%:
+        margin exactly 10.
+
+        The compare is strict `<`, as on main, so exactly 10 clears it.
+        """
+        h = _fleet(temp_home, threshold=85.0)
+        h.switcher.set_account_threshold("1", 85.0)
+        h.switcher.set_account_threshold("2", 85.0)
+        h.engine = h._make_engine()
+        outcome = self._tick(h, 90.0, 80.0)
+        assert outcome is TickOutcome.SWITCHED, _reasons(h)
+        assert h.active_number() == 2
+
+    def test_equal_lines_refuse_just_under_the_margin(self, temp_home):
+        """Both on an 85 line that is also the global, 1 at 90%, 2 at 80.5%:
+        margin 9.5."""
+        h = _fleet(temp_home, threshold=85.0)
+        h.switcher.set_account_threshold("1", 85.0)
+        h.switcher.set_account_threshold("2", 85.0)
+        h.engine = h._make_engine()
+        outcome = self._tick(h, 90.0, 80.5)
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        assert self._switches(h) == []
+
+    def test_equal_lines_off_the_global_are_measured_on_the_global(self, temp_home):
+        """Both on an 85 line under a 90 global, 1 at 90%, 2 at 80%.
+
+        Room is on the global's scale, so the two lines being equal does not
+        make it raw headroom: 1 is past its line at `10 * 10 / 15 = 6.67`, 2
+        is under it at `10 + 90 * 5 / 85 = 15.29`, a margin of `8.63` that
+        refuses. Raw headroom (`20 - 10 = 10`) would switch.
+        """
+        h = _fleet(temp_home)
+        h.switcher.set_account_threshold("1", 85.0)
+        h.switcher.set_account_threshold("2", 85.0)
+        h.engine = h._make_engine()
+        outcome = self._tick(h, 90.0, 80.0)
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        assert self._switches(h) == []
+
+
+class TestBestRanksByRoomUnderEachAccountsOwnLine:
+    """The `best` sort key ranks candidates on room under each one's own line.
+
+    1 departs at 95% on the global line. 2 sits at 50% on a 60 line, 3 at
+    55% on the global 90. Raw headroom ranks 2 first (50 vs 45); room on the
+    90 scale ranks 3 first, because 2 is 10 points under a 60 line
+    (`10 + 90 * 10 / 60 = 25`) while 3 is 35 points under a 90 line (`45`).
+    """
+
+    def _usage_map(self) -> dict:
+        return {"1": _usage(95.0), "2": _usage(50.0), "3": _usage(55.0)}
+
+    def test_room_picks_the_candidate_raw_headroom_does_not(self, temp_home):
+        h = _fleet(temp_home)
+        h.switcher.set_account_threshold("2", 60.0)
+        h.engine = h._make_engine()
+        outcome = h.tick_with_usage(self._usage_map())
+        assert outcome is TickOutcome.SWITCHED, _reasons(h)
+        assert h.active_number() == 3
+
+    def test_equal_thresholds_keep_the_raw_headroom_pick(self, temp_home):
+        """With every account on the global, room is `100 - pct` and the
+        ranking is main's: 2 at 50 headroom beats 3 at 45."""
+        h = _fleet(temp_home)
+        outcome = h.tick_with_usage(self._usage_map())
+        assert outcome is TickOutcome.SWITCHED, _reasons(h)
+        assert h.active_number() == 2
+
+
+class TestThePerAccountLineIsTheFiveHourLine:
+    """An account's threshold takes the place of the global wherever the global
+    is a line: the 5h window's line under a weekly line, and every window's
+    line without one. The weekly windows stay on `weekly_threshold`."""
+
+    PEERS = {"2": _usage7(10.0, 10.0), "3": _usage7(10.0, 10.0)}
+
+    def test_under_a_weekly_line_the_5h_window_departs_on_the_override(
+        self, temp_home
+    ):
+        h = _fleet(temp_home, weekly_threshold=97.0)
+        h.switcher.set_account_threshold("1", 60.0)
+        h.engine = h._make_engine()
+        outcome = h.tick_with_usage({"1": _usage7(62.0, 0.0), **self.PEERS})
+        assert outcome is TickOutcome.SWITCHED, _reasons(h)
+        assert h.active_number() != 1
+
+    def test_under_a_weekly_line_the_7d_window_keeps_the_weekly_line(
+        self, temp_home
+    ):
+        """5h 55% is under the 60 override and 7d 95% under the 97 weekly
+        line, so the account holds, and the detail quotes the window that
+        binds on its own line."""
+        h = _fleet(temp_home, weekly_threshold=97.0)
+        h.switcher.set_account_threshold("1", 60.0)
+        h.engine = h._make_engine()
+        outcome = h.tick_with_usage({"1": _usage7(55.0, 95.0), **self.PEERS})
+        assert outcome is TickOutcome.NO_ACTION
+        assert "below-threshold" in _reasons(h)
+        assert _details(h)[0] == "7d 95% < 97%"
+
+    def test_without_a_weekly_line_the_override_is_every_windows_line(
+        self, temp_home
+    ):
+        h = _fleet(temp_home)
+        h.switcher.set_account_threshold("1", 60.0)
+        h.engine = h._make_engine()
+        outcome = h.tick_with_usage({"1": _usage7(10.0, 62.0), **self.PEERS})
+        assert outcome is TickOutcome.SWITCHED, _reasons(h)
+        assert h.active_number() != 1
+
+    def test_the_poll_event_carries_both_lines(self, temp_home):
+        h = _fleet(temp_home, weekly_threshold=97.0)
+        h.switcher.set_account_threshold("1", 60.0)
+        h.engine = h._make_engine()
+        h.tick_with_usage({"1": _usage7(40.0, 40.0), **self.PEERS})
+        poll = _polls(h)[0]
+        assert poll.threshold == pytest.approx(60.0)
+        assert poll.weekly_threshold == pytest.approx(97.0)
+
+    def test_the_poll_pin_is_the_fleet_minimum_and_the_weekly_line(
+        self, temp_home
+    ):
+        h = _fleet(temp_home, weekly_threshold=97.0)
+        h.switcher.set_account_threshold("2", 60.0)
+        h.engine = h._make_engine()
+        expected = (60.0, 97.0, h.engine._models)
+        assert h.switcher._poll_inputs_override == expected
+        h.tick_with_usage({"1": _usage7(40.0, 40.0), **self.PEERS})
+        assert h.switcher._poll_inputs_override == expected
+
+
+class TestRecoveryUsesTheRankingsScale:
+    """`_binding_recovery_ts` must pick the binding window on the same scale
+    the ranking does, or the engine schedules around a window it did not
+    judge. 5h 73.3% on a 55.5 line and 7d 94% on a 90 weekly line tie on the
+    90 scale, so the 5h window binds; on the 55.5 ruler the 7d one does."""
+
+    USAGE = {
+        "five_hour": {"pct": 73.3, "resets_at": _R_SOON},
+        "seven_day": {"pct": 94.0, "resets_at": _R_LATEST},
+    }
+
+    def test_recovery_schedules_on_the_window_the_ranking_judged(self, temp_home):
+        h = _fleet(temp_home, weekly_threshold=90.0)
+        now = h.clock.now
+        assert now < _parse_reset_ts(_R_SOON)
+        binding = h.engine._binding(self.USAGE, h.settings, 55.5)
+        recovery = _binding_recovery_ts(
+            self.USAGE,
+            h.engine._models,
+            now,
+            threshold=55.5,
+            weekly_threshold=90.0,
+            scale=h.settings.threshold,
+        )
+        assert recovery == _parse_reset_ts(binding.resets_at)
+        assert recovery == _parse_reset_ts(_R_SOON)
+
+
+def _tick(h: EngineHarness, snapshots: list[dict]):
+    """Drive one real tick, serving `snapshots` to successive collector calls.
+
+    The last snapshot repeats, so a fixture only lists as many as it needs to
+    distinguish. Returns `(outcome, mock)`.
+    """
+    seq = [
+        {num: _entry_for(value, h.clock.now) for num, value in snap.items()}
+        for snap in snapshots
+    ]
+    calls = {"n": 0}
+
+    def _fetch(**_kwargs):
+        index = min(calls["n"], len(seq) - 1)
+        calls["n"] += 1
+        return seq[index]
+
+    with patch.object(
+        h.switcher, "usage_entries_by_account", side_effect=_fetch
+    ) as mock:
+        return h.engine.tick(), mock
+
+
+class TestADepartureOnTheAccountsOwnLineKeepsTheTargetLoopExits:
+    """A departure decided by a per-account line ends like any other when no
+    target can be freshened.
+
+    Account 1 carries a 50 line and sits at 60%, so it departs on its own
+    threshold where the global 90 would hold. The only other account ranks on
+    a readable usage row but cannot be committed to - a live session pins it,
+    or its refresh fails transiently - and the tick must take the target
+    loop's ordinary exits: `BLOCKED` with `no-viable-target`, or `ERROR` with
+    an `ErrorEvent`.
+    """
+
+    _EMAILS = {1: "a@example.com", 2: "b@example.com", 3: "c@example.com"}
+
+    def _stage(self, temp_home, *, expires_at=None, n: int = 2):
+        h = EngineHarness(temp_home)
+        for num in range(1, n + 1):
+            h.seed(num, self._EMAILS[num],
+                   expires_at=None if num == 1 else expires_at)
+        h.make_live(self._EMAILS[1], 1)
+        return h
+
+    def _snapshot(self, n: int = 2, active: float = 20.0):
+        snap = {"1": _usage(active)}
+        for num in range(2, n + 1):
+            snap[str(num)] = _usage(10.0)
+        return snap
+
+    def test_threshold_departure_with_no_viable_target_blocks(self, temp_home):
+        live = self._stage(temp_home,
+                           expires_at=int(1_000_000.0 * 1000) + 3_600_000)
+        # `ACCOUNT_THRESHOLD_MIN` is 50: the lowest line the store accepts,
+        # crossed here at 60%.
+        live.switcher.set_account_threshold("1", 50.0)
+        live.engine = live._make_engine()
+        with patch.object(
+            live.switcher, "live_session_pids_for", return_value=[4242]
+        ):
+            outcome, _ = _tick(live, [self._snapshot(active=60.0)])
+        assert outcome is TickOutcome.BLOCKED
+        assert "no-viable-target" in _reasons(live)
+
+    def test_threshold_departure_with_a_transient_refresh_failure_errors(
+        self, temp_home
+    ):
+        h = self._stage(temp_home, expires_at=1)
+        h.switcher.set_account_threshold("1", 50.0)
+        h.engine = h._make_engine()
+        with patch(
+            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(None, "transient"),
+        ):
+            outcome, _ = _tick(h, [self._snapshot(active=60.0)])
+        assert outcome is TickOutcome.ERROR
+        assert any(isinstance(e, ErrorEvent) for e in h.events)

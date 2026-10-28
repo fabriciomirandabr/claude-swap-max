@@ -13,6 +13,7 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from claude_swap.fsutil import atomic_write_text
 from claude_swap.usage_store import UsageEntry
 
 if TYPE_CHECKING:
@@ -51,7 +52,7 @@ def normalize_alias(name: str) -> str:
 #: Per-account switch-away threshold bounds, in binding-window utilization
 #: percent. Mirrors ``SETTING_SPECS["autoswitch.threshold"]``, written as
 #: literals rather than imported: ``models`` is a leaf and must not import
-#: ``settings`` (AGENTS.md §Architecture). The two are asserted equal in
+#: ``settings``. The two are asserted equal in
 #: ``tests/test_account_policy_values.py`` so they cannot drift apart.
 ACCOUNT_THRESHOLD_MIN = 50.0
 ACCOUNT_THRESHOLD_MAX = 99.9
@@ -103,19 +104,40 @@ def normalize_account_threshold(value: object) -> float:
     return pct
 
 
+ACCOUNT_PRIORITY_MAX = 1000
+
+
+def normalize_account_priority(value: object) -> int:
+    """Validate a priority tier. Higher numbers are preferred; zero is default."""
+    message = f"priority must be an integer between 0 and {ACCOUNT_PRIORITY_MAX}"
+    if isinstance(value, str):
+        value = value.strip()
+        if not value.isascii() or not value.isdecimal():
+            raise ValueError(message)
+        # Avoid converting an arbitrarily long hand-edited integer.
+        value = value.lstrip("0") or "0"
+        if len(value) > len(str(ACCOUNT_PRIORITY_MAX)):
+            raise ValueError(message)
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(message)
+    if not 0 <= value <= ACCOUNT_PRIORITY_MAX:
+        raise ValueError(message)
+    return value
+
+
 @dataclass(frozen=True)
 class AccountPolicy:
     """Per-account auto-switch overrides, stored in the sequence record.
 
-    Both knobs are unset by default, so a fleet with no policy set behaves
-    exactly as it did before this existed — the default-identity property
-    the acceptance criteria assert throughout.
+    Defaults preserve existing behavior. Priority is read only by the
+    opt-in ``priority-consume-first`` strategy.
 
     ``threshold``
-        This account's own switch-away cap, in binding-window utilization
+        This account's own switch-away line, in binding-window utilization
         percent. ``None`` inherits ``autoswitch.threshold``. Reserving headroom
         on one shared account no longer means taxing the whole fleet with a
-        global cap set to the strictest member's.
+        global line set to the strictest member's.
 
     ``standby``
         "Last man standing": held out of candidate selection while any
@@ -129,6 +151,7 @@ class AccountPolicy:
 
     threshold: float | None = None
     standby: bool = False
+    priority: int = 0
 
 
 class Platform(Enum):
@@ -275,11 +298,8 @@ class SwitchTransaction:
                 if step == "credentials_written":
                     switcher._write_credentials(self.original_credentials)
                 elif step == "config_written":
-                    self.config_path.write_text(
-                        self.original_config, encoding="utf-8"
-                    )
-                    if sys.platform != "win32":
-                        os.chmod(self.config_path, 0o600)
+                    # By rename, never in place (#419): see atomic_write_text.
+                    atomic_write_text(self.config_path, self.original_config)
                 elif step == "sequence_updated":
                     data = switcher._get_sequence_data()
                     if data:

@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12"
 
 [[package]]
@@ -89,7 +89,7 @@ wheels = [
 
 [[package]]
 name = "claude-swap"
-version = "0.28.0b1"
+version = "0.30.0b1"
 source = { editable = "." }
 dependencies = [
     { name = "keyring", marker = "sys_platform == 'win32'" },
