@@ -260,7 +260,7 @@ def export_accounts(
         if not full:
             config_obj = _slim_config(config_obj, f"config for {email}")
 
-        # API-key accounts store the credential as a raw ``sk-ant-api…`` string,
+        # API-key accounts store the credential as a raw ``sk-ant-…`` string,
         # not OAuth JSON — carry it verbatim (and tag the kind) so the JSON parse
         # below doesn't choke and import can restore it as-is.
         is_api_key = looks_like_api_key(creds_text)
@@ -400,7 +400,8 @@ def import_accounts(
         if is_api_key:
             if not (isinstance(creds_obj, str) and looks_like_api_key(creds_obj)):
                 raise TransferError(
-                    f"API-key credentials for {email} must be a raw sk-ant-api… string"
+                    f"API-key credentials for {email} must be a raw sk-ant-… key "
+                    "(not an OAuth token)"
                 )
             creds_text = creds_obj.strip()
         else:

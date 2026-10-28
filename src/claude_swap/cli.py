@@ -323,7 +323,7 @@ Examples:
         "--no-share",
         action="store_true",
         help=(
-            "Don't share settings/keybindings/CLAUDE.md/skills/commands/agents "
+            "Don't share settings/keybindings/CLAUDE.md/skills/commands/agents/rules "
             "from ~/.claude into the session profile (and remove previously "
             "shared items)"
         ),

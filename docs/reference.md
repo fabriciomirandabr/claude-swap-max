@@ -455,13 +455,14 @@ Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) 
 ### Add an account from a raw token or API key
 
 If you only have a long-lived setup-token (e.g., produced by `claude setup-token`)
-or a managed API key (`sk-ant-api...`) and you don't want to log in via the browser
+or a Console API key (`sk-ant-api03-...` workspace key, `sk-ant-usr-...` personal
+key, or a service-account key) and you don't want to log in via the browser
 flow first — useful on headless servers or when receiving a token from another
 machine — register it directly. The token type is auto-detected:
 
 ```bash
 cswap add-token sk-ant-oat01-...             # OAuth setup-token
-cswap add-token sk-ant-api03-...             # managed API key
+cswap add-token sk-ant-api03-...             # API key (any Console key family)
 cswap add-token sk-ant-oat01-... --slot 3
 cswap add-token - --slot 3                   # read token from stdin
 cswap add-token --email user@example.com     # optional label override
@@ -470,11 +471,14 @@ cswap add-token --email user@example.com     # optional label override
 `--email` is optional; omitted values use `setup-token-{slot}@token.local`
 (or `api-key-{slot}@token.local` for API keys). No Anthropic API calls are made.
 
-**API-key accounts.** An `sk-ant-api...` value registers a managed API-key account
-(the kind Claude Code uses after `/login` with a key) rather than an OAuth
-setup-token. It switches like any other account; since API keys have no subscription
-quota, they show no usage and the usage-aware `switch` strategies never skip them as
-rate-limited.
+**API-key accounts.** Any bare `sk-ant-...` value that is not an OAuth token
+(`sk-ant-oat...`) registers a managed API-key account (the kind Claude Code uses
+after `/login` with a key) rather than an OAuth setup-token. It switches like any
+other account; since API keys have no subscription quota, they show no usage and the
+usage-aware `switch` strategies never skip them as rate-limited. Create personal and
+service-account keys scoped to a single workspace: a multi-workspace key needs an
+`anthropic-workspace-id` header on every request, which Claude Code does not add for
+a stored key.
 
 ## Uninstall
 

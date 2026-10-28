@@ -592,14 +592,14 @@ class TestValidation:
 
     def test_credentials_garbage_string_rejected(self, temp_home: Path):
         # A non-key string credential is interpreted as an API-key account and
-        # rejected because it isn't a valid sk-ant-api… key.
+        # rejected because it isn't a bare sk-ant-… key.
         s = _linux_switcher(temp_home)
         env = self._make_envelope()
         env["accounts"][0]["credentials"] = "a string"
         f = temp_home / "c.cswap"
         f.write_text(json.dumps(env))
 
-        with pytest.raises(TransferError, match="must be a raw sk-ant-api"):
+        with pytest.raises(TransferError, match="must be a raw sk-ant-"):
             import_accounts(s, str(f))
 
     def test_credentials_non_object_non_string_rejected(self, temp_home: Path):
