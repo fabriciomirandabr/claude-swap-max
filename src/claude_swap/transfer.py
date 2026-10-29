@@ -507,9 +507,8 @@ def import_accounts(
                 # isn't attributable to the backup.
                 outcome = "replaced"
             else:
-                _eprint(
-                    f"Skipped {entry['email']} (already exists, use --force)"
-                )
+                shown = switcher._shown_email(existing_slot, entry["email"], data)
+                _eprint(f"Skipped {shown} (already exists, use --force)")
                 skipped += 1
                 # Even when skipped, the envelope's active account exists
                 # locally — record where so we can seed activeAccountNumber.
@@ -524,7 +523,8 @@ def import_accounts(
             live_pids = switcher._live_session_pids(target_num, entry["email"])
             if live_pids:
                 _eprint(
-                    f"Warning: {entry['email']} (slot {target_num}) has a live "
+                    f"Warning: {switcher._shown_email(target_num, entry['email'], data)} "
+                    f"(slot {target_num}) has a live "
                     f"session-mode instance (PID {', '.join(map(str, live_pids))}); "
                     "its session profile keeps the pre-import credentials until "
                     "it is restarted via 'cswap run'."
@@ -581,8 +581,9 @@ def import_accounts(
             resolved_active_slot = target_num
         written_slots.add(target_num)
 
+        shown = switcher._shown_email(target_num, entry["email"], data)
         if outcome == "overwrote":
-            _eprint(f"Overwrote {entry['email']} (slot {target_num})")
+            _eprint(f"Overwrote {shown} (slot {target_num})")
             if had_strike:
                 # Store-fact wording on purpose: import rewrites the backup,
                 # so for the active slot the next poll may still exercise the
@@ -604,12 +605,12 @@ def import_accounts(
             # Describe the observed trigger (the quarantine verdict), not the
             # token itself — a stale verdict can sit over newer working creds.
             _eprint(
-                f"Replaced {entry['email']} (slot {target_num} was "
+                f"Replaced {shown} (slot {target_num} was "
                 "quarantined: refresh token dead)"
             )
             replaced += 1
         else:
-            _eprint(f"Imported {entry['email']} → slot {target_num}")
+            _eprint(f"Imported {shown} → slot {target_num}")
             imported += 1
 
     # Migration UX: if the destination has no recorded active account
@@ -745,10 +746,11 @@ def import_usage(
 
     adopted = switcher._usage_store.adopt(readings, identities, hold_s=hold_s)
     for num, (email, _org_uuid) in identities.items():
+        shown = switcher._shown_email(num, email, local_data)
         if num in adopted:
-            _eprint(f"Adopted usage for {email} → slot {num}")
+            _eprint(f"Adopted usage for {shown} → slot {num}")
         else:
-            _eprint(f"Kept slot {num}'s own reading for {email}: it is newer")
+            _eprint(f"Kept slot {num}'s own reading for {shown}: it is newer")
     summary = (
         f"Done: {len(adopted)} adopted, {len(readings) - len(adopted)} kept, "
         f"{skipped} skipped"

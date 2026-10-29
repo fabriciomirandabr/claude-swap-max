@@ -122,6 +122,8 @@ def send_notification(title: str, body: str) -> None:
 
 def make_notifying_emit(
     inner: Callable[[AutoSwitchEvent], None],
+    *,
+    show_email: bool = True,
 ) -> Callable[[AutoSwitchEvent], None]:
     """Wrap an engine ``on_event`` callback with desktop notifications.
 
@@ -136,7 +138,9 @@ def make_notifying_emit(
         inner(event)
         if event.kind in NOTIFIED_KINDS:
             try:
-                send_notification(_NOTIFICATION_TITLE, event.human())
+                send_notification(
+                    _NOTIFICATION_TITLE, event.human(show_email=show_email)
+                )
             except Exception as exc:  # noqa: BLE001 — never kill the engine loop
                 _logger.debug("desktop notification raised: %s", exc)
 

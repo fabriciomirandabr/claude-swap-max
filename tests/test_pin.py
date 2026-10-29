@@ -2079,7 +2079,8 @@ class TestTheTuiSurfaceSurvivesTheSplit:
             dashboard.DashboardScreen,
             "app",
             property(lambda self: types.SimpleNamespace(
-                switcher=object(), snapshot=types.SimpleNamespace(accounts=[acc]))),
+                switcher=object(), snapshot=types.SimpleNamespace(accounts=[acc]),
+                show_email=True)),
             raising=False,
         )
         screen = object.__new__(dashboard.DashboardScreen)
@@ -2248,7 +2249,7 @@ class TestTheTuiSurfaceSurvivesTheSplit:
             "app",
             property(
                 lambda self: types.SimpleNamespace(
-                    current_theme=CSWAP_LIGHT, switcher=types.SimpleNamespace()
+                    current_theme=CSWAP_LIGHT, switcher=types.SimpleNamespace(), show_email=True
                 )
             ),
             raising=False,

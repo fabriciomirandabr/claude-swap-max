@@ -15,6 +15,7 @@ from rich.text import Text
 from textual.widgets import ListItem, Static
 
 from claude_swap import pace, pin
+from claude_swap.identity import account_parts
 from claude_swap.json_output import (
     USAGE_API_KEY,
     USAGE_FOREIGN_CREDENTIAL,
@@ -210,6 +211,22 @@ def _policy_badges(acc: AccountSnapshot, gap: str) -> list[str]:
     return badges
 
 
+def _append_identity(
+    text: Text, acc: AccountSnapshot, palette: Palette, show_email: bool
+) -> None:
+    name, mail, org = account_parts(
+        acc.alias, acc.email, acc.display_tag, show_email=show_email
+    )
+    if name:
+        text.append(name, style=f"bold {palette.accent}")
+        if mail:
+            text.append(f" ({mail})", style=palette.foreground)
+    elif mail:
+        text.append(mail, style=palette.foreground)
+    if org:
+        text.append(f"  [{org}]", style=palette.muted)
+
+
 def account_card_text(
     acc: AccountSnapshot,
     width: int,
@@ -219,6 +236,7 @@ def account_card_text(
     now: float | None = None,
     palette: Palette = Palette.DARK,
     cloud_pinned: bool = False,
+    show_email: bool = True,
 ) -> Text:
     """The full account card: header line + per-window bar rows. Each row's
     tick is the switch line that row is judged against: ``threshold`` on the
@@ -234,12 +252,7 @@ def account_card_text(
 
     text = Text()
     text.append(f"{acc.number:>2}  ", style=f"bold {palette.foreground}")
-    if acc.alias:
-        text.append(acc.alias, style=f"bold {palette.accent}")
-        text.append(f" ({acc.email})", style=palette.foreground)
-    else:
-        text.append(acc.email, style=palette.foreground)
-    text.append(f"  [{acc.display_tag}]", style=palette.muted)
+    _append_identity(text, acc, palette, show_email)
     if acc.is_active:
         text.append("   ● active", style=f"bold {palette.accent}")
     if cloud_pinned:
@@ -327,6 +340,7 @@ def mini_account_text(
     *,
     palette: Palette = Palette.DARK,
     cloud_pinned: bool = False,
+    show_email: bool = True,
 ) -> Text:
     """One minimized line for an inactive account.
 
@@ -337,12 +351,7 @@ def mini_account_text(
     """
     text = Text(no_wrap=True, overflow="ellipsis")
     text.append(f"{acc.number:>2}  ", style=f"bold {palette.muted}")
-    if acc.alias:
-        text.append(acc.alias, style=f"bold {palette.accent}")
-        text.append(f" ({acc.email})", style=palette.foreground)
-    else:
-        text.append(acc.email, style=palette.foreground)
-    text.append(f"  [{acc.display_tag}]", style=palette.muted)
+    _append_identity(text, acc, palette, show_email)
     if cloud_pinned:
         # Labelled, like the full card: a bare glyph sitting between the
         # org tag and the usage figures read as decoration, not as a state.
@@ -453,11 +462,15 @@ class AccountsPanel(Static):
                         acc, width, threshold=app.threshold_pct,
                         weekly_threshold=app.weekly_threshold_pct, now=now,
                         palette=palette, cloud_pinned=pinned,
+                        show_email=app.show_email,
                     )
                 )
             elif self._show_minis:
                 blocks.append(
-                    mini_account_text(acc, now, palette=palette, cloud_pinned=pinned)
+                    mini_account_text(
+                        acc, now, palette=palette, cloud_pinned=pinned,
+                        show_email=app.show_email,
+                    )
                 )
         if not blocks:
             return Text("no active managed login", style=palette.muted)
@@ -506,6 +519,7 @@ class AccountCard(Static):
             self._acc, self.size.width or 80, threshold=self._threshold,
             palette=Palette.from_theme(self.app.current_theme),
             cloud_pinned=self._cloud_pinned,
+            show_email=self.app.show_email,
         )
 
 

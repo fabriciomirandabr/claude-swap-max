@@ -90,9 +90,11 @@ class AutoSwitchSettings:
 @dataclass(frozen=True)
 class UiSettings:
     """Appearance preferences (``ui`` section). ``theme`` selects the TUI/CLI
-    color theme; ``auto`` follows terminal-background detection."""
+    color theme; ``auto`` follows terminal-background detection.
+    ``show_email`` off renders aliased accounts by alias alone."""
 
     theme: str = "auto"
+    show_email: bool = True
 
 
 @dataclass(frozen=True)
@@ -219,6 +221,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             help="Color theme; auto follows the terminal background",
         ),
         SettingSpec(
+            "ui", "showEmail", "show_email", "bool",
+            help="Show the e-mail and organization next to an account's alias",
+        ),
+        SettingSpec(
             "run", "shareHistory", "share_history", "bool",
             help="cswap run shares chat history unless --no-share-history",
         ),
@@ -340,8 +346,15 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
             "settings.json: unsupported ui.theme %r; using %r",
             theme, default.theme,
         )
-        return default
-    return UiSettings(theme=theme)
+        theme = default.theme
+    show_email = section.get("showEmail", default.show_email)
+    if not isinstance(show_email, bool):
+        _logger.warning(
+            "settings.json: ui.showEmail %r is not true or false; using %r",
+            show_email, default.show_email,
+        )
+        show_email = default.show_email
+    return UiSettings(theme=theme, show_email=show_email)
 
 
 def load_run_settings(backup_root: Path) -> RunSettings:

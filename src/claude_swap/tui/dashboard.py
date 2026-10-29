@@ -27,6 +27,7 @@ from textual.widgets import Footer, ListView, Static
 
 from claude_swap import pin
 from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.identity import account_display, account_parts
 from claude_swap.models import AccountsSnapshot
 from claude_swap.tui.widgets import AccountItem, AccountsPanel, MenuItem
 
@@ -180,6 +181,16 @@ class DashboardScreen(Screen):
                     menu.index = i
                     break
 
+    def _pinned_row_name(self) -> str | None:
+        identity = pin.pinned_identity(self.app.switcher)
+        if identity is None:
+            return None
+        snap = self.app.snapshot
+        for acc in (snap.accounts if snap else ()):
+            if pin.account_is_pinned(identity, acc.email, acc.org_uuid):
+                return self.app.account_name(acc)
+        return pin.pinned_email_recorded(self.app.switcher)
+
     def _root_entries(self) -> MenuEntries:
         # No "Refresh" entry: every view auto-refreshes, so a menu item would
         # wrongly imply the user has to. `f` stays as a hidden escape hatch.
@@ -210,7 +221,7 @@ class DashboardScreen(Screen):
                     # THE RECORD, which is what the badge reads. Asking the
                     # package here made the row say `none` beside a lit badge
                     # on every machine without the extra.
-                    f"{pin.pinned_email_recorded(self.app.switcher) or 'none'}",
+                    f"{self._pinned_row_name() or 'none'}",
                     "pin-menu",
                 )]
                 if (
@@ -244,12 +255,21 @@ class DashboardScreen(Screen):
             _BACK,
         ]
 
+    def _identity_label(self, acc, *, with_org: bool = False) -> str:
+        show_email = self.app.show_email
+        name = account_display(acc.alias, acc.email, None, show_email=show_email)
+        if not with_org:
+            return name
+        _, _, org = account_parts(
+            acc.alias, acc.email, acc.display_tag, show_email=show_email
+        )
+        return f"{name}  [{org}]" if org else name
+
     def _remove_entries(self) -> MenuEntries:
         snap = self.app.snapshot
         entries: MenuEntries = [
             (
-                f"{acc.number}  {f'{acc.alias} ({acc.email})' if acc.alias else acc.email}"
-                f"  [{acc.display_tag}]",
+                f"{acc.number}  {self._identity_label(acc, with_org=True)}",
                 f"remove:{acc.number}",
             )
             for acc in (snap.accounts if snap else ())
@@ -263,7 +283,7 @@ class DashboardScreen(Screen):
         snap = self.app.snapshot
         entries: MenuEntries = []
         for acc in (snap.accounts if snap else ()):
-            name = f"{acc.alias} ({acc.email})" if acc.alias else acc.email
+            name = self._identity_label(acc)
             action = "→ enable" if acc.disabled else "→ disable"
             state = "  (disabled)" if acc.disabled else ""
             entries.append(
@@ -363,7 +383,7 @@ class DashboardScreen(Screen):
         snap = self.app.snapshot
         entries: MenuEntries = []
         for acc in (snap.accounts if snap else ()):
-            name = f"{acc.alias} ({acc.email})" if acc.alias else acc.email
+            name = self._identity_label(acc)
             state = "  ○ cloud" if pin.account_is_pinned(
                 pinned_identity, acc.email, acc.org_uuid) else ""
             # An API-key account can never be pinned: sk-ant-api… is not OAuth
@@ -448,7 +468,11 @@ class DashboardScreen(Screen):
             number = action_id.split(":", 1)[1]
             snap = app.snapshot
             email = next(
-                (a.email for a in (snap.accounts if snap else ()) if a.number == number),
+                (
+                    app.account_name(a)
+                    for a in (snap.accounts if snap else ())
+                    if a.number == number
+                ),
                 "?",
             )
             app.confirm_remove(number, email)
@@ -508,7 +532,7 @@ class DashboardScreen(Screen):
                 )
                 if acc is not None:
                     app._start_action(
-                        f"pin cloud → {acc.email}",
+                        f"pin cloud → {app.account_name(acc)}",
                         partial(self._run_pin_op, partial(self._apply_pin, acc, impl)),
                     )
                 else:

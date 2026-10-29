@@ -617,9 +617,10 @@ class SessionManager:
             # the SERVING account's environment.
             current = self.switcher._live_login_identity()
             if current is not None and current == (email, org_uuid):
+                shown = self.switcher._shown_email(account_num, email)
                 if require_session:
                     raise SessionError(
-                        f"Account-{account_num} ({email}) is the active default "
+                        f"Account-{account_num} ({shown}) is the active default "
                         "login, so this launch would run plain claude on the "
                         "default login rather than in a session profile (a "
                         "second copy of the active credential would drift). "
@@ -628,7 +629,7 @@ class SessionManager:
                     )
                 print(
                     dimmed(
-                        f"Account-{account_num} ({email}) is already the active "
+                        f"Account-{account_num} ({shown}) is already the active "
                         "default login — launching claude directly."
                     )
                 )
@@ -646,7 +647,8 @@ class SessionManager:
         )
 
         print(
-            f"{accent('Launching')} Account-{account_num} ({email}) "
+            f"{accent('Launching')} Account-{account_num} "
+            f"({self.switcher._shown_email(account_num, email)}) "
             f"{muted('[session mode]')}"
         )
         env = {

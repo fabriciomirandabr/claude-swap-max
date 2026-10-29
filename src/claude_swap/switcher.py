@@ -57,6 +57,11 @@ from claude_swap.fsutil import (
     atomic_write_text,
     read_text_with_retry,
 )
+from claude_swap.identity import (
+    account_display,
+    masked_email,
+    show_email_enabled,
+)
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import (
@@ -2128,7 +2133,8 @@ class ClaudeAccountSwitcher:
                 tag = self._get_display_tag(
                     email, account.get("organizationName", ""), org_uuid
                 )
-                print(f"  {path} {dimmed('→')} {slot}: {email} {muted(f'[{tag}]')}")
+                label = self._account_label(account.get("alias"), email, tag)
+                print(f"  {path} {dimmed('→')} {slot}: {label}")
             else:
                 print(f"  {path} {dimmed('→')} {email} {muted('(account removed)')}")
 
@@ -2450,16 +2456,17 @@ class ClaudeAccountSwitcher:
 
         account_num, email, data, record = self._resolve_for_policy_write(identifier)
 
+        shown = self._shown_email(account_num, email, data)
         current = record.get("threshold")
         if normalized is None and "threshold" not in record:
             print(dimmed(
-                f"Account-{account_num} ({email}) has no threshold override "
+                f"Account-{account_num} ({shown}) has no threshold override "
                 f"— already using the global default."
             ))
             return
         if normalized is not None and current == normalized:
             print(dimmed(
-                f"Account-{account_num} ({email}) is already at {normalized:g}%."
+                f"Account-{account_num} ({shown}) is already at {normalized:g}%."
             ))
             return
 
@@ -2472,13 +2479,13 @@ class ClaudeAccountSwitcher:
 
         if normalized is None:
             self._logger.info(f"Cleared threshold for account {account_num}: {email}")
-            print(f"{accent('Cleared')} threshold for Account-{account_num} ({email}) "
+            print(f"{accent('Cleared')} threshold for Account-{account_num} ({shown}) "
                   f"— now using the global default.")
         else:
             self._logger.info(
                 f"Set threshold {normalized:g} for account {account_num}: {email}"
             )
-            print(f"{accent('Set')} Account-{account_num} ({email}) "
+            print(f"{accent('Set')} Account-{account_num} ({shown}) "
                   f"threshold to {normalized:g}%.")
 
     def set_account_standby(self, identifier: str, standby: bool) -> None:
@@ -2504,9 +2511,10 @@ class ClaudeAccountSwitcher:
         account_num, email, data, record = self._resolve_for_policy_write(identifier)
 
         verb = "marked as standby" if standby else "cleared as standby"
+        shown = self._shown_email(account_num, email, data)
         if bool(record.get("standby")) == standby:
             state = "already a standby" if standby else "not a standby"
-            print(dimmed(f"Account-{account_num} ({email}) is {state}."))
+            print(dimmed(f"Account-{account_num} ({shown}) is {state}."))
             return
 
         if standby:
@@ -2517,7 +2525,7 @@ class ClaudeAccountSwitcher:
         self._write_json(self.sequence_file, data)
         self._logger.info(f"Account {account_num} {verb}: {email}")
 
-        print(f"{accent('Account-' + account_num)} ({email}) {verb}.")
+        print(f"{accent('Account-' + account_num)} ({shown}) {verb}.")
 
         if standby:
             print(dimmed(
@@ -2538,7 +2546,8 @@ class ClaudeAccountSwitcher:
         if changed:
             data["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, data)
-        print(f"Account-{account_num} ({email}) priority: {normalized} "
+        shown = self._shown_email(account_num, email, data)
+        print(f"Account-{account_num} ({shown}) priority: {normalized} "
               "(used by priority-consume-first).")
 
     def set_account_disabled(self, identifier: str, disabled: bool) -> None:
@@ -2567,8 +2576,9 @@ class ClaudeAccountSwitcher:
             raise AccountNotFoundError(f"Account-{account_num} does not exist")
 
         verb = "disabled" if disabled else "enabled"
+        shown = self._shown_email(account_num, email, data)
         if bool(record.get("disabled")) == disabled:
-            print(dimmed(f"Account-{account_num} ({email}) is already {verb}."))
+            print(dimmed(f"Account-{account_num} ({shown}) is already {verb}."))
             return
 
         if disabled:
@@ -2579,7 +2589,7 @@ class ClaudeAccountSwitcher:
         self._write_json(self.sequence_file, data)
         self._logger.info(f"{verb.capitalize()} account {account_num}: {email}")
 
-        print(f"{accent(verb.capitalize())} Account-{account_num} ({email}).")
+        print(f"{accent(verb.capitalize())} Account-{account_num} ({shown}).")
 
         if disabled:
             active = data.get("activeAccountNumber")
@@ -2605,6 +2615,26 @@ class ClaudeAccountSwitcher:
         """Stored email for a slot; empty string when unknown."""
         data = self._get_sequence_data() or {}
         return data.get("accounts", {}).get(str(account_num), {}).get("email", "")
+
+    def show_email(self) -> bool:
+        """``ui.showEmail`` from settings.json."""
+        return show_email_enabled(self.backup_dir)
+
+    def _shown_email(
+        self, account_num: str, email: str, data: dict | None = None
+    ) -> str:
+        """``email``, or the account's alias when ``ui.showEmail`` is off."""
+        if data is None:
+            data = self._get_sequence_data() or {}
+        alias = data.get("accounts", {}).get(str(account_num), {}).get("alias")
+        return masked_email(alias, email, show_email=self.show_email())
+
+    def _account_label(self, alias: str | None, email: str, tag: str) -> str:
+        """``email [tag]`` as printed by default; the alias alone when
+        ``ui.showEmail`` is off and the account has one."""
+        if self.show_email():
+            return f"{email} {muted(f'[{tag}]')}"
+        return account_display(alias, email, tag, show_email=False, org_style=muted)
 
     def current_account_number(self) -> str | None:
         """Slot of the live login; ``None`` when there is none or it's unmanaged.
@@ -4769,9 +4799,12 @@ class ClaudeAccountSwitcher:
 
             tag = self._get_display_tag(current_email, matched_org_name, current_org_uuid)
             self._logger.info(f"Updated credentials for account {account_num}: {current_email}")
+            label = self._account_label(
+                seq["accounts"][account_num].get("alias"), current_email, tag
+            )
             print(
                 f"{accent('Updated credentials')} for Account {account_num} "
-                f"({current_email} {muted(f'[{tag}]')})."
+                f"({label})."
             )
             self._repin_if_pin_slot_refreshed(account_num)
             return
@@ -5063,9 +5096,12 @@ class ClaudeAccountSwitcher:
             self._write_json(self.sequence_file, seq)
             kind_label = "API key" if is_api_key else "token"
             self._logger.info(f"Updated {kind_label} for account {account_num}: {email}")
+            label = self._account_label(
+                seq["accounts"][account_num].get("alias"), email, "personal"
+            )
             print(
                 f"{accent(f'Updated {kind_label}')} for Account {account_num} "
-                f"({email} {muted('[personal]')})."
+                f"({label})."
             )
             self._repin_if_pin_slot_refreshed(account_num)
             return
@@ -5098,7 +5134,11 @@ class ClaudeAccountSwitcher:
                         existing.get("organizationUuid", ""),
                     )
                     warning(f"Slot {slot} already occupied")
-                    print(f"{existing_email} {muted(f'[{existing_tag}]')}")
+                    print(
+                        self._account_label(
+                            existing.get("alias"), existing_email, existing_tag
+                        )
+                    )
                     if not assume_yes:
                         try:
                             answer = input(f"Overwrite slot {slot}? [y/N] ").strip().lower()
@@ -5287,6 +5327,7 @@ class ClaudeAccountSwitcher:
             raise AccountNotFoundError(f"Account-{account_num} does not exist")
 
         email = account_info.get("email")
+        shown = self._shown_email(account_num, email, data)
         active_account = data.get("activeAccountNumber")
 
         # Check before the confirmation prompt (better UX); the chokepoint in
@@ -5294,12 +5335,12 @@ class ClaudeAccountSwitcher:
         self._ensure_no_live_session(account_num, email, "--remove-account")
 
         if str(active_account) == account_num:
-            warning(f"Warning: Account-{account_num} ({email}) is currently active")
+            warning(f"Warning: Account-{account_num} ({shown}) is currently active")
 
         if not assume_yes:
             confirm = input(
                 f"Are you sure you want to permanently remove "
-                f"Account-{account_num} ({email})? [y/N] "
+                f"Account-{account_num} ({shown})? [y/N] "
             )
             if confirm.lower() != "y":
                 print(dimmed("Cancelled"))
@@ -5315,7 +5356,7 @@ class ClaudeAccountSwitcher:
 
         self._write_json(self.sequence_file, data)
         self._logger.info(f"Removed account {account_num}: {email}")
-        print(f"{accent('Removed')} Account-{account_num} ({email})")
+        print(f"{accent('Removed')} Account-{account_num} ({shown})")
 
         self._prune_mappings(email, account_info.get("organizationUuid", ""))
         # AFTER the roster write, not before: the pin's own clear re-reads the
@@ -7007,15 +7048,19 @@ class ClaudeAccountSwitcher:
 
         seq_data = self._get_sequence_data() or {}
         print(bolded("Accounts:"))
+        show_email = self.show_email()
         for i, (num, email, org_name, org_uuid, is_active, _, alias) in enumerate(accounts_info):
             tag = self._get_display_tag(email, org_name, org_uuid)
-            label = f"{accent(alias)} ({email})" if alias else email
+            label = account_display(
+                alias, email, tag, show_email=show_email,
+                alias_style=accent, org_style=muted,
+            )
             markers = ""
             if is_active:
                 markers += f" {bold_accent('(active)')}"
             if self._disabled_from_data(seq_data, str(num)):
                 markers += f" {muted('(disabled)')}"
-            print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
+            print(f"  {num}: {label}{markers}")
             for line in _usage_entry_lines(entries[str(num)]):
                 print(f"     {line}")
 
@@ -7174,9 +7219,12 @@ class ClaudeAccountSwitcher:
         if account_num:
             tag = self._get_display_tag(current_email, org_name, current_org_uuid)
             total = len(data.get("accounts", {}))
+            label = self._account_label(
+                data["accounts"][account_num].get("alias"), current_email, tag
+            )
             print(
                 f"{bolded('Status:')} {accent(f'Account-{account_num}')} "
-                f"({current_email} {muted(f'[{tag}]')})"
+                f"({label})"
             )
             print(f"  {dimmed(f'Total managed accounts: {total}')}")
             entry = self._active_account_usage(
@@ -7648,7 +7696,8 @@ class ClaudeAccountSwitcher:
                         message=f"Already on Account-{next_account} ({current_email})",
                     )
                 print(
-                    f"{accent('Already on')} Account-{next_account} ({current_email})"
+                    f"{accent('Already on')} Account-{next_account} "
+                    f"({self._shown_email(next_account, current_email)})"
                 )
                 return None
 
@@ -7745,7 +7794,8 @@ class ClaudeAccountSwitcher:
                     ref = account_ref(int(target_account), email)
                     if not json_output:
                         print(
-                            f"{accent('Already on')} Account-{target_account} ({email})"
+                            f"{accent('Already on')} Account-{target_account} "
+                            f"({self._shown_email(target_account, email, data)})"
                         )
                         print(dimmed(
                             "To rewrite the live login from the stored backup "
@@ -8650,7 +8700,8 @@ class ClaudeAccountSwitcher:
                     )
                 if emit_output:
                     print(
-                        f"{accent('Activated')} Account-{target_account} ({target_email})"
+                        f"{accent('Activated')} Account-{target_account} "
+                        f"({self._shown_email(target_account, target_email)})"
                     )
                     print()
                     self._print_switch_followup()
@@ -9008,7 +9059,10 @@ class ClaudeAccountSwitcher:
         # one of two exits, and the other returns from inside the lock scope
         # above. `_perform_switch` wraps this function and covers both.
         if emit_output:
-            print(f"{accent('Switched to')} Account-{target_account} ({target_email})")
+            print(
+                f"{accent('Switched to')} Account-{target_account} "
+                f"({self._shown_email(target_account, target_email)})"
+            )
             try:
                 self.list_accounts()
             except Exception as e:

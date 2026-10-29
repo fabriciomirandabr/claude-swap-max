@@ -18,6 +18,7 @@ from claude_swap.models import (
     ACCOUNT_THRESHOLD_MIN,
     Platform,
 )
+from claude_swap.identity import account_parts
 from claude_swap.printer import (
     accent,
     bolded,
@@ -513,14 +514,22 @@ Examples:
         store.set(target, email, org_uuid)
 
         shown = normalize_path(target)
+        shown_email = switcher._shown_email(account_num, email)
         if previous and previous.get("email") != email:
             prev_email = previous.get("email")
+            prev_slot = switcher._find_account_slot(
+                switcher._get_sequence_data() or {},
+                prev_email,
+                previous.get("organizationUuid", "") or "",
+            )
+            if prev_slot:
+                prev_email = switcher._shown_email(prev_slot, prev_email)
             print(
-                f"{accent('Mapped')} {shown} → Account-{account_num} ({email}) "
+                f"{accent('Mapped')} {shown} → Account-{account_num} ({shown_email}) "
                 f"{muted(f'(was {prev_email})')}"
             )
         else:
-            print(f"{accent('Mapped')} {shown} → Account-{account_num} ({email})")
+            print(f"{accent('Mapped')} {shown} → Account-{account_num} ({shown_email})")
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
@@ -655,7 +664,7 @@ Examples:
         accounts = data.get("accounts", {})
         for num in sorted((num_a, num_b), key=int):
             email = accounts.get(num, {}).get("email", "")
-            print(f"  {num}: {email}")
+            print(f"  {num}: {switcher._shown_email(num, email, data)}")
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
@@ -700,15 +709,17 @@ Examples:
         accounts = data.get("accounts", {})
         if num_src == num_target:
             email = accounts.get(num_target, {}).get("email", "")
-            print(f"{dimmed('Already in')} slot {num_target}: {email}")
+            shown = switcher._shown_email(num_target, email, data)
+            print(f"{dimmed('Already in')} slot {num_target}: {shown}")
         elif swapped:
             print(f"{accent('Swapped')} Account {num_src} and Account {num_target}:")
             for num in sorted((num_src, num_target), key=int):
                 email = accounts.get(num, {}).get("email", "")
-                print(f"  {num}: {email}")
+                print(f"  {num}: {switcher._shown_email(num, email, data)}")
         else:
             email = accounts.get(num_target, {}).get("email", "")
-            print(f"{accent('Moved')} {email} to slot {num_target}")
+            shown = switcher._shown_email(num_target, email, data)
+            print(f"{accent('Moved')} {shown} to slot {num_target}")
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
@@ -774,8 +785,13 @@ Examples:
                 print(dimmed("No aliases set"))
                 return
             print(bolded("Aliases:"))
+            show_email = switcher.show_email()
             for num, alias_name, email in rows:
-                print(f"  {num}: {alias_name} {muted(f'({email})')}")
+                _, shown_mail, _ = account_parts(
+                    alias_name, email, None, show_email=show_email
+                )
+                suffix = f" {muted(f'({shown_mail})')}" if shown_mail else ""
+                print(f"  {num}: {alias_name}{suffix}")
             return
 
         if args.unset:
@@ -931,7 +947,8 @@ def _priority_command(argv: list[str]) -> None:
         if args.account is None:
             print(bolded("Account priorities (higher first; default 0):"))
             for num, policy in switcher.account_policies().items():
-                print(f"  Account-{num}  {switcher.account_email(num)}  {policy.priority}")
+                shown = switcher._shown_email(num, switcher.account_email(num))
+                print(f"  Account-{num}  {shown}  {policy.priority}")
             print(dimmed("Used only by: cswap auto --strategy priority-consume-first"))
             return
         switcher.set_account_priority(args.account, None if args.unset else args.priority)
@@ -1088,7 +1105,7 @@ Defaults live in settings.json in the backup root; flags override them.
 
     def human_emit(event: AutoSwitchEvent) -> None:
         stamp = _time.strftime("%H:%M:%S")
-        line = event.human()
+        line = event.human(show_email=show_email)
         if event.kind == "switch":
             line = accent(line)
         elif event.kind in ("error", "account-quarantined"):
@@ -1105,11 +1122,12 @@ Defaults live in settings.json in the backup root; flags override them.
                 sys.exit(1)
 
         settings = merged_with_cli(load_settings(switcher.backup_dir), args)
+        show_email = switcher.show_email()
         emit = jsonl_emit if args.json else human_emit
         if settings.notify:
             from claude_swap.notifications import make_notifying_emit
 
-            emit = make_notifying_emit(emit)
+            emit = make_notifying_emit(emit, show_email=show_email)
         engine = AutoSwitchEngine(
             switcher,
             settings,

@@ -18,7 +18,8 @@ from textual.reactive import reactive
 from textual.worker import WorkerState
 
 from claude_swap import printer
-from claude_swap.models import AccountsSnapshot
+from claude_swap.identity import masked_email
+from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.snapshot_source import account_identity
 from claude_swap.settings import load_settings, load_ui_settings, set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -81,10 +82,9 @@ class CswapApp(App):
         except Exception:
             self.threshold_pct = None
             self.weekly_threshold_pct = None
-        try:
-            self._theme_name = load_ui_settings(switcher.backup_dir).theme
-        except Exception:
-            self._theme_name = "auto"
+        ui_settings = load_ui_settings(switcher.backup_dir)
+        self._theme_name = ui_settings.theme
+        self.show_email: bool = ui_settings.show_email
 
     def on_mount(self) -> None:
         self.register_theme(CSWAP_DARK)
@@ -273,8 +273,9 @@ class CswapApp(App):
         if "switched" in payload:
             if payload.get("switched"):
                 to = payload.get("to") or {}
-                target = to.get("email") or f"account {to.get('number')}"
-                self.notify(f"Switched to {target}", title="Switch")
+                self.notify(
+                    f"Switched to {self._switched_target(to)}", title="Switch"
+                )
             else:
                 reason = str(payload.get("reason") or "no switch performed")
                 self.notify(reason, title="No switch", severity="warning")
@@ -283,6 +284,15 @@ class CswapApp(App):
             self.push_screen(OutputModal(label, result.output))
         elif result.first_line:
             self.notify(result.first_line)
+
+    def _switched_target(self, to: dict) -> str:
+        if self.show_email:
+            return to.get("email") or f"account {to.get('number')}"
+        if self.snapshot is not None:
+            for acc in self.snapshot.accounts:
+                if acc.number == str(to.get("number")) and acc.alias:
+                    return acc.alias
+        return f"account {to.get('number')}"
 
     # -- account operations ----------------------------------------------------
 
@@ -383,12 +393,16 @@ class CswapApp(App):
         else:
             run()
 
+    def account_name(self, acc: AccountSnapshot) -> str:
+        """The e-mail, or the alias when ``ui.showEmail`` is off and one is set."""
+        return masked_email(acc.alias, acc.email, show_email=self.show_email)
+
     def _slot_occupant(self, slot: int | None) -> str | None:
         if slot is None or self.snapshot is None:
             return None
         for acc in self.snapshot.accounts:
             if acc.number == str(slot):
-                return acc.email
+                return self.account_name(acc)
         return None
 
     # -- navigation -------------------------------------------------------------

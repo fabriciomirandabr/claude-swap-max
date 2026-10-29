@@ -228,6 +228,12 @@ def _below_line_detail(
 # ---------------------------------------------------------------------------
 
 
+def _who(number: object, email: object, show_email: bool) -> str:
+    """``Account-N (email)``, or just ``Account-N`` when ``ui.showEmail`` is
+    off (events carry no alias, so the slot number identifies the account)."""
+    return f"Account-{number} ({email})" if show_email else f"Account-{number}"
+
+
 @dataclass(frozen=True)
 class AutoSwitchEvent:
     """Base event. ``to_json()`` payloads are additive: consumers must ignore
@@ -247,7 +253,7 @@ class AutoSwitchEvent:
             **self._fields(),
         }
 
-    def human(self) -> str:  # pragma: no cover - overridden
+    def human(self, *, show_email: bool = True) -> str:  # pragma: no cover - overridden
         return self.kind
 
 
@@ -295,7 +301,7 @@ class PollEvent(AutoSwitchEvent):
         err = self.fetch_errors.get(num)
         return f"? ({err})" if err else "?"
 
-    def human(self) -> str:
+    def human(self, *, show_email: bool = True) -> str:
         if self.active is None:
             return "poll: no active account"
         num = self.active.get("number")
@@ -326,7 +332,7 @@ class PollEvent(AutoSwitchEvent):
         )
         tail = f" | others: {others}" if others else ""
         return (
-            f"Account-{num} ({self.active.get('email')}): {used} "
+            f"{_who(num, self.active.get('email'), show_email)}: {used} "
             f"(switch at {pct_label(line)}%){tail}"
         )
 
@@ -350,12 +356,12 @@ class SwitchEvent(AutoSwitchEvent):
             "dryRun": self.dry_run,
         }
 
-    def human(self) -> str:
+    def human(self, *, show_email: bool = True) -> str:
         src = (
             f"Account-{self.from_ref.get('number')}" if self.from_ref else "(none)"
         )
         dst = (
-            f"Account-{self.to_ref.get('number')} ({self.to_ref.get('email')})"
+            _who(self.to_ref.get("number"), self.to_ref.get("email"), show_email)
             if self.to_ref
             else "?"
         )
@@ -372,7 +378,7 @@ class NoSwitchEvent(AutoSwitchEvent):
     def _fields(self) -> dict:
         return {"reason": self.reason, "detail": self.detail}
 
-    def human(self) -> str:
+    def human(self, *, show_email: bool = True) -> str:
         return f"no switch: {self.reason}" + (f" ({self.detail})" if self.detail else "")
 
 
@@ -386,9 +392,9 @@ class QuarantineEvent(AutoSwitchEvent):
     def _fields(self) -> dict:
         return {"number": self.number, "email": self.email, "reason": self.reason}
 
-    def human(self) -> str:
+    def human(self, *, show_email: bool = True) -> str:
         return (
-            f"Account-{self.number} ({self.email}) quarantined: {self.reason}. "
+            f"{_who(self.number, self.email, show_email)} quarantined: {self.reason}. "
             f"Log in with it and run 'cswap --add-account --slot {self.number}' "
             "to recover."
         )
@@ -404,8 +410,9 @@ class UnquarantineEvent(AutoSwitchEvent):
     def _fields(self) -> dict:
         return {"number": self.number, "email": self.email, "reason": self.reason}
 
-    def human(self) -> str:
-        return f"Account-{self.number} ({self.email}) back in rotation ({self.reason})"
+    def human(self, *, show_email: bool = True) -> str:
+        who = _who(self.number, self.email, show_email)
+        return f"{who} back in rotation ({self.reason})"
 
 
 @dataclass(frozen=True)
@@ -416,7 +423,7 @@ class AllExhaustedEvent(AutoSwitchEvent):
     def _fields(self) -> dict:
         return {"earliestResetAt": self.earliest_reset_at}
 
-    def human(self) -> str:
+    def human(self, *, show_email: bool = True) -> str:
         if self.earliest_reset_at:
             return f"all accounts exhausted; earliest reset {self.earliest_reset_at}"
         return "all accounts exhausted; no reset time known"
@@ -431,7 +438,7 @@ class SleepEvent(AutoSwitchEvent):
     def _fields(self) -> dict:
         return {"seconds": round(self.seconds, 1), "until": self.until}
 
-    def human(self) -> str:
+    def human(self, *, show_email: bool = True) -> str:
         return f"sleeping {self.seconds / 60:.0f}m (until {self.until})"
 
 
@@ -444,7 +451,7 @@ class ErrorEvent(AutoSwitchEvent):
     def _fields(self) -> dict:
         return {"message": self.message, "transient": self.transient}
 
-    def human(self) -> str:
+    def human(self, *, show_email: bool = True) -> str:
         return f"error: {self.message}" + (" (will retry)" if self.transient else "")
 
 
@@ -460,7 +467,7 @@ class ConfigWarningEvent(AutoSwitchEvent):
     def _fields(self) -> dict:
         return {"message": self.message}
 
-    def human(self) -> str:
+    def human(self, *, show_email: bool = True) -> str:
         return f"warning: {self.message}"
 
 

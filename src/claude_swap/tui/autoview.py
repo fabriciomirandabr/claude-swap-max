@@ -31,6 +31,7 @@ from claude_swap.autoswitch import (
     pct_label,
 )
 from claude_swap import pin
+from claude_swap.identity import masked_email
 from claude_swap.lines import binding_window
 from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
@@ -51,7 +52,12 @@ _EVENT_ROLES = {
 _QUIET_KINDS = {"poll", "no-switch", "sleep", "account-unquarantined"}
 
 
-def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Text:
+def event_text(
+    event: AutoSwitchEvent,
+    *,
+    palette: Palette = Palette.DARK,
+    show_email: bool = True,
+) -> Text:
     """Log line for one engine event, styled like the CLI's human renderer."""
     role = _EVENT_ROLES.get(event.kind)
     if role is not None:
@@ -60,7 +66,7 @@ def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Te
         style = palette.muted if event.kind in _QUIET_KINDS else palette.foreground
     text = Text()
     text.append(f"{data.clock_stamp()}  ", style=palette.muted)
-    text.append(event.human(), style=style)
+    text.append(event.human(show_email=show_email), style=style)
     return text
 
 
@@ -256,7 +262,9 @@ class AutoScreen(Screen):
         if not self.is_attached:
             return
         palette = Palette.from_theme(self.app.current_theme)
-        self.query_one("#event-log", RichLog).write(event_text(event, palette=palette))
+        self.query_one("#event-log", RichLog).write(
+            event_text(event, palette=palette, show_email=self.app.show_email)
+        )
         if event.kind == "switch":
             self.app.request_refresh()
 
@@ -345,7 +353,10 @@ class AutoScreen(Screen):
             )
             entry = Text()
             entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
-            entry.append(acc.email, style=palette.foreground)
+            entry.append(
+                masked_email(acc.alias, acc.email, show_email=self.app.show_email),
+                style=palette.foreground,
+            )
             if acc.usage.sentinel is not None:
                 entry.append(
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted

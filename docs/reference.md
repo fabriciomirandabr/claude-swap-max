@@ -384,6 +384,7 @@ cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fa
 cswap config set autoswitch.strategy balance  # spend every account's week on schedule (see "auto")
 cswap config set run.shareHistory true    # every cswap run shares chat history (see "run")
 cswap config set updates.check false      # no daily PyPI lookup for the "newer version" hint
+cswap config set ui.showEmail false       # aliased accounts show by alias only (unaliased keep e-mail); auto-switch events and notifications show Account-N (events carry no alias); the TUI reads it at startup
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```

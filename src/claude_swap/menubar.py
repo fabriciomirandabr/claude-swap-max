@@ -30,6 +30,7 @@ from pathlib import Path
 
 from claude_swap import pace
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
+from claude_swap.identity import account_parts, show_email_enabled
 from claude_swap.printer import warning
 from claude_swap.switcher import SENTINEL_NOTES
 
@@ -277,6 +278,15 @@ def usage_summary(
     return " · ".join(parts) if parts else "usage unavailable"
 
 
+def format_identity(alias: str | None, email: str, *, show_email: bool) -> str:
+    """``alias  (email)``, the alias alone with ``show_email`` off, or the
+    bare e-mail for an account without an alias."""
+    name, mail, _ = account_parts(alias, email, None, show_email=show_email)
+    if name and mail:
+        return f"{name}  ({mail})"
+    return name or mail or ""
+
+
 def format_account_label(
     num,
     email: str,
@@ -285,9 +295,10 @@ def format_account_label(
     alias: str | None = None,
     disabled: bool = False,
     fetched_at: float | None = None,
+    show_email: bool = True,
 ) -> str:
     """Build one account row's menu label."""
-    label = f"{alias}  ({email})" if alias else email
+    label = format_identity(alias, email, show_email=show_email)
     marker = "  (disabled)" if disabled else ""
     return f"{num}  {label}{marker}  {usage_summary(usage, now, fetched_at)}"
 
@@ -725,19 +736,32 @@ def run(switcher) -> int:
         def _drain_engine_events(self):
             with self._event_lock:
                 events, self._engine_events = self._engine_events, []
+            show_email = self._show_email()
             for ev in events:
                 if ev.kind == "switch" and not getattr(ev, "dry_run", False):
-                    rumps.notification("claude-swap", "Auto-switched account", ev.human())
+                    rumps.notification(
+                        "claude-swap", "Auto-switched account",
+                        ev.human(show_email=show_email),
+                    )
                     self.refresh_async()  # reflect the switch promptly
                 elif ev.kind == "account-quarantined":
-                    rumps.notification("claude-swap", "Account quarantined", ev.human())
+                    rumps.notification(
+                        "claude-swap", "Account quarantined",
+                        ev.human(show_email=show_email),
+                    )
                 elif ev.kind == "all-exhausted":
-                    rumps.notification("claude-swap", "All accounts exhausted", ev.human())
+                    rumps.notification(
+                        "claude-swap", "All accounts exhausted",
+                        ev.human(show_email=show_email),
+                    )
                 elif ev.kind == "config-warning":
                     # e.g. an autoswitch.model name no account reports — the
                     # engine emits it once per run; dropping it would leave a
                     # menu-bar user with a silently inert filter.
                     rumps.notification("claude-swap", "Configuration warning", ev.human())
+
+        def _show_email(self) -> bool:
+            return show_email_enabled(self.switcher.backup_dir)
 
         def _threshold(self) -> int:
             """Current auto-switch threshold from core settings (for the menu)."""
@@ -775,10 +799,12 @@ def run(switcher) -> int:
                 _purge(self.menu._menu)
             self.menu.clear()
             account_items = []
+            show_email = self._show_email()
             for num, email, is_active, display, _last_good, alias, disabled, fetched_at in self.snapshot["accounts"]:
                 item = rumps.MenuItem(
                     format_account_label(
-                        num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at
+                        num, email, display, alias=alias, disabled=disabled,
+                        fetched_at=fetched_at, show_email=show_email,
                     ),
                     callback=self._make_switch_to(num),
                 )
@@ -817,8 +843,9 @@ def run(switcher) -> int:
             accounts = self.snapshot["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
+            show_email = self._show_email()
             for num, email, _is_active, _display, _last_good, alias, _disabled, _fetched_at in accounts:
-                label = f"{num}  {alias}  ({email})" if alias else f"{num}  {email}"
+                label = f"{num}  {format_identity(alias, email, show_email=show_email)}"
                 menu.add(rumps.MenuItem(label, callback=self._make_remove(num)))
             return menu
 
@@ -827,8 +854,9 @@ def run(switcher) -> int:
             accounts = self.snapshot["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
+            show_email = self._show_email()
             for num, email, _is_active, _display, _last_good, alias, disabled, _fetched_at in accounts:
-                name = f"{alias}  ({email})" if alias else email
+                name = format_identity(alias, email, show_email=show_email)
                 item = rumps.MenuItem(
                     f"{num}  {name}", callback=self._make_toggle_disabled(num, disabled)
                 )
