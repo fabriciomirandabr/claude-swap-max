@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 from rich.text import Text
 from textual.widgets import ListItem, Static
 
-from claude_swap import pace, pin
+from claude_swap import pace, pin, subscription
 from claude_swap.identity import account_parts
 from claude_swap.json_output import (
     USAGE_API_KEY,
@@ -24,6 +24,7 @@ from claude_swap.json_output import (
 )
 from claude_swap.models import AccountSnapshot
 from claude_swap.oauth import FIVE_HOUR_LABEL
+from claude_swap.printer import format_age
 from claude_swap.switcher import ERROR_NOTES
 from claude_swap.usage_store import STALE_OK_S
 from claude_swap.tui import data
@@ -142,7 +143,7 @@ def usage_rows(
         rows.append(("$$", float(spend["pct"]), suffix, suffix_full))
     for key, label in (("five_hour", FIVE_HOUR_LABEL), ("seven_day", "7d")):
         window = last_good.get(key)
-        if window:
+        if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
             reset, reset_full = _reset_parts(window, now)
             suffix, suffix_full = reset or "", reset_full or ""
             if key == "seven_day":
@@ -189,6 +190,22 @@ def pin_is_broken(acc: AccountSnapshot) -> bool:
         USAGE_RELOGIN_REQUIRED,    # refresh lineage dead; only a human fixes it
         USAGE_FOREIGN_CREDENTIAL,  # the stored credential is another account's
     )
+
+
+def _append_plan(text: Text, acc: AccountSnapshot, gap: str, palette) -> None:
+    """``· Ultra`` after the header, ``(expired)`` when lapsed — the same
+    marker ``cswap list`` prints, including the age once the plan has gone two
+    TTLs without refreshing."""
+    record = acc.subscription_plan
+    if not record:
+        return
+    plan = record["plan"]
+    text.append(f"{gap}· {subscription.plan_label(plan)}", style=palette.muted)
+    if time.time() - record["fetchedAt"] >= 2 * subscription.PLAN_TTL_S:
+        age = format_age(int(record["fetchedAt"] * 1000))
+        text.append(f" ({age})", style=palette.muted)
+    if subscription.is_expired(plan):
+        text.append(" (expired)", style=palette.sev_warn)
 
 
 def _policy_badges(acc: AccountSnapshot, gap: str) -> list[str]:
@@ -272,6 +289,7 @@ def account_card_text(
         text.append("   (disabled)", style=palette.muted)
     for badge in _policy_badges(acc, "   "):
         text.append(badge, style=palette.muted)
+    _append_plan(text, acc, "   ", palette)
     age = data.format_age(acc.usage.age_s)
     if age:
         text.append(f"   {age}", style=palette.muted)
@@ -362,6 +380,7 @@ def mini_account_text(
         text.append("  (disabled)", style=palette.muted)
     for badge in _policy_badges(acc, "  "):
         text.append(badge, style=palette.muted)
+    _append_plan(text, acc, "  ", palette)
     text.append("   ")
 
     sentinel = acc.usage.sentinel
@@ -376,7 +395,9 @@ def mini_account_text(
     parts = 0
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = last_good.get(key) if isinstance(last_good, dict) else None
-        if not window:
+        if not (
+            isinstance(window, dict) and isinstance(window.get("pct"), (int, float))
+        ):
             continue
         pct = float(window["pct"])
         if parts:

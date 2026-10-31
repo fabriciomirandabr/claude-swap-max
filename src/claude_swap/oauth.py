@@ -506,7 +506,11 @@ def build_usage_result(data: dict) -> dict | None:
     result = {}
 
     h5 = data.get("five_hour")
-    if h5:
+    if (
+        isinstance(h5, dict)
+        and isinstance(h5.get("utilization"), (int, float))
+        and not isinstance(h5["utilization"], bool)
+    ):
         h5_entry = {"pct": h5["utilization"]}
         if h5.get("resets_at"):
             h5_entry["resets_at"] = h5["resets_at"]

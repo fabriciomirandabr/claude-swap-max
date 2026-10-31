@@ -18,7 +18,9 @@ The 5h window gates and penalises: ``projected_5h = pct_5h + load_per_session
 * busy_sessions`` estimates where the 5h window lands once the sessions
 already placed there keep working. An account whose projection reaches
 ``five_hour_ceiling`` is not eligible; otherwise ``score = slack - weight *
-projected_5h``, so of two equally behind accounts the emptier 5h wins.
+projected_5h``, so of two equally behind accounts the emptier 5h wins. An
+account whose usage carries no 5h window has no 5h limit: its projection is
+0, so it takes no penalty and no ceiling applies.
 
 ``score`` is always computed as ``slack - weight * projected_5h`` for known
 accounts. Eligibility additionally requires: headroom > 0 (not at-limit), then
@@ -125,7 +127,8 @@ def score_account(
     reads as unknown. The 7d window is required: without it there is no
     schedule to be behind. A 7d window without a usable ``resets_at`` has not
     started (the API omits the reset until first use), so its target is 0 and
-    its slack is ``-used_7d``. A missing 5h window likewise counts as 0.
+    its slack is ``-used_7d``. A missing 5h window means the account has no
+    5h limit: no projection, no penalty, no ceiling.
 
     Snapshots are accepted as reported by the store; decision freshness is the
     engine's job (consistent with account_headroom and binding_recovery_ts).
@@ -136,9 +139,8 @@ def score_account(
     windows = oauth.relevant_windows(usage, models)
     if any(not math.isfinite(pct) for _, pct, _ in windows):
         return _unknown(account)
-    # 7d is required; a missing 5h window counts as 0.
     used_7d = None
-    pct_5h = 0.0
+    pct_5h: float | None = None
     reset_ts_7d = None
     for label, pct, resets_at in windows:
         if label == "7d":
@@ -155,7 +157,11 @@ def score_account(
     )
     slack = target - used_7d
     safe_busy = max(0, busy_sessions)
-    projected_5h = pct_5h + params.load_per_session * safe_busy
+    projected_5h = (
+        0.0
+        if pct_5h is None
+        else pct_5h + params.load_per_session * safe_busy
+    )
     score = slack - params.five_hour_weight * projected_5h
     headroom = oauth.account_headroom(usage, models)
     assert headroom is not None  # a 7d window is known, so account_headroom has a window to reduce
