@@ -85,6 +85,7 @@ class CswapApp(App):
         ui_settings = load_ui_settings(switcher.backup_dir)
         self._theme_name = ui_settings.theme
         self.show_email: bool = ui_settings.show_email
+        self.watch_sort_mode: str = ui_settings.watch_sort
 
     def on_mount(self) -> None:
         self.register_theme(CSWAP_DARK)
@@ -442,6 +443,14 @@ class CswapApp(App):
             set_setting(self.switcher.backup_dir, "ui.theme", name)
         except Exception as exc:  # persistence is best-effort; never crash the UI
             self.notify(f"Could not save theme: {exc}", severity="warning")
+
+    def apply_watch_sort(self, mode: str) -> None:
+        """Set the watch page order live and persist it as the new default."""
+        self.watch_sort_mode = mode
+        try:
+            set_setting(self.switcher.backup_dir, "ui.watchSort", mode)
+        except Exception as exc:
+            self.notify(f"Could not save watch order: {exc}", severity="warning")
 
     def action_toggle_theme(self) -> None:
         order = ("dark", "light", "auto")

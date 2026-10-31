@@ -516,28 +516,7 @@ _parse_reset_ts = poll_policy.parse_reset_ts
 # Moved to poll_policy so the pure balance policy can rank by it without
 # importing the engine; aliased for the engine and the test suite.
 _binding_recovery_ts = poll_policy.binding_recovery_ts
-
-
-def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
-    """Epoch of an account's 7-day (weekly) window reset, or None if unknown
-    or already past.
-
-    The consume-first strategy ranks by this — the weekly window is the
-    perishable quota (the 5-hour one recycles too fast to be worth planning
-    around). A stale snapshot can carry a ``resets_at`` that has since
-    elapsed; treated as a real instant it would sort the *just-rolled-over*
-    account (the least perishable quota of all) as "soonest", so past ==
-    unknown. Plain ``ts <= now``: RESET_SLACK_S is poll-scheduling lag
-    tolerance, not ranking input — padding here would turn a genuinely
-    imminent reset into a false reset-unknown hold.
-    """
-    if isinstance(usage, dict):
-        window = usage.get("seven_day")
-        if isinstance(window, dict):
-            ts = _parse_reset_ts(window.get("resets_at"))
-            if ts is not None and ts > now:
-                return ts
-    return None
+_seven_day_reset_ts = poll_policy.seven_day_reset_ts
 
 
 class ThresholdMap(dict):

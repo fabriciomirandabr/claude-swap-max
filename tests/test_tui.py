@@ -71,6 +71,19 @@ def make_entry(
     )
 
 
+def make_entry_reset(
+    seven_day_resets_in: float | None, pct7: float = 10.0
+) -> UsageEntry:
+    """Usage whose 7d window resets in the given seconds (None: no 7d window)."""
+    last_good: dict = {"five_hour": {"pct": 25.0, "resets_at": _iso_in(7200)}}
+    if seven_day_resets_in is not None:
+        last_good["seven_day"] = {
+            "pct": pct7,
+            "resets_at": _iso_in(seven_day_resets_in),
+        }
+    return UsageEntry(last_good=last_good, fetched_at=time.time() - 5.0, age_s=5.0)
+
+
 def make_account(
     number: int | str,
     *,
@@ -1293,6 +1306,275 @@ class TestWatchScreen:
             app._update_refresh_status()
             await pilot.pause()
             assert "refreshing" in title.render().plain
+
+    def _reset_fake(self, tmp_path):
+        return FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry_reset(86400 * 5)),
+                make_account(2, entry=make_entry_reset(86400)),
+                make_account(3, entry=make_entry_reset(None)),
+            ],
+            tmp_path,
+        )
+
+    def _item_numbers(self, app) -> list[str]:
+        from textual.widgets import ListView
+
+        from claude_swap.tui.widgets import AccountItem
+
+        listview = app.screen.query_one("#accounts", ListView)
+        return [item.number for item in listview.query(AccountItem)]
+
+    async def test_default_orders_by_soonest_weekly_reset(self, tmp_path):
+        app = make_app(self._reset_fake(tmp_path))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            from textual.widgets import Static
+
+            assert self._item_numbers(app) == ["2", "1", "3"]
+            title = app.screen.query_one("#list-title", Static).render().plain
+            assert "soonest reset first" in title
+
+    async def test_setting_added_keeps_added_order(self, tmp_path):
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"ui": {"watchSort": "added"}})
+        )
+        app = make_app(self._reset_fake(tmp_path))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            from textual.widgets import Static
+
+            assert self._item_numbers(app) == ["1", "2", "3"]
+            title = app.screen.query_one("#list-title", Static).render().plain
+            assert "order added" in title
+
+    async def test_o_toggles_live_and_persists_default(self, tmp_path):
+        app = make_app(self._reset_fake(tmp_path))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            from textual.widgets import Static
+
+            await pilot.press("o")
+            await settle(pilot)
+            assert self._item_numbers(app) == ["1", "2", "3"]
+            title = app.screen.query_one("#list-title", Static).render().plain
+            assert "order added" in title
+            saved = json.loads((tmp_path / "settings.json").read_text())
+            assert saved["ui"]["watchSort"] == "added"
+            await pilot.press("o")
+            await settle(pilot)
+            assert self._item_numbers(app) == ["2", "1", "3"]
+            saved = json.loads((tmp_path / "settings.json").read_text())
+            assert saved["ui"]["watchSort"] == "reset"
+
+    async def test_selection_follows_sorted_order(self, tmp_path):
+        fake = self._reset_fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            await pilot.press("s")
+            await pilot.pause()
+            from textual.widgets import ListView
+
+            listview = app.screen.query_one("#accounts", ListView)
+            assert listview.index == 1
+            await pilot.press("up", "enter")
+            await settle(pilot)
+            assert ("switch_to", "2") in fake.calls
+
+    async def test_cursor_stays_on_account_when_order_changes(self, tmp_path):
+        fake = self._reset_fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            await pilot.press("s")
+            await pilot.pause()
+            from textual.widgets import ListView
+
+            listview = app.screen.query_one("#accounts", ListView)
+            assert listview.index == 1
+            await pilot.press("o")
+            await settle(pilot)
+            assert self._item_numbers(app) == ["1", "2", "3"]
+            assert listview.index == 0
+            await pilot.press("enter")
+            await settle(pilot)
+            assert ("switch_to", "1") in fake.calls
+
+
+    def _republish(self, app, fake, resets: dict[str, float | None], pct7=10.0):
+        fake._accounts = [
+            dataclasses.replace(
+                acc, usage=make_entry_reset(resets[acc.number], pct7=pct7)
+            )
+            for acc in fake._accounts
+        ]
+        app.snapshot = fake.accounts_snapshot()
+
+    async def test_toggle_during_snapshot_rebuild_keeps_one_row_per_account(
+        self, tmp_path
+    ):
+        fake = self._reset_fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            from textual.widgets import ListView
+
+            self._republish(app, fake, {"1": 86400 * 5, "2": 86400 * 3, "3": 3600})
+            await app.screen.action_toggle_order()
+            await settle(pilot)
+            await pilot.pause()
+            listview = app.screen.query_one("#accounts", ListView)
+            assert len(listview.children) == 3
+            assert self._item_numbers(app) == ["1", "2", "3"]
+
+    async def test_new_snapshot_alone_resorts_and_cursor_follows_account(
+        self, tmp_path
+    ):
+        fake = self._reset_fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            await pilot.press("s")
+            await pilot.pause()
+            from textual.widgets import ListView
+
+            listview = app.screen.query_one("#accounts", ListView)
+            assert self._item_numbers(app) == ["2", "1", "3"]
+            assert listview.index == 1
+            self._republish(app, fake, {"1": 3600, "2": 86400, "3": None})
+            await settle(pilot)
+            await pilot.pause()
+            assert self._item_numbers(app) == ["1", "2", "3"]
+            assert listview.index == 0
+
+    async def test_card_label_is_account_number_not_position(self, tmp_path):
+        app = make_app(self._reset_fake(tmp_path))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            from textual.widgets import ListView
+
+            from claude_swap.tui.widgets import AccountCard
+
+            listview = app.screen.query_one("#accounts", ListView)
+            cards = list(listview.query(AccountCard))
+            firsts = [card.render().plain.split()[0] for card in cards]
+            assert firsts == ["2", "1", "3"]
+
+    async def test_same_order_snapshot_updates_each_card_with_own_data(
+        self, tmp_path
+    ):
+        app = make_app(self._reset_fake(tmp_path))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            fake = app.switcher
+            fake._accounts = [
+                dataclasses.replace(
+                    acc,
+                    usage=make_entry_reset(
+                        {"1": 86400 * 5, "2": 86400, "3": 86400 * 6}[acc.number],
+                        pct7={"1": 41.0, "2": 62.0, "3": 77.0}[acc.number],
+                    ),
+                )
+                for acc in fake._accounts
+            ]
+            app.snapshot = fake.accounts_snapshot()
+            await settle(pilot)
+            await pilot.pause()
+            from textual.widgets import ListView
+
+            from claude_swap.tui.widgets import AccountCard
+
+            listview = app.screen.query_one("#accounts", ListView)
+            assert self._item_numbers(app) == ["2", "1", "3"]
+            cards = list(listview.query(AccountCard))
+            for card, pct in zip(cards, ("62", "41", "77")):
+                assert f"{pct}%" in card.render().plain
+
+    async def test_switch_screen_keeps_added_order(self, tmp_path):
+        app = make_app(self._reset_fake(tmp_path))
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            await pilot.press("s")
+            await pilot.pause()
+            from claude_swap.tui.dashboard import SwitchScreen
+
+            assert isinstance(app.screen, SwitchScreen)
+            assert self._item_numbers(app) == ["1", "2", "3"]
+
+
+class TestOrderAccounts:
+    NOW = 1_000_000.0
+
+    def test_resets_within_hysteresis_keep_added_order(self):
+        accounts = [self._acc("1", 150), self._acc("2", 100), self._acc("3", 5000)]
+        assert self._numbers(accounts, "reset") == ["1", "2", "3"]
+
+    def _acc(self, number, resets_in):
+        last_good = {}
+        if resets_in is not None:
+            last_good["seven_day"] = {
+                "pct": 10.0,
+                "resets_at": datetime.fromtimestamp(
+                    self.NOW + resets_in, timezone.utc
+                ).isoformat(),
+            }
+        return make_account(number, entry=UsageEntry(last_good=last_good))
+
+    def _numbers(self, accounts, mode):
+        return [a.number for a in tui_data.order_accounts(accounts, mode, self.NOW)]
+
+    def test_reset_sorts_soonest_first_unknown_and_past_last(self):
+        accounts = [
+            self._acc("1", 5000),
+            self._acc("2", None),
+            self._acc("3", 100),
+            self._acc("4", -60),
+            self._acc("5", 3000),
+        ]
+        assert self._numbers(accounts, "reset") == ["3", "5", "1", "2", "4"]
+
+    def test_reset_ties_keep_added_order(self):
+        accounts = [
+            self._acc("1", 500),
+            self._acc("2", None),
+            self._acc("3", 500),
+            self._acc("4", None),
+        ]
+        assert self._numbers(accounts, "reset") == ["1", "3", "2", "4"]
+
+    def test_added_keeps_given_order(self):
+        accounts = [self._acc("1", 5000), self._acc("2", 100)]
+        assert self._numbers(accounts, "added") == ["1", "2"]
+
+    def test_sentinel_entry_counts_as_unknown(self):
+        accounts = [
+            make_account("1", entry=make_entry(sentinel=USAGE_API_KEY)),
+            self._acc("2", 100),
+        ]
+        assert self._numbers(accounts, "reset") == ["2", "1"]
+
+    def test_unknown_mode_raises(self):
+        with pytest.raises(ValueError, match="watch sort"):
+            tui_data.order_accounts([], "bogus", self.NOW)
 
 
 def fake_calls(app) -> list[tuple]:

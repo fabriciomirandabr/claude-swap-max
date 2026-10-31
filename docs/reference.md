@@ -206,7 +206,7 @@ Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `cswap
 
 ### Interactive dashboard (TUI)
 
-Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `cswap watch` opens it straight to the live monitor. Works on macOS, Linux, and Windows.
+Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `cswap watch` opens it straight to the live monitor, accounts ordered by soonest weekly reset (press `o` to switch to the order they were added; the choice is saved as `ui.watchSort`). Works on macOS, Linux, and Windows.
 
 <img src="../assets/tui-watch.png" width="760" alt="cswap watch — live 5h/7d usage bars for every account, with reset times and the active account marked">
 
@@ -385,6 +385,7 @@ cswap config set autoswitch.strategy balance  # spend every account's week on sc
 cswap config set run.shareHistory true    # every cswap run shares chat history (see "run")
 cswap config set updates.check false      # no daily PyPI lookup for the "newer version" hint
 cswap config set ui.showEmail false       # aliased accounts show by alias only (unaliased keep e-mail); auto-switch events and notifications show Account-N (events carry no alias); the TUI reads it at startup
+cswap config set ui.watchSort added       # watch page order: reset (default) = weekly window resetting soonest first, unknown/past reset last; added = slot order; press o on the watch page to toggle live (saves it as the new default)
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```

@@ -17,6 +17,8 @@ No global command palette: actions live where their context is.
 
 from __future__ import annotations
 
+import asyncio
+import time
 from functools import partial
 from typing import TYPE_CHECKING, Callable
 
@@ -28,7 +30,8 @@ from textual.widgets import Footer, ListView, Static
 from claude_swap import pin
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.identity import account_display, account_parts
-from claude_swap.models import AccountsSnapshot
+from claude_swap.models import AccountSnapshot, AccountsSnapshot
+from claude_swap.tui.data import order_accounts
 from claude_swap.tui.widgets import AccountItem, AccountsPanel, MenuItem
 
 if TYPE_CHECKING:
@@ -595,6 +598,7 @@ class AccountListScreen(Screen):
         super().__init__()
         self._numbers: list[str] = []
         self._stamps: dict[str, float | None] = {}
+        self._build_lock = asyncio.Lock()
 
     def compose(self) -> ComposeResult:
         yield Static("", id="list-title")
@@ -607,8 +611,13 @@ class AccountListScreen(Screen):
     async def _on_snapshot(self, snap: AccountsSnapshot | None) -> None:
         if snap is None:
             return
+        async with self._build_lock:
+            await self._apply_snapshot(snap)
+
+    async def _apply_snapshot(self, snap: AccountsSnapshot) -> None:
         listview = self.query_one("#accounts", ListView)
-        numbers = [acc.number for acc in snap.accounts]
+        accounts = self._ordered(snap)
+        numbers = [acc.number for acc in accounts]
         # ONCE PER SNAPSHOT, not once per card per repaint. `AccountCard.render`
         # used to ask `pin.pinned_email` itself, which is per-widget and off the
         # poll — see that class for the measurement. This is the only place that
@@ -621,9 +630,13 @@ class AccountListScreen(Screen):
         if numbers != self._numbers:
             first_build = not self._numbers
             previous = listview.index
+            if previous is not None and previous < len(self._numbers):
+                kept = self._numbers[previous]
+                if kept in numbers:
+                    previous = numbers.index(kept)
             await listview.clear()
             await listview.extend(
-                AccountItem(acc, cloud_pinned=_pinned(acc)) for acc in snap.accounts
+                AccountItem(acc, cloud_pinned=_pinned(acc)) for acc in accounts
             )
             self._numbers = numbers
             listview.index = (
@@ -632,9 +645,13 @@ class AccountListScreen(Screen):
                 else None
             )
         else:
-            for item, acc in zip(listview.query(AccountItem), snap.accounts):
+            for item, acc in zip(listview.query(AccountItem), accounts):
                 item.set_account(acc, cloud_pinned=_pinned(acc))
         self._flash_updated(snap, listview)
+
+    def _ordered(self, snap: AccountsSnapshot) -> list[AccountSnapshot]:
+        """The accounts in display order (the cursor index maps onto this)."""
+        return list(snap.accounts)
 
     def _index_after_build(
         self, snap: AccountsSnapshot, first_build: bool, previous: int | None
@@ -645,14 +662,9 @@ class AccountListScreen(Screen):
         return min(previous or 0, len(snap.accounts) - 1)
 
     def _active_index(self, snap: AccountsSnapshot) -> int:
-        return next(
-            (
-                i
-                for i, acc in enumerate(snap.accounts)
-                if acc.number == snap.active_number
-            ),
-            0,
-        )
+        if snap.active_number in self._numbers:
+            return self._numbers.index(snap.active_number)
+        return 0
 
     def _flash_updated(self, snap: AccountsSnapshot, listview: ListView) -> None:
         """Briefly highlight rows whose stored measurement just advanced."""
@@ -720,9 +732,11 @@ class WatchScreen(AccountListScreen):
 
     _WATCH_TITLE = "watching all accounts"
     _SELECT_TITLE = "switch to which account? · enter confirm · esc cancel"
+    _SORT_LABELS = {"added": "order added", "reset": "soonest reset first"}
 
     BINDINGS = [
         Binding("s", "toggle_select", "Switch"),
+        Binding("o", "toggle_order", "Order"),
         Binding("enter", "select_highlighted", "Confirm", priority=True),
         Binding("f", "app.refresh_full", "Refresh", show=False),
         Binding("escape,q", "back", "Back"),
@@ -742,8 +756,22 @@ class WatchScreen(AccountListScreen):
     def _title_text(self) -> str:
         if self._selecting:
             return self._SELECT_TITLE
+        title = f"{self._WATCH_TITLE} · {self._SORT_LABELS[self.app.watch_sort_mode]}"
         status = self.app.refresh_status
-        return f"{self._WATCH_TITLE} · {status}" if status else self._WATCH_TITLE
+        return f"{title} · {status}" if status else title
+
+    def _ordered(self, snap: AccountsSnapshot) -> list[AccountSnapshot]:
+        return order_accounts(snap.accounts, self.app.watch_sort_mode, time.time())
+
+    async def action_toggle_order(self) -> None:
+        self.app.apply_watch_sort(
+            "added" if self.app.watch_sort_mode == "reset" else "reset"
+        )
+        if not self._selecting:
+            self.query_one("#list-title", Static).update(self._title_text())
+        snap = self.app.snapshot
+        if snap is not None:
+            await self._on_snapshot(snap)
 
     def _on_refresh_status(self, status: str) -> None:
         if not self._selecting:

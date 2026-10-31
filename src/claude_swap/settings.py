@@ -27,6 +27,7 @@ from claude_swap.fsutil import atomic_write_text, publish_target
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
 AUTOSWITCH_STRATEGIES = ("best", "consume-first", "balance", "priority-consume-first")
+WATCH_SORTS = ("added", "reset")
 
 _logger = logging.getLogger("claude-swap")
 
@@ -91,10 +92,13 @@ class AutoSwitchSettings:
 class UiSettings:
     """Appearance preferences (``ui`` section). ``theme`` selects the TUI/CLI
     color theme; ``auto`` follows terminal-background detection.
-    ``show_email`` off renders aliased accounts by alias alone."""
+    ``show_email`` off renders aliased accounts by alias alone. ``watch_sort``
+    orders the TUI watch page: ``added`` (slot order) or ``reset`` (weekly
+    window resetting soonest first)."""
 
     theme: str = "auto"
     show_email: bool = True
+    watch_sort: str = "reset"
 
 
 @dataclass(frozen=True)
@@ -223,6 +227,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "ui", "showEmail", "show_email", "bool",
             help="Show the e-mail and organization next to an account's alias",
+        ),
+        SettingSpec(
+            "ui", "watchSort", "watch_sort", "choice", choices=WATCH_SORTS,
+            help="Watch page order: added = slot order, reset = weekly reset soonest first",
         ),
         SettingSpec(
             "run", "shareHistory", "share_history", "bool",
@@ -354,7 +362,14 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
             show_email, default.show_email,
         )
         show_email = default.show_email
-    return UiSettings(theme=theme, show_email=show_email)
+    watch_sort = section.get("watchSort", default.watch_sort)
+    if watch_sort not in SETTING_SPECS["ui.watchSort"].choices:
+        _logger.warning(
+            "settings.json: unsupported ui.watchSort %r; using %r",
+            watch_sort, default.watch_sort,
+        )
+        watch_sort = default.watch_sort
+    return UiSettings(theme=theme, show_email=show_email, watch_sort=watch_sort)
 
 
 def load_run_settings(backup_root: Path) -> RunSettings:

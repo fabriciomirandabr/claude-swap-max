@@ -56,11 +56,12 @@ class TestConfigList:
             "autoswitch.balanceLoadPerSession",
             "ui.theme",
             "ui.showEmail",
+            "ui.watchSort",
             "run.shareHistory",
             "updates.check",
         ):
             assert key in out
-        assert out.count("(default)") == 18
+        assert out.count("(default)") == 19
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -87,7 +88,7 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 18
+        assert len(by_key) == 19
         assert by_key["autoswitch.threshold"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
         assert by_key["autoswitch.balanceLeadHours"]["value"] == 24.0
@@ -190,6 +191,11 @@ class TestConfigValidation:
         code, _, err = _run(["set", "autoswitch.strategy", "chaos"], capsys)
         assert code == 1
         assert "must be one of: best" in err
+
+    def test_bad_watch_sort_exits_1(self, temp_home, capsys):
+        code, _, err = _run(["set", "ui.watchSort", "bad"], capsys)
+        assert code == 1
+        assert "must be one of: added, reset" in err
 
     def test_balance_strategy_accepted(self, temp_home, capsys):
         code, _, _ = _run(["set", "autoswitch.strategy", "balance"], capsys)

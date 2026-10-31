@@ -18,9 +18,11 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable
+from typing import Callable, Sequence
 
-from claude_swap import oauth, printer, usage_store
+from claude_swap import oauth, poll_policy, printer, usage_store
+from claude_swap.autoswitch import RECOVERY_HYSTERESIS_S
+from claude_swap.models import AccountSnapshot
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.snapshot_source import SnapshotSource
 from claude_swap.switcher import SENTINEL_NOTES, last_seen_note
@@ -86,6 +88,25 @@ def run_action(fn: Callable[[], dict | None]) -> ActionResult:
 # ---------------------------------------------------------------------------
 # Display helpers
 # ---------------------------------------------------------------------------
+
+def order_accounts(
+    accounts: Sequence[AccountSnapshot], mode: str, now: float
+) -> list[AccountSnapshot]:
+    """Accounts in watch order: ``added`` keeps the given order; ``reset``
+    puts the weekly window resetting soonest first, unknown or past resets
+    last. Resets are bucketed by ``RECOVERY_HYSTERESIS_S`` so timestamp
+    jitter cannot reorder near-equal accounts; ties keep the given order."""
+    if mode == "added":
+        return list(accounts)
+    if mode != "reset":
+        raise ValueError(f"unknown watch sort {mode!r}")
+
+    def key(acc: AccountSnapshot) -> float:
+        ts = poll_policy.seven_day_reset_ts(acc.usage.last_good, now)
+        return float("inf") if ts is None else ts // RECOVERY_HYSTERESIS_S
+
+    return sorted(accounts, key=key)
+
 
 def sentinel_label(sentinel: str) -> str:
     """The same wording ``cswap list`` prints for this sentinel state."""

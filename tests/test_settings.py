@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import stat
 import os
 import sys
@@ -225,6 +226,32 @@ class TestUiSettings:
     def test_unknown_theme_clamps_to_default(self, tmp_path: Path):
         settings_path(tmp_path).write_text(json.dumps({"ui": {"theme": "purple"}}))
         assert load_ui_settings(tmp_path).theme == "auto"
+
+    def test_watch_sort_defaults_to_reset(self, tmp_path: Path):
+        assert load_ui_settings(tmp_path).watch_sort == "reset"
+
+    def test_reads_watch_sort_added(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"ui": {"watchSort": "added"}}))
+        assert load_ui_settings(tmp_path).watch_sort == "added"
+
+    def test_unknown_watch_sort_clamps_to_default(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"ui": {"watchSort": "name"}}))
+        assert load_ui_settings(tmp_path).watch_sort == "reset"
+
+    def test_unknown_watch_sort_logs_warning(self, tmp_path: Path, caplog):
+        settings_path(tmp_path).write_text(json.dumps({"ui": {"watchSort": "name"}}))
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            load_ui_settings(tmp_path)
+        assert "unsupported ui.watchSort 'name'; using 'reset'" in caplog.text
+
+    def test_set_watch_sort_validates_choice(self, tmp_path: Path):
+        assert set_setting(tmp_path, "ui.watchSort", "added") == "added"
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw == {"schemaVersion": 1, "ui": {"watchSort": "added"}}
+        with pytest.raises(ConfigError):
+            set_setting(tmp_path, "ui.watchSort", "name")
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw["ui"]["watchSort"] == "added"
 
     def test_set_and_unset_ui_theme(self, tmp_path: Path):
         assert set_setting(tmp_path, "ui.theme", "light") == "light"
