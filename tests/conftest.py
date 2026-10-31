@@ -693,6 +693,28 @@ def block_real_oauth_profile_fetch(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def block_real_switch_target_probe(request, monkeypatch):
+    """Safety net: no test may make a live switch-target liveness probe.
+
+    ``switch(current_at_limit=True)`` probes the chosen target's stored access
+    token through ``oauth.probe_oauth_profile_live`` before activating it.
+    Stub it to ``None`` (its documented "transport failure, no verdict" answer,
+    which lands the switch without ``validated``) so the suite stays hermetic;
+    a test exercising the guard patches it explicitly.
+    ``@pytest.mark.no_switch_probe_fake`` opts out for the probe's own unit
+    tests, which mock ``urlopen`` beneath it.
+    """
+    if request.node.get_closest_marker("no_switch_probe_fake"):
+        yield
+        return
+    monkeypatch.setattr(
+        "claude_swap.oauth.probe_oauth_profile_live",
+        lambda token, timeout_s=5.0: None,
+    )
+    yield
+
+
+@pytest.fixture(autouse=True)
 def block_real_policy_limits_fetch(request, monkeypatch):
     """Safety net: no test may make a live ``policy_limits`` request.
 

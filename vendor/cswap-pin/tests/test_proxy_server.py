@@ -16613,6 +16613,28 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
     NO_HEADROOM = {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 20.0}}
 
     @staticmethod
+    def _no_real_wait(monkeypatch):
+        """Reset `_fleet_held_until` (restored at teardown) and replace the
+        relay's wait with a recorder, so a candidates-exhausted relay does not
+        sleep for real. The recorder, like the real wait, returns the fresh
+        `_fleet_held_until`. The list it appends to is `pp._test_waits`."""
+        from cswap_pin import proxy as pp
+        monkeypatch.setattr(pp, "_fleet_held_until", 0.0)
+        waits = []
+        holds = []
+        monkeypatch.setattr(pp, "_test_waits", waits, raising=False)
+        monkeypatch.setattr(pp, "_test_holds", holds, raising=False)
+        monkeypatch.setattr(
+            pp, "_test_real_hold_reply",
+            getattr(pp, "_test_real_hold_reply", pp._hold_reply),
+            raising=False)
+        monkeypatch.setattr(
+            pp, "_hold_relay_wait",
+            lambda seconds: (waits.append(seconds), pp._fleet_held_until)[1])
+        monkeypatch.setattr(pp, "_hold_reply", holds.append)
+        return waits
+
+    @staticmethod
     def _wire(monkeypatch, switched, raises_once=None, needs_login=False,
               validated=True, before=None, live_token=None, usage=None,
               snap=None, live_num="1", entry_walled=False,
@@ -16671,7 +16693,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         # raised TypeError into the relay's except and silently stopped
         # converting any wall at all.
         def _switch(strategy=None, json_output=False, models=None,
-                    current_at_limit=False):
+                    current_at_limit=False, exclude=frozenset()):
             calls.append(models)
             if before is not None:
                 before()
@@ -16701,18 +16723,18 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                 # helper's own `except` and the unmanaged-login case passes
                 # whatever the code does.
                 None: types.SimpleNamespace(
-                    decision_value=lambda models=(): {
+                    decision_value=lambda:{
                         "five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0}}),
                 "2": types.SimpleNamespace(
-                    decision_value=lambda models=(): {
+                    decision_value=lambda:{
                         "five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0}}),
                 "1": types.SimpleNamespace(
-                    decision_value=lambda models=(): usage,
+                    decision_value=lambda:usage,
                     walled=entry_walled),
             }
             for num, fusage in (fleet or {}).items():
                 entries[num] = types.SimpleNamespace(
-                    decision_value=(lambda u: (lambda models=(): u))(fusage),
+                    decision_value=(lambda u: (lambda: u))(fusage),
                     walled=False)
             return entries
 
@@ -16748,7 +16770,10 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         pp._walled_slots.clear()
         pp._walled_switch_seen_by_session.clear()
         pp._walled_headroom_seen.clear()
-        pp._fleet_exhausted_until = 0.0
+        pp._walled_conversions_by_session.clear()
+        pp._walled_relay_spell_by_session.clear()
+        TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount._no_real_wait(
+            monkeypatch)
         # THE `_note_usage_headers` THROTTLES are memos of the SAME shape
         # and outlive this case exactly like the three above: cases run
         # alphabetically (`run_cases`'s `sorted(dir(cls))`), so a case that
@@ -16763,7 +16788,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
 
     @classmethod
     def _relay(cls, path="/v1/messages", reset=None, status=b"429 Too Many Requests",
-               auth="", session="", extra_headers=b""):
+               auth="", session="", extra_headers=b"", retry_after=None):
         import socket as _s
         from cswap_pin import proxy as pp
         up_a, up_b = _s.socketpair()
@@ -16772,7 +16797,8 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             head = b"HTTP/1.1 " + status + b"\r\n"
             if reset is not False:  # False omits the header entirely
                 head += (reset or cls.RESET_HEADER) + b"\r\n"
-            head += (cls.RETRY_AFTER + b"\r\n" + cls.UNIFIED_STATUS + b"\r\n"
+            head += ((retry_after or cls.RETRY_AFTER) + b"\r\n"
+                     + cls.UNIFIED_STATUS + b"\r\n"
                      + cls.SHOULD_RETRY + b"\r\n" + extra_headers
                      + b"Content-Length: 2\r\n\r\nno")
             up_b.sendall(head)
@@ -16839,15 +16865,30 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         self._relay()
         assert any("reason=candidates-exhausted" in l for l in lines), lines
 
-    def case_an_exhausted_fleet_relays_its_own_reset_instead_of_the_walls(
+    def _assert_never_ends_the_turn(self, got):
+        """A candidates-exhausted relay is a stripped 429 the client retries:
+        no synthetic unified headers, no `representative-claim` (which ends a
+        subscriber's turn), and a `retry-after` the client can honour."""
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        low = got.lower()
+        assert b"representative-claim" not in low, got
+        assert b"anthropic-ratelimit-" not in low, got
+        assert self.RETRY_AFTER not in got, got
+        assert self.SHOULD_RETRY not in got, got
+        assert self.UNIFIED_STATUS not in got, got
+        found = re.findall(rb"(?im)^retry-after: (\d+)\r$", got)
+        assert len(found) == 1 and 1 <= int(found[0]) <= 60, got
+        return int(found[0])
+
+    def case_an_exhausted_fleet_waits_and_relays_a_stripped_429(
         self, monkeypatch,
     ):
-        """A provable fleet-wide reset must reach the client instead of the
-        strip alone — and never later than the fleet value, since this
-        wall's OWN reset can belong to a frozen bearer on another account
-        entirely."""
+        """R14: a fleet whose blocked slots all prove a reset gets the same
+        waiting relay as a held fleet — never the synthetic `rejected` +
+        `representative-claim` headers that end a subscriber's turn."""
+        from cswap_pin import proxy as pp
         now = time.time()
-        earliest = now + 120
+        earliest = now + 100
         self._wire(
             monkeypatch, switched=False,
             fleet={"6": {"five_hour": {"pct": 100.0},
@@ -16857,25 +16898,18 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         got = self._relay(
             reset=f"anthropic-ratelimit-unified-reset: {upstream_reset}"
             .encode())
-        assert got.startswith(b"HTTP/1.1 429"), got[:40]
-        assert b"anthropic-ratelimit-unified-status: rejected" in got, got
-        assert (f"anthropic-ratelimit-unified-reset: {int(earliest)}"
-                .encode() in got), got
-        assert (f"anthropic-ratelimit-unified-reset: {upstream_reset}"
-                .encode() not in got), got
-        assert (b"anthropic-ratelimit-unified-representative-claim: "
-                b"five_hour" in got), got
-        assert self.RETRY_AFTER not in got, got
-        assert self.SHOULD_RETRY not in got, got
-        assert self.UNIFIED_STATUS not in got, got
+        retry_after = self._assert_never_ends_the_turn(got)
+        assert retry_after == 60, got
+        assert len(pp._test_waits) == 1, pp._test_waits
+        assert 98 <= pp._test_waits[0] <= 100, pp._test_waits
+        assert abs(pp._fleet_held_until - earliest) < 1, pp._fleet_held_until
 
-    def case_an_all_provable_fleet_reset_relays_uncapped_even_days_out(
+    def case_a_fleet_reset_days_out_waits_at_most_120_and_asks_for_60(
         self, monkeypatch,
     ):
-        """Every blocked slot proving its own reset means the fleet's real
-        worst case IS that far out — capping it would wake an interactive
-        client early into a wall that has not lifted. No cap applies when
-        every blocked slot is provable, however far its reset is."""
+        """However far the fleet's real worst case is, the reply waits at
+        most `_ALL_HELD_RELAY_DELAY_S` and asks to be retried within 60 s."""
+        from cswap_pin import proxy as pp
         days_out = time.time() + 86400 * 5
         self._wire(
             monkeypatch, switched=False,
@@ -16883,249 +16917,39 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                          "seven_day": {"pct": 0.0}, "_reset_ts": days_out}},
         )
         got = self._relay()
-        assert (f"anthropic-ratelimit-unified-reset: {int(days_out)}"
-                .encode() in got), got
+        assert self._assert_never_ends_the_turn(got) == 60, got
+        assert pp._test_waits == [120.0], pp._test_waits
+        assert abs(pp._fleet_held_until - days_out) < 1, pp._fleet_held_until
 
-    def case_a_not_all_provable_fleet_reset_announces_the_bounded_minimum(
+    def case_the_own_reset_header_never_reaches_the_client_or_the_wait(
         self, monkeypatch,
     ):
-        """One blocked slot proves a far reset; another proves none at all
-        — that second slot could beat the far one at any moment, so the
-        far reset cannot be relayed unbounded. Announced instead as
-        `min(earliest, decision time + _EXHAUSTED_RESET_CAP_S)`, mirroring
-        `_earliest_recovery`'s own "announce the earliest provable moment
-        and keep a bounded re-check rather than sleeping toward a reset
-        that peer may beat"."""
-        from cswap_pin import proxy as pp
-        far = time.time() + 86400 * 3
-        self._wire(
-            monkeypatch, switched=False,
-            fleet={
-                "6": {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 0.0},
-                      "_reset_ts": far},
-                "7": {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 0.0},
-                      "_reset_ts": None},
-            },
-        )
-        before = time.time()
-        got = self._relay()
-        after = time.time()
-        m = re.search(rb"anthropic-ratelimit-unified-reset: (\d+)", got)
-        assert m, got
-        relayed = int(m.group(1))
-        assert relayed < far, relayed
-        assert before + pp._EXHAUSTED_RESET_CAP_S - 1 <= relayed, relayed
-        assert relayed <= after + pp._EXHAUSTED_RESET_CAP_S + 1, relayed
-
-    def case_a_live_walls_own_clear_bounds_a_fleet_blocked_on_a_scoped_window(
-        self, monkeypatch,
-    ):
-        """A live-token 429's own reset can clear soon while
-        `_fleet_earliest_provable_reset`'s `("all",)` basis reads the SAME
-        slot as blocked for days on an unrelated per-model weekly window —
-        and every other enabled slot proves an equally far reset, so the
-        naive fleet earliest is days out too. The relay bounds the fleet
-        value by THIS 429's own reset header, so the live wall's near
-        clear time is what gets announced, never the far scoped-window
-        one."""
-        now = time.time()
-        days_out = now + 86400 * 5
-        live_reset = int(now) + 3600
-        blocked_days_out = {
-            "five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0},
-            "scoped": [{"name": "opus", "pct": 100.0}], "_reset_ts": days_out,
-        }
-        self._wire(
-            monkeypatch, switched=False, live_token=self.LIVE,
-            usage=blocked_days_out, fleet={"6": blocked_days_out},
-        )
-        got = self._relay(
-            reset=f"anthropic-ratelimit-unified-reset: {live_reset}".encode(),
-            auth="Bearer " + self.LIVE,
-        )
-        assert got.startswith(b"HTTP/1.1 429"), got[:40]
-        assert (f"anthropic-ratelimit-unified-reset: {live_reset}".encode()
-                in got), got
-        assert (f"anthropic-ratelimit-unified-reset: {int(days_out)}"
-                .encode() not in got), got
-
-    def case_a_frozen_bearers_far_own_reset_never_beats_a_nearer_fleet_value(
-        self, monkeypatch,
-    ):
-        """A frozen bearer's own reset header can be days out while the
-        fleet itself proves a nearer reset through some other slot. Both
-        are upper bounds on when this client is served again, so the
-        minimum — the nearer fleet value — is what gets relayed; the far
-        bearer reset never reaches the client.
-
-        The live slot is KNOWN WALLED (`entry_walled=True`, cswap's own
-        persisted wall) so the bearer branch falls through to `switch()`
-        instead of converting this to a 401 — exercising the actual
-        frozen-bearer path (proxy.py's `token != live` branch) rather than
-        skipping it via an unreadable credential store."""
-        now = time.time()
-        fleet_reset = int(now) + 3600
-        days_out = now + 86400 * 5
-        self._wire(
-            monkeypatch, switched=False, live_token=self.LIVE,
-            entry_walled=True,
-            fleet={"6": {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 0.0},
-                         "_reset_ts": fleet_reset}},
-        )
-        got = self._relay(
-            reset=f"anthropic-ratelimit-unified-reset: {int(days_out)}"
-            .encode(),
-            auth="Bearer stale-account-token",
-        )
-        assert got.startswith(b"HTTP/1.1 429"), got[:40]
-        assert (f"anthropic-ratelimit-unified-reset: {fleet_reset}".encode()
-                in got), got
-        assert (f"anthropic-ratelimit-unified-reset: {int(days_out)}"
-                .encode() not in got), got
-
-    def case_a_frozen_bearers_nearer_own_reset_bounds_a_far_fleet_value(
-        self, monkeypatch,
-    ):
-        """A frozen bearer's own reset header can be nearer than the
-        fleet's provable worst case — the minimum, the bearer's own nearer
-        reset, is what gets relayed.
-
-        The live slot is KNOWN WALLED (`entry_walled=True`, cswap's own
-        persisted wall) so the bearer branch falls through to `switch()`
-        instead of converting this to a 401 — exercising the actual
-        frozen-bearer path (proxy.py's `token != live` branch) rather than
-        skipping it via an unreadable credential store."""
-        now = time.time()
-        own_reset = int(now) + 1800
-        days_out = now + 86400 * 5
-        self._wire(
-            monkeypatch, switched=False, live_token=self.LIVE,
-            entry_walled=True,
-            fleet={"6": {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 0.0},
-                         "_reset_ts": days_out}},
-        )
-        got = self._relay(
-            reset=f"anthropic-ratelimit-unified-reset: {own_reset}".encode(),
-            auth="Bearer stale-account-token",
-        )
-        assert got.startswith(b"HTTP/1.1 429"), got[:40]
-        assert (f"anthropic-ratelimit-unified-reset: {own_reset}".encode()
-                in got), got
-        assert (f"anthropic-ratelimit-unified-reset: {int(days_out)}"
-                .encode() not in got), got
-
-    def case_an_unknown_live_wall_leaves_the_fleet_value_unbounded(
-        self, monkeypatch,
-    ):
-        """THE CONTROL: a default reset header far past the fleet's own
-        provable value must not engage the minimum — the announced value
-        stays the fleet's own provable worst case."""
-        days_out = time.time() + 86400 * 5
-        self._wire(
-            monkeypatch, switched=False,
-            fleet={"6": {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0},
-                         "scoped": [{"name": "opus", "pct": 100.0}],
-                         "_reset_ts": days_out}},
-        )
-        got = self._relay()
-        assert (f"anthropic-ratelimit-unified-reset: {int(days_out)}"
-                .encode() in got), got
-
-    def case_a_debounced_repeat_relays_its_own_wall_not_a_later_walls(
-        self, monkeypatch,
-    ):
-        """CONTAMINATION, fails on f7ebfbd. Wall W1 (live-token, own reset
-        now+3600) is decided against a fleet blocked days out — f7ebfbd's
-        module-wide `_fleet_exhausted_until` bounds itself to W1's own wall
-        at that moment, by design. A second live-token wall W2 on the SAME
-        slot then lands with its own reset days out and gets decided too —
-        overwriting `_walled_slots[slot]` and, on f7ebfbd, re-bounding the
-        SAME module-wide fact to W2's far value. W1 then reappears inside
-        its own debounce window: the debounced repeat never recomputes the
-        fact, so it relays whatever the fact holds NOW — W2's far value on
-        f7ebfbd, not W1's own near one. The fix bounds at relay time, from
-        each request's own reset header, so a wall never leaks another
-        wall's bound into a debounced repeat of itself."""
-        now = time.time()
-        w1_reset = int(now) + 3600
-        days_out = now + 86400 * 5
-        self._wire(
-            monkeypatch, switched=False, live_token=self.LIVE,
-            fleet={"6": {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 0.0},
-                         "_reset_ts": days_out}},
-        )
-        first = self._relay(
-            reset=f"anthropic-ratelimit-unified-reset: {w1_reset}".encode(),
-            auth="Bearer " + self.LIVE,
-        )
-        assert (f"anthropic-ratelimit-unified-reset: {w1_reset}".encode()
-                in first), first
-        self._relay(
-            reset=f"anthropic-ratelimit-unified-reset: {int(days_out)}"
-            .encode(),
-            auth="Bearer " + self.LIVE,
-        )
-        repeat = self._relay(
-            reset=f"anthropic-ratelimit-unified-reset: {w1_reset}".encode(),
-            auth="Bearer " + self.LIVE,
-        )
-        assert (f"anthropic-ratelimit-unified-reset: {w1_reset}".encode()
-                in repeat), repeat
-        assert (f"anthropic-ratelimit-unified-reset: {int(days_out)}"
-                .encode() not in repeat), repeat
-
-    def case_an_unparseable_own_reset_leaves_the_fleet_value_alone(
-        self, monkeypatch,
-    ):
-        """This 429's own reset header can fail to parse as a number —
-        nothing to bound with, so the fleet's own provable value is
-        relayed exactly as decided."""
-        fleet_reset = time.time() + 3600
-        self._wire(
-            monkeypatch, switched=False,
-            fleet={"6": {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 0.0},
-                         "_reset_ts": fleet_reset}},
-        )
-        got = self._relay(
-            reset=b"anthropic-ratelimit-unified-reset: not-a-number")
-        assert (f"anthropic-ratelimit-unified-reset: {int(fleet_reset)}"
-                .encode() in got), got
-
-    def case_a_past_own_reset_bounds_the_fleet_value_at_the_cap(
-        self, monkeypatch,
-    ):
-        """This 429's own reset header can already be past — the SAME
-        case `_fleet_earliest_provable_reset` treats as unprovable,
-        because that account could recover at any moment. Relayed instead
-        as `min(fleet value, now + _EXHAUSTED_RESET_CAP_S)`, the same
-        bounded re-check the not-all-provable case gets, rather than the
-        bare far fleet value: a client sleeping to it would ignore that
-        this very request's own account may already be clear."""
+        """This 429's own reset (far, near, past, unparseable) is neither
+        relayed nor folded into the wait: the relay is a stripped 429
+        whatever the bearer's wall says."""
         from cswap_pin import proxy as pp
         now = time.time()
-        days_out = now + 86400 * 5
-        self._wire(
-            monkeypatch, switched=False,
-            fleet={"6": {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 0.0},
-                         "_reset_ts": days_out}},
-        )
-        before = time.time()
-        got = self._relay(
-            reset=f"anthropic-ratelimit-unified-reset: {int(now) - 100}"
-            .encode())
-        after = time.time()
-        m = re.search(rb"anthropic-ratelimit-unified-reset: (\d+)", got)
-        assert m, got
-        relayed = int(m.group(1))
-        assert relayed < int(days_out), relayed
-        assert before + pp._EXHAUSTED_RESET_CAP_S - 1 <= relayed, relayed
-        assert relayed <= after + pp._EXHAUSTED_RESET_CAP_S + 1, relayed
+        for own in (f"{int(now) + 86400 * 5}", f"{int(now) + 1800}",
+                    f"{int(now) - 100}", "not-a-number"):
+            self._wire(
+                monkeypatch, switched=False, live_token=self.LIVE,
+                entry_walled=True,
+                fleet={"6": {"five_hour": {"pct": 100.0},
+                             "seven_day": {"pct": 0.0},
+                             "_reset_ts": now + 3600}},
+            )
+            got = self._relay(
+                reset=f"anthropic-ratelimit-unified-reset: {own}".encode(),
+                auth="Bearer stale-account-token",
+            )
+            self._assert_never_ends_the_turn(got)
+            assert own.encode() not in got, (own, got)
+            assert pp._test_waits == [120.0], (own, pp._test_waits)
 
     def case_a_disabled_slot_is_never_the_fleets_earliest(self, monkeypatch):
         """A slot the user disabled is never a `switch()` candidate, so its
-        earlier reset must not be the one announced. Both resets stay under
-        `_EXHAUSTED_RESET_CAP_S` so the cap cannot be the reason either
-        value wins — see the separate cap case for that."""
+        earlier reset must not be the one the wait follows."""
+        from cswap_pin import proxy as pp
         now = time.time()
         self._wire(
             monkeypatch, switched=False,
@@ -17138,90 +16962,98 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             disabled={"3"},
         )
         got = self._relay()
-        assert (f"anthropic-ratelimit-unified-reset: {int(now + 200)}"
-                .encode() in got), got
-        assert (f"anthropic-ratelimit-unified-reset: {int(now + 50)}"
-                .encode() not in got), got
+        self._assert_never_ends_the_turn(got)
+        assert abs(pp._fleet_held_until - (now + 200)) < 1, (
+            pp._fleet_held_until)
 
-    def case_no_provable_fleet_reset_is_not_announced(self, monkeypatch):
+    def case_no_provable_fleet_reset_waits_the_fixed_delay(self, monkeypatch):
         """No blocked slot can prove a reset at all — it could recover any
-        moment — so nothing is announced, and the plain strip stands."""
+        moment — so the reply waits the fixed relay delay, still a stripped
+        429."""
+        from cswap_pin import proxy as pp
         self._wire(
             monkeypatch, switched=False,
             fleet={"6": {"five_hour": {"pct": 100.0},
                          "seven_day": {"pct": 0.0}, "_reset_ts": None}},
         )
+        before = time.time()
         got = self._relay()
-        assert got.startswith(b"HTTP/1.1 429"), got[:40]
-        assert b"anthropic-ratelimit-unified-status: rejected" not in got, got
+        self._assert_never_ends_the_turn(got)
         assert self.RESET_HEADER not in got, got[:80]
+        assert abs(pp._fleet_held_until
+                   - (before + pp._ALL_HELD_RELAY_DELAY_S)) < 2, (
+            pp._fleet_held_until)
+        assert len(pp._test_waits) == 1 and 118 <= pp._test_waits[0] <= 120, (
+            pp._test_waits)
 
-    def case_a_host_without_the_fleet_symbols_is_not_announced(
+    def case_a_host_without_the_fleet_symbols_still_waits_the_fixed_delay(
         self, monkeypatch,
     ):
         """An older claude-swap with no `is_account_disabled` / no
-        `poll_policy` — the shape every case above `fleet=` gets by
-        omitting it — must not raise into the relay; it just cannot prove
-        anything, so the plain strip stands."""
+        `poll_policy` must not raise into the relay: it cannot prove a
+        reset, so the reply waits the fixed delay."""
+        from cswap_pin import proxy as pp
         calls = self._wire(monkeypatch, switched=False)
         got = self._relay()
-        assert got.startswith(b"HTTP/1.1 429"), got[:40]
-        assert b"anthropic-ratelimit-unified-status: rejected" not in got, got
+        self._assert_never_ends_the_turn(got)
         assert len(calls) == 1, calls
+        assert len(pp._test_waits) == 1 and 118 <= pp._test_waits[0] <= 120, (
+            pp._test_waits)
 
     def case_the_fleet_fact_does_not_leak_across_a_different_reason(
         self, monkeypatch,
     ):
-        """A stale exhausted verdict from an earlier wall must not survive
-        into THIS decision when its own `switch()` reports a different
-        reason — the memo has to clear, not just fail to refresh."""
+        """A stale held verdict from an earlier wall must not survive into
+        THIS decision when its own `switch()` reports a different reason —
+        the memo has to clear, not just fail to refresh."""
         from cswap_pin import proxy as pp
         self._wire(monkeypatch, switched=False, reason="some-other-reason")
-        pp._fleet_exhausted_until = time.time() + 500
+        pp._fleet_held_until = time.time() + 500
         got = self._relay()
-        assert b"anthropic-ratelimit-unified-status: rejected" not in got, got
-        assert pp._fleet_exhausted_until == 0.0, pp._fleet_exhausted_until
+        assert self.RETRY_AFTER not in got, got
+        assert pp._fleet_held_until == 0.0, pp._fleet_held_until
+        assert pp._test_waits == [], pp._test_waits
 
     def case_the_fleet_fact_clears_on_a_landed_switch(self, monkeypatch):
-        """A switch that actually lands says the fleet is not exhausted —
-        even when a stale exhausted verdict from an earlier wall is still
-        sitting in the fact."""
+        """A switch that actually lands says the fleet is not held — even
+        when a stale held verdict from an earlier wall is still sitting in
+        the fact."""
         from cswap_pin import proxy as pp
         self._wire(monkeypatch, switched=True)
-        pp._fleet_exhausted_until = time.time() + 500
+        pp._fleet_held_until = time.time() + 500
         self._relay()
-        assert pp._fleet_exhausted_until == 0.0, pp._fleet_exhausted_until
+        assert pp._fleet_held_until == 0.0, pp._fleet_held_until
 
     def case_the_fleet_fact_clears_when_switch_raises(self, monkeypatch):
         """A raising `switch()` proves nothing about the fleet — a stale
-        exhausted verdict from an earlier wall must not survive it."""
+        held verdict from an earlier wall must not survive it."""
         from cswap_pin import proxy as pp
         monkeypatch.setattr(pp, "_WALLED_SWITCH_RAISE_TTL", 0.0)
         self._wire(monkeypatch, switched=True, raises_once=OSError("locked"))
-        pp._fleet_exhausted_until = time.time() + 500
+        pp._fleet_held_until = time.time() + 500
         self._relay()
-        assert pp._fleet_exhausted_until == 0.0, pp._fleet_exhausted_until
+        assert pp._fleet_held_until == 0.0, pp._fleet_held_until
 
     def case_the_fleet_fact_clears_on_a_stale_bearer_conversion(
         self, monkeypatch,
     ):
         """The stale-bearer 401 branch never calls `switch()` — it judged
-        the LIVE slot able to take a retry, so a stale exhausted verdict
-        from an earlier wall must not survive it either."""
+        the LIVE slot able to take a retry, so a stale held verdict from an
+        earlier wall must not survive it either."""
         from cswap_pin import proxy as pp
         self._wire(monkeypatch, switched=False,
                    live_token=self.LIVE, usage=self.HEADROOM)
-        pp._fleet_exhausted_until = time.time() + 500
+        pp._fleet_held_until = time.time() + 500
         got = self._relay(auth="Bearer stale-account-token")
         assert got.startswith(b"HTTP/1.1 401"), got[:40]
-        assert pp._fleet_exhausted_until == 0.0, pp._fleet_exhausted_until
+        assert pp._fleet_held_until == 0.0, pp._fleet_held_until
 
-    def case_a_debounced_repeat_of_an_exhausted_wall_still_carries_the_headers(
+    def case_a_debounced_repeat_of_an_exhausted_wall_gets_the_same_waiting_relay(
         self, monkeypatch,
     ):
-        """A debounced repeat never recomputes the fleet fact — it must
-        read whatever the first decision on this wall wrote, not the
-        strip alone."""
+        """A debounced repeat never recomputes the fleet fact — it reads
+        whatever the first decision on this wall wrote and waits like it."""
+        from cswap_pin import proxy as pp
         now = time.time()
         calls = self._wire(
             monkeypatch, switched=False,
@@ -17230,11 +17062,40 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         )
         first = self._relay()
         second = self._relay()
-        assert b"anthropic-ratelimit-unified-status: rejected" in first, first
-        assert (b"anthropic-ratelimit-unified-status: rejected"
-                in second), second
+        self._assert_never_ends_the_turn(first)
+        self._assert_never_ends_the_turn(second)
         assert len(calls) == 1, (
             f"the repeat must be a debounce, not a fresh switch(): {calls}")
+        assert pp._test_waits == [120.0, 120.0], pp._test_waits
+
+    def case_a_live_slot_with_a_full_model_window_still_gets_its_stale_bearer_401(
+        self, monkeypatch,
+    ):
+        """The 401 sends the client to rebuild onto the live slot, judged on
+        5h/7d only: Fable at 100% with 5h/7d at 30% still converts, so the
+        proxy never ends the turn on a per-model window."""
+        usage = {"five_hour": {"pct": 30.0}, "seven_day": {"pct": 30.0},
+                 "scoped": [{"name": "Fable", "pct": 100.0}]}
+        calls = self._wire(monkeypatch, switched=False,
+                           live_token=self.LIVE, usage=usage)
+        got = self._relay(auth="Bearer stale-account-token")
+        assert got.startswith(b"HTTP/1.1 401"), got[:40]
+        assert calls == [], calls
+
+    def case_a_live_slot_missing_a_base_window_never_converts_on_headroom(
+        self, monkeypatch,
+    ):
+        """A reading missing the 5h or the 7d window yields no headroom at
+        all (None), whatever the other window or a scoped one says."""
+        from cswap_pin import proxy as pp
+        for usage in (
+            {"five_hour": {"pct": 10.0}},
+            {"seven_day": {"pct": 10.0}},
+            {"scoped": [{"name": "Fable", "pct": 10.0}]},
+        ):
+            self._wire(monkeypatch, switched=False,
+                       live_token=self.LIVE, usage=usage)
+            assert pp._live_account_headroom("1") is None, usage
 
     def case_a_raising_switch_releases_the_slot_for_a_retry(self, monkeypatch):
         """A transient failure (this daemon's own config lock held
@@ -17850,25 +17711,31 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             f"N stale sessions on one wall must share one headroom read, "
             f"not pay their own: {snap}")
 
-    def case_one_session_gets_one_401_per_ttl_even_as_its_token_rotates(
+    def case_one_session_gets_one_401_per_bearer_per_ttl(
         self, monkeypatch,
     ):
-        """THE 78bd597 LOOP STAYS CLOSED, per session now instead of per
-        wall: a second 429 carrying the same reset from the SAME session --
-        even with a rotated token, since a retry mints a fresh one -- is
-        still proof the conversion did not land, and must not repeat the
-        401 that would spend the client's retries with no sleep."""
+        """THE 78bd597 LOOP STAYS CLOSED, per session and per bearer: a
+        second 429 carrying the same reset from the SAME session with the
+        SAME bearer is proof the conversion did not land, and must not
+        repeat the 401. A CHANGED bearer on the same reset and slot is a
+        client that did rebuild, so it is not frozen and gets its own 401."""
         calls = self._wire(monkeypatch, switched=False,
                            live_token=self.LIVE, usage=self.HEADROOM)
         first = self._relay(auth="Bearer stale-account-token",
                             session="cse_rotating")
         assert first.startswith(b"HTTP/1.1 401"), first[:40]
-        for n in (2, 3):
-            again = self._relay(auth=f"Bearer rotated-token-{n}",
+        for n in (1, 2):
+            again = self._relay(auth="Bearer stale-account-token",
                                 session="cse_rotating")
             assert again.startswith(b"HTTP/1.1 429"), (
-                f"relay {n}: the same session must not get a second 401 "
+                f"relay {n}: the same bearer must not get a second 401 "
                 f"inside the TTL: {again[:40]!r}")
+        rotated = self._relay(auth="Bearer rotated-token-2",
+                              session="cse_rotating")
+        assert rotated.startswith(b"HTTP/1.1 401"), rotated[:40]
+        repeat = self._relay(auth="Bearer rotated-token-2",
+                             session="cse_rotating")
+        assert repeat.startswith(b"HTTP/1.1 429"), repeat[:40]
         assert not calls, (
             f"no repeat from this session may reach switch(): {calls}")
 
@@ -18037,12 +17904,13 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         an attempt per TTL across the whole window to mint that permanent
         TRUE. The key is `(reset, slot)`; the slot does not rotate per retry,
         so a same-account token rotation still debounces."""
-        slots = iter(["1", "2"])   # one slot read per relay
+        live = {"slot": "1"}
         calls = self._wire(monkeypatch, switched=True, live_token=self.LIVE,
                            usage=self.HEADROOM,
-                           live_num=lambda: next(slots, "2"))
+                           live_num=lambda: live["slot"])
         first = self._relay(auth="Bearer " + self.LIVE)
         assert first.startswith(b"HTTP/1.1 401"), first[:40]
+        live["slot"] = "2"
         # Slot 2's own wall, same epoch, and it has never been switched off.
         second = self._relay(auth="Bearer " + self.LIVE)
         assert second.startswith(b"HTTP/1.1 401"), second[:40]
@@ -18122,7 +17990,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                         and row["LiveSlot"] == "Managed")
         if stale_bearer and row["Headroom"] not in ("Exhausted", "OverLimit"):
             return True, 0
-        return row["Switch"] == "LandedValidated", 1
+        return row["Switch"] in ("LandedValidated", "LandedUnvalidated"), 1
 
     def case_every_row_of_the_pict_model(self, monkeypatch):
         """One row per pairwise combination, expected outcome derived from the
@@ -18199,7 +18067,10 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         server round trip inside the one lock every waiter in a wall storm
         blocks on -- ten concurrent 429s on one wall is measured, and the
         debounced repeats (28 in the 2026-09-09 event) would each pay it in
-        series. The key needs the slot; nothing needs it read under the lock."""
+        series. The key needs the slot, so the FIRST read is outside the lock;
+        the one re-read that guards the decision against a move while the
+        thread waited for the lock sits after the debounce, so a debounced
+        repeat never pays it."""
         from cswap_pin import proxy as pp
         under_lock = []
 
@@ -18213,8 +18084,13 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         self._wire(monkeypatch, switched=False, live_token=self.LIVE,
                    usage=self.HEADROOM, live_num=_slot)
         self._relay(auth="Bearer stale-account-token")
-        assert under_lock and not any(under_lock), (
-            "the live slot was resolved while `_walled_switch_lock` was held: "
+        assert under_lock[0] is False, (
+            "the pair read must happen before the lock is taken: "
+            f"{under_lock}")
+        assert under_lock == [False, True], under_lock
+        self._relay(auth="Bearer stale-account-token")
+        assert under_lock == [False, True, False], (
+            "a debounced repeat must not re-read the slot under the lock: "
             f"{under_lock}")
 
     def case_the_bearer_conversion_is_logged(self, monkeypatch):
@@ -18230,35 +18106,33 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         self._relay(auth="Bearer stale-account-token")
         assert sum("no longer the live account" in m for m in logged) == 1, logged
 
-    def case_a_switch_without_a_validated_landing_relays_the_429_with_headers_stripped(
+    def case_a_switch_without_a_validated_landing_converts_to_a_401(
         self, monkeypatch,
     ):
-        """`switch()` landed a credential but never probed it live (an older
-        cswap on the host, or a probe that did not run) — no `validated`
-        key at all. A 401 here would rebuild CC onto a credential nobody
-        confirmed is alive, which is worse than the wall it replaces."""
+        """`switch()` landed a credential and the probe gave no verdict (a
+        transport failure, or an older cswap that never probed) — no
+        `validated` key at all. Availability beats a rare dead credential:
+        the landing counts as good and the client rebuilds onto it."""
         from cswap_pin import proxy as pp
         logged = []
         monkeypatch.setattr(pp, "_log_lifecycle", logged.append)
         calls = self._wire(monkeypatch, switched=True, validated=None)
         got = self._relay()
-        assert got.startswith(b"HTTP/1.1 429"), got[:40]
-        assert self.RESET_HEADER not in got, got[:80]
-        assert self.RETRY_AFTER not in got, got[:80]
+        assert got.startswith(b"HTTP/1.1 401"), got[:40]
+        assert b"retry-after" not in got.lower(), got
         assert sum(
-            "did not validate the landing credential (validated absent), "
-            "relaying the 429 with headers stripped" in m for m in logged
+            "walled account switched off, relaying a 401 (the landing "
+            "carries no validation verdict)" in m for m in logged
         ) == 1, logged
         second = self._relay()
-        assert second.startswith(b"HTTP/1.1 429"), second[:40]
-        assert self.RESET_HEADER not in second, second[:80]
+        assert second.startswith(b"HTTP/1.1 401"), second[:40]
         assert len(calls) == 1, len(calls)
 
     def case_a_switch_with_validated_false_relays_the_429_with_headers_stripped(
         self, monkeypatch,
     ):
-        """Same as the missing-key case, spelled the other way: `switch()`
-        ran the probe and it came back dead."""
+        """A host that says outright the landing credential is dead
+        (`validated` False) is the one landing the proxy never converts."""
         from cswap_pin import proxy as pp
         logged = []
         monkeypatch.setattr(pp, "_log_lifecycle", logged.append)
@@ -18268,8 +18142,9 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert self.RESET_HEADER not in got, got[:80]
         assert self.RETRY_AFTER not in got, got[:80]
         assert sum(
-            "did not validate the landing credential (validated False), "
-            "relaying the 429 with headers stripped" in m for m in logged
+            "switch() reported switched=True" in m
+            and "relaying the 429 with headers stripped" in m
+            for m in logged
         ) == 1, logged
         second = self._relay()
         assert second.startswith(b"HTTP/1.1 429"), second[:40]
@@ -18577,6 +18452,10 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         pp._walled_slots.clear()
         pp._walled_switch_seen_by_session.clear()
         pp._walled_headroom_seen.clear()
+        pp._walled_conversions_by_session.clear()
+        pp._walled_relay_spell_by_session.clear()
+        TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount._no_real_wait(
+            monkeypatch)
         return calls
 
     def case_a_walled_slot_live_again_re_decides_when_the_host_can_exclude_it(
@@ -18751,6 +18630,9 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         pp._walled_slots.clear()
         pp._walled_switch_seen_by_session.clear()
         pp._walled_headroom_seen.clear()
+        pp._walled_conversions_by_session.clear()
+        pp._walled_relay_spell_by_session.clear()
+        self._no_real_wait(monkeypatch)
 
         first = self._relay(reset=self.RESET_HEADER, auth="Bearer token-6")
         assert first.startswith(b"HTTP/1.1 429"), first[:40]
@@ -18882,6 +18764,793 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert len(calls) == 1, (
             f"a reset already in the past zeroed the debounce and let a "
             f"second concurrent 429 call switch() again: {calls}")
+
+    @classmethod
+    def _wall(cls, n):
+        return b"anthropic-ratelimit-unified-reset: " + str(9000000000 + n).encode()
+
+    def case_conversions_are_held_from_the_third_and_relayed_from_the_sixth(
+        self, monkeypatch,
+    ):
+        from cswap_pin import proxy as pp
+        calls = self._wire(monkeypatch, switched=False,
+                           live_token=self.LIVE, usage=self.HEADROOM)
+        got = [self._relay(auth="Bearer stale-account-token",
+                           session="cse_budget", reset=self._wall(n))
+               for n in range(8)]
+        assert [g[9:12] for g in got] == [b"401"] * 6 + [b"429"] * 2, [
+            g[:40] for g in got]
+        assert pp._test_holds == [120.0] * 6, pp._test_holds
+        for g in got[:6]:
+            assert b"retry-after" not in g.lower(), g
+        for g in got[6:]:
+            assert re.findall(rb"(?im)^retry-after: (\d+)\r$", g) == [b"30"], g
+            assert b"anthropic-ratelimit" not in g.lower(), g
+        assert not calls, calls
+
+    def case_a_request_without_a_session_id_is_never_counted(
+        self, monkeypatch,
+    ):
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, switched=False,
+                   live_token=self.LIVE, usage=self.HEADROOM)
+        for n in range(8):
+            got = self._relay(auth="Bearer stale-account-token",
+                              session="", reset=self._wall(n))
+            assert got.startswith(b"HTTP/1.1 401"), (n, got[:40])
+        assert pp._test_holds == [], pp._test_holds
+        assert pp._walled_conversions_by_session == {}
+
+    def case_conversions_leave_the_count_after_1800_seconds(self, monkeypatch):
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, switched=False,
+                   live_token=self.LIVE, usage=self.HEADROOM)
+        now = time.time()
+        pp._walled_conversions_by_session["cse_old"] = (
+            [now - 1801.0] * 4 + [now - 5.0])
+        got = self._relay(auth="Bearer stale-account-token",
+                          session="cse_old", reset=self._wall(0))
+        assert got.startswith(b"HTTP/1.1 401"), got[:40]
+        assert pp._test_holds == [], pp._test_holds
+        assert len(pp._walled_conversions_by_session["cse_old"]) == 2
+
+    def case_the_conversion_hold_runs_on_the_relay_path_holding_no_lock(
+        self, monkeypatch,
+    ):
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, switched=False,
+                   live_token=self.LIVE, usage=self.HEADROOM)
+        locked = []
+        monkeypatch.setattr(
+            pp, "_hold_reply",
+            lambda seconds: locked.append(pp._walled_switch_lock.locked()))
+        for n in range(3):
+            self._relay(auth="Bearer stale-account-token",
+                        session="cse_lock", reset=self._wall(n))
+        assert locked == [False], locked
+
+    def case_a_draining_process_ends_the_conversion_hold_at_once(
+        self, monkeypatch,
+    ):
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, switched=False,
+                   live_token=self.LIVE, usage=self.HEADROOM)
+        def _never_sleep(seconds):
+            raise AssertionError(f"slept {seconds}s while draining")
+
+        monkeypatch.setattr(pp, "_hold_reply", pp._test_real_hold_reply)
+        monkeypatch.setattr(pp, "this_process_is_draining", lambda: True)
+        monkeypatch.setattr(time, "sleep", _never_sleep)
+        for n in range(4):
+            got = self._relay(auth="Bearer stale-account-token",
+                              session="cse_drain", reset=self._wall(n))
+            assert got.startswith(b"HTTP/1.1 401"), (n, got[:40])
+
+    def case_no_byte_reaches_the_client_during_the_conversion_hold(
+        self, monkeypatch,
+    ):
+        import select
+        import socket as _s
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, switched=False,
+                   live_token=self.LIVE, usage=self.HEADROOM)
+        monkeypatch.setattr(pp, "_CONVERSION_HOLD_FROM", 1)
+        monkeypatch.setattr(pp, "_CONVERSION_HOLD_S", 1.2)
+        entered = threading.Event()
+        real_hold = pp._test_real_hold_reply
+
+        def _signalling_hold(seconds):
+            entered.set()
+            real_hold(seconds)
+
+        monkeypatch.setattr(pp, "_hold_reply", _signalling_hold)
+        up_a, up_b = _s.socketpair()
+        cl_a, cl_b = _s.socketpair()
+        try:
+            up_b.sendall(
+                b"HTTP/1.1 429 Too Many Requests\r\n" + self._wall(1) + b"\r\n"
+                b"retry-after: 10\r\nContent-Length: 2\r\n\r\nno")
+            up_b.shutdown(_s.SHUT_WR)
+            worker = threading.Thread(
+                target=lambda: pp._relay_response(
+                    up_a, cl_a, 0, method="POST", path="/v1/messages",
+                    auth="Bearer stale-account-token", session="cse_nb"),
+                daemon=True)
+            worker.start()
+            assert entered.wait(5), "the relay never reached its hold"
+            deadline = time.monotonic() + 0.8
+            while time.monotonic() < deadline:
+                readable, _, _ = select.select([cl_b], [], [], 0.05)
+                assert readable == [], "a byte arrived during the hold"
+            assert worker.is_alive(), "the hold ended early"
+            worker.join(5)
+            assert not worker.is_alive()
+            cl_a.shutdown(_s.SHUT_WR)
+            got = cl_b.recv(4096)
+            assert got.startswith(b"HTTP/1.1 401"), got[:40]
+        finally:
+            for x in (up_a, up_b, cl_a, cl_b):
+                try: x.close()
+                except OSError: pass
+
+    def case_a_repeat_inside_the_ttl_gets_the_waiting_relay_and_one_after_it_a_401(
+        self, monkeypatch,
+    ):
+        from cswap_pin import proxy as pp
+        calls = self._wire(monkeypatch, switched=False,
+                           live_token=self.LIVE, usage=self.HEADROOM)
+        got = [self._relay(auth="Bearer stale-account-token",
+                           session="cse_frozen") for _ in range(11)]
+        assert [g[9:12] for g in got] == [b"401"] + [b"429"] * 10, [
+            g[:40] for g in got]
+        for g in got[1:]:
+            assert re.findall(rb"(?im)^retry-after: (\d+)\r$", g) == [b"30"], g
+            assert b"anthropic-ratelimit" not in g.lower(), g
+        assert pp._test_holds == [120.0] * 10, pp._test_holds
+        real_time = time.time
+        monkeypatch.setattr(time, "time", lambda: real_time() + 31.0)
+        after = self._relay(auth="Bearer stale-account-token",
+                            session="cse_frozen")
+        assert after.startswith(b"HTTP/1.1 401"), after[:40]
+        assert not calls, calls
+
+    def case_the_session_memo_lasts_the_shared_30_seconds(
+        self, monkeypatch,
+    ):
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, switched=False,
+                   live_token=self.LIVE, usage=self.HEADROOM)
+        self._relay(auth="Bearer stale-account-token", session="cse_ttl")
+        (expiry,) = pp._walled_switch_seen_by_session.values()
+        assert 20.0 < expiry - time.time() <= 30.0, expiry
+        assert pp._WALLED_SWITCH_RAISE_TTL == 30.0
+        assert not hasattr(pp, "_SESSION_CONVERTED_TTL_S")
+
+    def case_a_slot_that_moves_again_between_the_passes_holds_and_switches_nothing(
+        self, monkeypatch,
+    ):
+        from cswap_pin import proxy as pp
+        reads = iter(["1", "2", "3", "3", "3", "3"])
+        logged = []
+        monkeypatch.setattr(pp, "_log_lifecycle", logged.append)
+        calls = self._wire(monkeypatch, switched=True, live_token=self.LIVE,
+                           live_num=lambda: next(reads))
+        monkeypatch.setattr(pp, "_log_lifecycle", logged.append)
+        got = self._relay(auth="Bearer " + self.LIVE)
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert re.findall(rb"(?im)^retry-after: (\d+)\r$", got) == [b"30"], got
+        assert not calls, calls
+        assert pp._walled_slots == {}
+        assert pp._fleet_held_until == 0.0
+        assert any("moved again" in m for m in logged), logged
+
+
+class TestARateLimitedSlotIsHeldAndTheReplyWaitsWhenEveryCandidateIsHeld:
+    """R10-R17 over the real `_relay_response`, with the real host modules
+    `rate_limit_hold` and `settings` on a temp backup dir and a fake switcher
+    whose `switch` carries the real keyword-only signature."""
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    A = TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount
+    HEADROOM = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 20.0}}
+    EXHAUSTED = {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 0.0}}
+    EXHAUSTED_RESULT = {"switched": False, "needsLogin": False,
+                        "reason": "candidates-exhausted"}
+    LANDED = {"switched": True, "needsLogin": False, "reason": None,
+              "validated": True}
+
+    @classmethod
+    def _host(cls, monkeypatch, tmp_path, results, usage=None, disabled=(),
+              waits=None, real_wait=False, lines=None):
+        from claude_swap import rate_limit_hold, settings as host_settings
+        from cswap_pin import proxy as pp
+
+        state = {"num": "1"}
+        calls = []
+        rows = usage if usage is not None else {
+            "1": cls.HEADROOM, "2": cls.HEADROOM}
+
+        class _Switcher:
+            def switch(self, strategy=None, json_output=False, models=(),
+                       model_source=None, *, current_at_limit=False,
+                       exclude=frozenset()):
+                calls.append({
+                    "strategy": strategy, "json_output": json_output,
+                    "models": models, "current_at_limit": current_at_limit,
+                    "exclude": exclude})
+                result = results[min(len(calls), len(results)) - 1]
+                if isinstance(result, Exception):
+                    raise result
+                if callable(result):
+                    return result(state)
+                return dict(result)
+
+            def current_account_number(self):
+                return state["num"]
+
+            def _read_credentials(self):
+                return json.dumps({"claudeAiOauth": {
+                    "accessToken": f"token-{state['num']}"}})
+
+            def usage_entries_by_account(self, fetch=None):
+                return {
+                    num: types.SimpleNamespace(
+                        decision_value=(lambda u: lambda: u)(u))
+                    for num, u in rows.items()}
+
+            def is_account_disabled(self, num):
+                return num in disabled
+
+        mapping = {
+            "switcher": types.SimpleNamespace(ClaudeAccountSwitcher=_Switcher),
+            "rate_limit_hold": rate_limit_hold,
+            "settings": host_settings,
+            "paths": types.SimpleNamespace(get_backup_root=lambda: tmp_path),
+            "poll_policy": types.SimpleNamespace(
+                limiting_reset_ts=lambda u, models=(): (
+                    u.get("_reset_ts") if isinstance(u, dict) else None)),
+        }
+        real_require = pp.require
+        monkeypatch.setattr(
+            pp, "require",
+            lambda name: mapping[name] if name in mapping
+            else real_require(name))
+        if not real_wait:
+            recorded = waits if waits is not None else []
+            monkeypatch.setattr(
+                pp, "_hold_relay_wait",
+                lambda seconds: (recorded.append(seconds),
+                                 pp._fleet_held_until)[1])
+        monkeypatch.setattr(pp, "_hold_reply", lambda seconds: None)
+        if lines is not None:
+            monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
+        pp._walled_switch_seen.clear()
+        pp._walled_slots.clear()
+        pp._walled_switch_seen_by_session.clear()
+        pp._walled_headroom_seen.clear()
+        pp._walled_conversions_by_session.clear()
+        pp._walled_relay_spell_by_session.clear()
+        monkeypatch.setattr(pp, "_fleet_held_until", 0.0)
+        pp._usage_header_seen.clear()
+        pp._usage_header_spawn_seen.clear()
+        return calls, state
+
+    @staticmethod
+    def _short_holds(tmp_path, seconds="10"):
+        from claude_swap import settings as host_settings
+        host_settings.set_setting(
+            tmp_path, "autoswitch.rateLimitHoldSeconds", seconds)
+
+    @classmethod
+    def _relay(cls, num="1", **kw):
+        return cls.A._relay(auth=f"Bearer token-{num}", **kw)
+
+    @staticmethod
+    def _retry_after(got):
+        found = re.findall(rb"(?im)^retry-after: (\d+)\r$", got)
+        assert len(found) == 1, got
+        return int(found[0])
+
+    def case_the_host_wiring_clears_a_fleet_held_until_a_previous_case_left_behind(
+        self, monkeypatch, tmp_path,
+    ):
+        from cswap_pin import proxy as pp
+        monkeypatch.setattr(pp, "_fleet_held_until", 123456789.0)
+        self._host(monkeypatch, tmp_path, [self.LANDED])
+        assert pp._fleet_held_until == 0.0, pp._fleet_held_until
+
+    def case_a_live_429_records_the_hold_and_walls_the_slot_for_its_duration(
+        self, monkeypatch, tmp_path,
+    ):
+        from claude_swap import rate_limit_hold
+        from cswap_pin import proxy as pp
+        lines = []
+        self._host(monkeypatch, tmp_path, [self.LANDED], lines=lines)
+        t0 = time.time()
+        self._relay(retry_after=b"retry-after: 90")
+        persisted = rate_limit_hold.active_holds(tmp_path, time.time())
+        assert abs(persisted["1"] - (t0 + 120)) < 5, persisted
+        assert pp._walled_slots["1"] == persisted["1"], pp._walled_slots
+        assert any("slot 1 on hold for 120s" in l and "retry-after=90" in l
+                   and "n=1" in l for l in lines), lines
+
+    def case_a_hostile_retry_after_is_logged_as_a_bounded_repr(
+        self, monkeypatch, tmp_path,
+    ):
+        lines = []
+        self._host(monkeypatch, tmp_path, [self.LANDED], lines=lines)
+        self._relay(retry_after=b"retry-after: " + b"A" * 40 + b"TAILMARK\x01")
+        hold_lines = [l for l in lines if "on hold for" in l]
+        assert hold_lines, lines
+        assert all("TAILMARK" not in l for l in hold_lines), hold_lines
+        assert all("\x01" not in l for l in hold_lines), hold_lines
+        assert any(f"retry-after='{'A' * 32}'" in l for l in hold_lines), (
+            hold_lines)
+
+    def case_the_walled_slot_expires_at_the_earlier_of_the_reset_and_the_hold(
+        self, monkeypatch, tmp_path,
+    ):
+        from cswap_pin import proxy as pp
+        self._host(monkeypatch, tmp_path, [self.LANDED])
+        reset = int(time.time()) + 30
+        self._relay(
+            reset=f"anthropic-ratelimit-unified-reset: {reset}".encode(),
+            retry_after=b"retry-after: 90")
+        assert pp._walled_slots["1"] == float(reset), pp._walled_slots
+
+    def case_an_unusable_retry_after_holds_for_the_base_duration(
+        self, monkeypatch, tmp_path,
+    ):
+        from claude_swap import rate_limit_hold
+        self._host(monkeypatch, tmp_path, [self.LANDED])
+        t0 = time.time()
+        self._relay(retry_after=b"retry-after: abc")
+        until = rate_limit_hold.active_holds(tmp_path, time.time())["1"]
+        assert abs(until - (t0 + 120)) < 5, until
+
+    def case_a_record_failure_is_logged_and_holds_two_minutes_in_memory(
+        self, monkeypatch, tmp_path,
+    ):
+        from claude_swap import rate_limit_hold
+        from claude_swap.exceptions import LockError
+        from cswap_pin import proxy as pp
+
+        def _locked(*a, **k):
+            raise LockError("held elsewhere")
+
+        lines = []
+        calls, _ = self._host(
+            monkeypatch, tmp_path,
+            [{"switched": False, "reason": "usage-unavailable"}], lines=lines)
+        monkeypatch.setattr(rate_limit_hold, "record_hold", _locked)
+        t0 = time.time()
+        got = self._relay()
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert len(calls) == 1, calls
+        assert abs(pp._walled_slots["1"] - (t0 + 120)) < 5, pp._walled_slots
+        assert any("could not persist the hold" in l and "LockError" in l
+                   for l in lines), lines
+        assert calls[0]["exclude"] == frozenset({"1"}), calls
+
+    def case_exclude_carries_the_holds_a_previous_process_persisted(
+        self, monkeypatch, tmp_path,
+    ):
+        from claude_swap import rate_limit_hold
+        calls, _ = self._host(monkeypatch, tmp_path, [self.LANDED])
+        rate_limit_hold.record_hold(tmp_path, "5", 600, time.time(), 120, 1800)
+        got = self._relay()
+        assert got.startswith(b"HTTP/1.1 401"), got[:40]
+        assert calls == [{
+            "strategy": "best", "json_output": True, "models": ("all",),
+            "current_at_limit": True, "exclude": frozenset({"1", "5"})}], calls
+
+    def case_a_chain_of_walls_never_revisits_a_held_slot(
+        self, monkeypatch, tmp_path,
+    ):
+        def _land(to):
+            def _do(state):
+                state["num"] = to
+                return dict(self.LANDED)
+            return _do
+
+        calls, state = self._host(
+            monkeypatch, tmp_path, [_land("2"), _land("3"), _land("4")])
+        resets = [b"anthropic-ratelimit-unified-reset: 9999999991",
+                  b"anthropic-ratelimit-unified-reset: 9999999992",
+                  b"anthropic-ratelimit-unified-reset: 9999999993"]
+        for num, reset in zip(("1", "2", "3"), resets):
+            got = self._relay(num=num, reset=reset)
+            assert got.startswith(b"HTTP/1.1 401"), got[:40]
+        assert [c["exclude"] for c in calls] == [
+            frozenset({"1"}), frozenset({"1", "2"}),
+            frozenset({"1", "2", "3"})], calls
+
+    def case_every_candidate_held_relays_a_stripped_429_after_the_wait(
+        self, monkeypatch, tmp_path,
+    ):
+        from claude_swap import rate_limit_hold
+        from cswap_pin import proxy as pp
+        waits = []
+        self._host(monkeypatch, tmp_path, [self.EXHAUSTED_RESULT],
+                   waits=waits)
+        rate_limit_hold.record_hold(tmp_path, "2", 600, time.time(), 120, 1800)
+        t0 = time.time()
+        got = self._relay(retry_after=b"retry-after: 90")
+        low = got.lower()
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert b"representative-claim" not in low, got
+        assert b"anthropic-ratelimit-" not in low, got
+        assert b"x-should-retry" not in low, got
+        assert got.endswith(b"\r\n\r\nno"), got
+        assert self._retry_after(got) == 60, got
+        assert len(waits) == 1 and abs(waits[0] - 120) < 5, waits
+        assert abs(pp._fleet_held_until - (t0 + 120)) < 5, pp._fleet_held_until
+
+    def case_the_wait_and_the_retry_after_follow_a_short_hold(
+        self, monkeypatch, tmp_path,
+    ):
+        waits = []
+        self._host(monkeypatch, tmp_path, [self.EXHAUSTED_RESULT],
+                   waits=waits)
+        self._short_holds(tmp_path)
+        got = self._relay(retry_after=b"retry-after: 3")
+        assert 9 <= waits[0] <= 10, waits
+        assert 9 <= self._retry_after(got) <= 10, got
+
+    def case_a_1500_second_hold_waits_exactly_120_in_one_wait(
+        self, monkeypatch, tmp_path,
+    ):
+        waits = []
+        self._host(monkeypatch, tmp_path, [self.EXHAUSTED_RESULT],
+                   waits=waits)
+        got = self._relay(retry_after=b"retry-after: 1495")
+        assert waits == [120.0], waits
+        assert self._retry_after(got) == 60, got
+
+    def case_a_debounced_repeat_gets_the_same_held_relay(
+        self, monkeypatch, tmp_path,
+    ):
+        waits = []
+        calls, _ = self._host(monkeypatch, tmp_path, [self.EXHAUSTED_RESULT],
+                              waits=waits)
+        first = self._relay(retry_after=b"retry-after: 90")
+        second = self._relay(retry_after=b"retry-after: 90")
+        assert len(calls) == 1, calls
+        assert len(waits) == 2, waits
+        for got in (first, second):
+            assert got.startswith(b"HTTP/1.1 429"), got[:40]
+            assert b"representative-claim" not in got.lower(), got
+            assert self._retry_after(got) == 60, got
+
+    def case_a_really_exhausted_fleet_gets_the_same_waiting_relay(
+        self, monkeypatch, tmp_path,
+    ):
+        from cswap_pin import proxy as pp
+        waits = []
+        now = time.time()
+        self._host(
+            monkeypatch, tmp_path, [self.EXHAUSTED_RESULT],
+            usage={"1": dict(self.EXHAUSTED, _reset_ts=now + 300),
+                   "2": dict(self.EXHAUSTED, _reset_ts=now + 200)},
+            waits=waits)
+        got = self._relay()
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        low = got.lower()
+        assert b"representative-claim" not in low, got
+        assert b"anthropic-ratelimit-" not in low, got
+        assert abs(pp._fleet_held_until - (now + 200)) < 2, pp._fleet_held_until
+        assert waits == [120.0], waits
+        assert self._retry_after(got) == 60, got
+
+    def case_a_held_slot_that_is_really_at_100_percent_is_not_hold_only(
+        self, monkeypatch, tmp_path,
+    ):
+        from cswap_pin import proxy as pp
+        waits = []
+        t0 = time.time()
+        self._host(
+            monkeypatch, tmp_path, [self.EXHAUSTED_RESULT],
+            usage={"1": self.EXHAUSTED, "2": self.EXHAUSTED}, waits=waits)
+        self._relay(retry_after=b"retry-after: 400")
+        assert abs(pp._fleet_held_until - (t0 + 120)) < 5, pp._fleet_held_until
+        assert len(waits) == 1, waits
+
+    def case_a_disabled_held_slot_is_not_hold_only(self, monkeypatch, tmp_path):
+        from claude_swap import rate_limit_hold
+        from cswap_pin import proxy as pp
+        waits = []
+        t0 = time.time()
+        self._host(
+            monkeypatch, tmp_path, [self.EXHAUSTED_RESULT],
+            usage={"1": self.EXHAUSTED, "2": self.HEADROOM},
+            disabled=("2",), waits=waits)
+        rate_limit_hold.record_hold(tmp_path, "2", 600, time.time(), 120, 1800)
+        self._relay(retry_after=b"retry-after: 400")
+        assert abs(pp._fleet_held_until - (t0 + 120)) < 5, pp._fleet_held_until
+
+    def case_one_hold_only_slot_among_really_walled_ones_is_enough(
+        self, monkeypatch, tmp_path,
+    ):
+        from claude_swap import rate_limit_hold
+        from cswap_pin import proxy as pp
+        waits = []
+        self._host(
+            monkeypatch, tmp_path, [self.EXHAUSTED_RESULT],
+            usage={"1": self.EXHAUSTED, "2": self.HEADROOM}, waits=waits)
+        self._short_holds(tmp_path)
+        rate_limit_hold.record_hold(tmp_path, "2", 30, time.time(), 10, 1800)
+        got = self._relay()
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert b"representative-claim" not in got.lower(), got
+        assert 34 <= waits[0] <= 35, waits
+        assert 34 <= self._retry_after(got) <= 35, got
+
+    def case_an_unknown_reading_counts_as_hold_only(self, monkeypatch, tmp_path):
+        from claude_swap import rate_limit_hold
+        from cswap_pin import proxy as pp
+        t0 = time.time()
+        for readings in (
+            {"1": None, "2": None},
+            {"1": "rate-limited", "2": "rate-limited"},
+        ):
+            self._host(
+                monkeypatch, tmp_path, [self.EXHAUSTED_RESULT],
+                usage=readings, waits=[])
+            rate_limit_hold.record_hold(
+                tmp_path, "2", 880, time.time(), 120, 1800)
+            self._relay(retry_after=b"retry-after: 395")
+            assert abs(pp._fleet_held_until - (t0 + 400)) < 5, (
+                readings, pp._fleet_held_until)
+
+    def case_other_unconverted_relays_carry_retry_after_30(
+        self, monkeypatch, tmp_path,
+    ):
+        for result in (
+            RuntimeError("boom"),
+            {"switched": False, "needsLogin": False,
+             "reason": "usage-unavailable"},
+            {"switched": True, "needsLogin": False, "reason": None,
+             "validated": False},
+        ):
+            waits = []
+            self._host(monkeypatch, tmp_path, [result], waits=waits)
+            got = self._relay()
+            assert got.startswith(b"HTTP/1.1 429"), (result, got[:40])
+            assert self._retry_after(got) == 30, (result, got)
+            assert b"3600" not in got, (result, got)
+            assert waits == [], (result, waits)
+
+    def case_a_401_conversion_carries_no_retry_after(
+        self, monkeypatch, tmp_path,
+    ):
+        self._host(monkeypatch, tmp_path, [self.LANDED])
+        got = self._relay()
+        assert got.startswith(b"HTTP/1.1 401"), got[:40]
+        assert b"retry-after" not in got.lower(), got
+
+    def case_the_wait_ends_at_once_when_the_process_is_draining(
+        self, monkeypatch, tmp_path,
+    ):
+        from cswap_pin import proxy as pp
+        self._host(monkeypatch, tmp_path, [self.EXHAUSTED_RESULT],
+                   real_wait=True)
+        monkeypatch.setattr(pp, "this_process_is_draining", lambda: True)
+        started = time.monotonic()
+        got = self._relay(retry_after=b"retry-after: 1500")
+        assert time.monotonic() - started < 2.0
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert self._retry_after(got) == 60, got
+
+    def case_the_wait_really_holds_the_reply_back(self, monkeypatch, tmp_path):
+        from cswap_pin import proxy as pp
+        self._host(monkeypatch, tmp_path, [self.EXHAUSTED_RESULT],
+                   real_wait=True)
+        monkeypatch.setattr(pp, "_ALL_HELD_RELAY_DELAY_S", 0.3)
+        started = time.monotonic()
+        got = self._relay(retry_after=b"retry-after: 10")
+        assert time.monotonic() - started >= 0.3
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+
+    def case_no_byte_reaches_the_client_before_the_wait_is_over(
+        self, monkeypatch, tmp_path,
+    ):
+        import select
+        import socket as _s
+        from cswap_pin import proxy as pp
+        self._host(monkeypatch, tmp_path, [self.EXHAUSTED_RESULT],
+                   real_wait=True)
+        monkeypatch.setattr(pp, "_ALL_HELD_RELAY_DELAY_S", 1.2)
+        entered = threading.Event()
+        real_wait = pp._hold_relay_wait
+
+        def _signalling_wait(seconds):
+            entered.set()
+            return real_wait(seconds)
+
+        monkeypatch.setattr(pp, "_hold_relay_wait", _signalling_wait)
+        up_a, up_b = _s.socketpair()
+        cl_a, cl_b = _s.socketpair()
+        try:
+            up_b.sendall(
+                b"HTTP/1.1 429 Too Many Requests\r\n"
+                + self.A.RESET_HEADER + b"\r\n"
+                b"retry-after: 10\r\nContent-Length: 2\r\n\r\nno")
+            up_b.shutdown(_s.SHUT_WR)
+            worker = threading.Thread(
+                target=lambda: pp._relay_response(
+                    up_a, cl_a, 0, method="POST", path="/v1/messages",
+                    auth="Bearer token-1", session=""),
+                daemon=True)
+            worker.start()
+            assert entered.wait(5), "the relay never reached its wait"
+            deadline = time.monotonic() + 0.8
+            while time.monotonic() < deadline:
+                readable, _, _ = select.select([cl_b], [], [], 0.05)
+                assert readable == [], "a byte arrived during the wait"
+            assert worker.is_alive(), "the wait ended early"
+            worker.join(5)
+            assert not worker.is_alive()
+            cl_a.shutdown(_s.SHUT_WR)
+            got = cl_b.recv(4096)
+            assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        finally:
+            for x in (up_a, up_b, cl_a, cl_b):
+                try: x.close()
+                except OSError: pass
+
+    def case_retry_after_is_1_after_a_real_wait_that_ran_to_expiry(
+        self, monkeypatch, tmp_path,
+    ):
+        from cswap_pin import proxy as pp
+        self._host(monkeypatch, tmp_path, [self.EXHAUSTED_RESULT],
+                   real_wait=True)
+        monkeypatch.setattr(
+            pp, "_fleet_hold_only_until", lambda held: time.time() + 0.5)
+        started = time.monotonic()
+        got = self._relay(retry_after=b"retry-after: 10")
+        assert time.monotonic() - started >= 0.5
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert self._retry_after(got) == 1, got
+
+    def case_clearing_the_fleet_fact_mid_wait_ends_the_wait_at_once(
+        self, monkeypatch, tmp_path,
+    ):
+        from cswap_pin import proxy as pp
+        self._host(monkeypatch, tmp_path, [self.EXHAUSTED_RESULT],
+                   real_wait=True)
+        entered = threading.Event()
+        real_wait = pp._hold_relay_wait
+
+        def _signalling_wait(seconds):
+            entered.set()
+            return real_wait(seconds)
+
+        monkeypatch.setattr(pp, "_hold_relay_wait", _signalling_wait)
+        box = {}
+        worker = threading.Thread(
+            target=lambda: box.update(got=self._relay()), daemon=True)
+        started = time.monotonic()
+        worker.start()
+        assert entered.wait(5), "the relay never reached its wait"
+        time.sleep(0.3)
+        pp._fleet_held_until = 0.0
+        worker.join(3)
+        assert not worker.is_alive(), "the wait ignored the cleared fact"
+        assert time.monotonic() - started < 3
+        assert box["got"].startswith(b"HTTP/1.1 429"), box
+        assert self._retry_after(box["got"]) == 1, box["got"]
+
+    def case_a_slot_that_moves_after_the_pair_read_takes_the_bearer_branch(
+        self, monkeypatch, tmp_path,
+    ):
+        from claude_swap import rate_limit_hold
+        from cswap_pin import proxy as pp
+        waits = []
+        calls, state = self._host(
+            monkeypatch, tmp_path, [self.EXHAUSTED_RESULT], waits=waits)
+        real_token = pp._active_oauth_token
+        flipped = {"done": False}
+
+        def _flip_after_the_first_pair_read():
+            token = real_token()
+            if not flipped["done"]:
+                flipped["done"] = True
+                state["num"] = "2"
+            return token
+
+        monkeypatch.setattr(pp, "_active_oauth_token",
+                            _flip_after_the_first_pair_read)
+        got = self._relay()
+        assert got.startswith(b"HTTP/1.1 401"), got[:40]
+        assert calls == [], calls
+        assert waits == [], waits
+        assert rate_limit_hold.active_holds(tmp_path, time.time()) == {}
+        assert pp._walled_slots == {}
+
+    def case_a_landing_with_no_verdict_converts_to_a_401(
+        self, monkeypatch, tmp_path,
+    ):
+        waits = []
+        calls, state = self._host(
+            monkeypatch, tmp_path, [self._land_unvalidated], waits=waits)
+        got = self._relay(num="1", reset=self.A.RESET_HEADER)
+        assert got.startswith(b"HTTP/1.1 401"), got[:40]
+        assert b"retry-after" not in got.lower(), got
+        assert state["num"] == "2"
+        assert len(calls) == 1, calls
+        assert waits == [], waits
+
+    @staticmethod
+    def _land_unvalidated(state):
+        state["num"] = "2"
+        return {"switched": True, "needsLogin": False, "reason": None,
+                "to": {"number": 2, "email": "b@example.com"}}
+
+    def case_a_none_slot_re_read_keeps_the_hold_on_the_original_slot(
+        self, monkeypatch, tmp_path,
+    ):
+        from claude_swap import rate_limit_hold
+        from cswap_pin import proxy as pp
+        calls, state = self._host(
+            monkeypatch, tmp_path, [self.EXHAUSTED_RESULT])
+        reads = []
+
+        def _slot_then_blind():
+            reads.append(1)
+            return state["num"] if len(reads) == 1 else None
+
+        monkeypatch.setattr(pp, "_live_account_slot", _slot_then_blind)
+        self._relay(num="1")
+        assert len(calls) == 1, calls
+        assert set(rate_limit_hold.active_holds(tmp_path, time.time())) \
+            == {"1"}
+        assert "1" in calls[0]["exclude"], calls
+
+    def case_a_persisted_hold_on_the_live_slot_blocks_the_stale_bearer_401(
+        self, monkeypatch, tmp_path,
+    ):
+        from claude_swap import rate_limit_hold
+        from cswap_pin import proxy as pp
+        calls, state = self._host(
+            monkeypatch, tmp_path, [self.EXHAUSTED_RESULT])
+        state["num"] = "2"
+        rate_limit_hold.record_hold(tmp_path, "2", 600, time.time(), 120, 1800)
+        assert pp._walled_slots == {}
+        got = self._relay(num="1")
+        assert not got.startswith(b"HTTP/1.1 401"), got[:40]
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert len(calls) == 1, calls
+
+    def case_the_wait_holds_no_lock_and_blocks_no_other_client(
+        self, monkeypatch, tmp_path,
+    ):
+        from cswap_pin import proxy as pp
+        self._host(monkeypatch, tmp_path, [self.EXHAUSTED_RESULT])
+        entered = threading.Event()
+        gate = threading.Event()
+
+        def _wait(seconds):
+            entered.set()
+            gate.wait(10)
+            return pp._fleet_held_until
+
+        monkeypatch.setattr(pp, "_hold_relay_wait", _wait)
+        box = {}
+        worker = threading.Thread(
+            target=lambda: box.update(got=self._relay()), daemon=True)
+        worker.start()
+        try:
+            assert entered.wait(5), "the held relay never reached its wait"
+            assert pp._walled_switch_lock.acquire(blocking=False)
+            pp._walled_switch_lock.release()
+            other = self.A._relay(status=b"200 OK", auth="")
+            assert other.startswith(b"HTTP/1.1 200"), other[:40]
+        finally:
+            gate.set()
+            worker.join(5)
+        assert box["got"].startswith(b"HTTP/1.1 429"), box
 
 
 class TestTheEvidenceSurvivesAHandover:

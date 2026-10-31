@@ -6007,7 +6007,7 @@ class TestAllAboveHeadroomDoesNotFlap:
         # _perform's lastSwitchAt) with a couple of spares so neither code
         # path can exhaust the sequence.
         clock_values = iter([
-            ranking_now, ranking_now, stale_reread,
+            ranking_now, ranking_now, ranking_now, stale_reread,
             stale_reread, stale_reread, stale_reread,
         ])
         with patch.object(h.engine, "clock", side_effect=lambda: next(clock_values)):
@@ -8073,3 +8073,386 @@ class TestWeeklyThreshold:
         h.engine.apply_threshold(72.0)
         assert h.switcher._poll_inputs_override == (72.0, 97.0, ())
         assert h.engine.settings.weekly_threshold == 97.0
+
+
+def _hold(h: EngineHarness, slot: int, seconds: float = 120.0) -> float:
+    from claude_swap.rate_limit_hold import record_hold
+
+    return record_hold(
+        h.switcher.backup_dir, str(slot), None, h.clock.now, seconds, seconds
+    )
+
+
+def _rel(h: EngineHarness, hours: float) -> str:
+    return _iso_at(h.clock.now + hours * 3600)
+
+
+def _switches_of(h: EngineHarness) -> list[SwitchEvent]:
+    return [e for e in h.events if isinstance(e, SwitchEvent)]
+
+
+def _no_switch_reasons(h: EngineHarness) -> list[str]:
+    return [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+
+
+class TestRateLimitHold:
+    def _fleet(self, temp_home: Path, count: int = 3, **settings) -> EngineHarness:
+        h = EngineHarness(temp_home, **settings)
+        for num in range(1, count + 1):
+            h.seed(num, f"{chr(96 + num)}@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    @pytest.mark.parametrize(
+        "strategy", ["best", "consume-first", "balance", "priority-consume-first"]
+    )
+    def test_held_peer_is_out_of_every_strategy_ranking(self, temp_home, strategy):
+        h = self._fleet(temp_home, strategy=strategy)
+        _hold(h, 2)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 95, _rel(h, 200)),
+            "2": _usage7(1, 1, _rel(h, 10)),
+            "3": _usage7(40, 40, _rel(h, 100)),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_held_primary_leaves_the_standby_as_last_man_standing(self, temp_home):
+        h = self._fleet(temp_home)
+        h.switcher.set_account_standby("3", True)
+        _hold(h, 2)
+        outcome = h.tick_with_usage({
+            "1": _usage(100), "2": _usage(5), "3": _usage(5),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_held_standby_is_not_reached_by_the_second_pass(self, temp_home):
+        h = self._fleet(temp_home)
+        h.switcher.set_account_standby("3", True)
+        _hold(h, 3)
+        outcome = h.tick_with_usage({
+            "1": _usage(100), "2": _usage(100), "3": _usage(5),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert not _switches_of(h)
+
+    def test_held_api_key_is_skipped_by_the_last_resort(self, temp_home):
+        h = self._fleet(temp_home, count=3, include_api_key_accounts=True)
+        data = h.switcher._get_sequence_data()
+        for num in ("2", "3"):
+            data["accounts"][num]["kind"] = "api_key"
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        _hold(h, 2)
+        outcome = h.tick_with_usage({
+            "1": _usage(100), "2": "api key", "3": "api key",
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_held_active_leaves_even_far_below_its_line(self, temp_home):
+        h = self._fleet(temp_home)
+        _hold(h, 1)
+        outcome = h.tick_with_usage({
+            "1": _usage(10), "2": _usage(30), "3": _usage(20),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        assert [s.trigger for s in _switches_of(h)] == ["rate-limit-hold"]
+
+    def test_held_active_with_unknown_usage_leaves_on_the_first_tick(self, temp_home):
+        h = self._fleet(temp_home)
+        _hold(h, 1)
+        outcome = h.tick_with_usage({"1": None, "2": _usage(30), "3": _usage(20)})
+        assert outcome is TickOutcome.SWITCHED
+        assert [s.trigger for s in _switches_of(h)] == ["rate-limit-hold"]
+        assert h.engine._unhealthy_ticks == 0
+
+    def test_held_active_leaves_under_priority_even_when_it_ranks_first(
+        self, temp_home
+    ):
+        h = self._fleet(temp_home, strategy="priority-consume-first")
+        _hold(h, 1)
+        outcome = h.tick_with_usage({
+            "1": _usage7(10, 10, _rel(h, 5)),
+            "2": _usage7(30, 30, _rel(h, 100)),
+            "3": _usage7(20, 20, _rel(h, 50)),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        assert [s.trigger for s in _switches_of(h)] == ["rate-limit-hold"]
+
+    def test_held_active_with_no_qualifying_peer_is_not_called_already_consuming(
+        self, temp_home
+    ):
+        h = self._fleet(temp_home, strategy="priority-consume-first")
+        _hold(h, 1)
+        outcome = h.tick_with_usage({
+            "1": _usage7(10, 10, _rel(h, 5)),
+            "2": _usage7(99, 99, _rel(h, 100)),
+            "3": _usage7(99, 99, _rel(h, 50)),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert "already-consuming-priority" not in _no_switch_reasons(h)
+        assert "no-qualifying-candidate" in _no_switch_reasons(h)
+
+    def test_held_active_ignores_the_cooldown(self, temp_home):
+        h = self._fleet(temp_home)
+        h.engine._mutate_state(lambda st: st.__setitem__("lastSwitchAt", h.clock.now))
+        _hold(h, 1)
+        outcome = h.tick_with_usage({
+            "1": _usage(10), "2": _usage(30), "3": _usage(20),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert "cooldown" not in _no_switch_reasons(h)
+
+    def test_all_above_ignores_a_held_peer(self, temp_home):
+        h = self._fleet(temp_home)
+        _hold(h, 1)
+        _hold(h, 2)
+        outcome = h.tick_with_usage({
+            "1": _usage(10), "2": _usage(5), "3": _usage(92),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_held_active_with_every_peer_held_does_not_switch(self, temp_home):
+        h = self._fleet(temp_home)
+        for slot in (1, 2, 3):
+            _hold(h, slot)
+        outcome = h.tick_with_usage({
+            "1": _usage(10), "2": _usage(5), "3": _usage(5),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert not _switches_of(h)
+
+    def test_census_keeps_a_held_peer_so_the_fleet_is_not_called_exhausted(
+        self, temp_home
+    ):
+        h = self._fleet(temp_home)
+        _hold(h, 3)
+        outcome = h.tick_with_usage({
+            "1": _usage(95), "2": _usage(100), "3": _usage(5),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert not any(isinstance(e, AllExhaustedEvent) for e in h.events)
+
+    def test_engine_departure_then_return_to_the_soonest_reset(self, temp_home):
+        h = self._fleet(temp_home, strategy="consume-first")
+        usage = {
+            "1": _usage7(20, 20, _rel(h, 10)),
+            "2": _usage7(20, 20, _rel(h, 50)),
+            "3": _usage7(20, 20, _rel(h, 100)),
+        }
+        _hold(h, 1)
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert h.state()["leftTrigger"] == "rate-limit-hold"
+        assert h.state()["lastSwitchFrom"] == 1
+
+        h.clock.advance(60)
+        h.events.clear()
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+
+        h.clock.advance(400)
+        h.events.clear()
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        assert [s.trigger for s in _switches_of(h)] == ["consume-first"]
+
+    def test_proxy_departure_then_return_to_the_soonest_reset(self, temp_home):
+        h = self._fleet(temp_home, strategy="consume-first")
+        usage = {
+            "1": _usage7(20, 20, _rel(h, 10)),
+            "2": _usage7(20, 20, _rel(h, 50)),
+            "3": _usage7(20, 20, _rel(h, 100)),
+        }
+        h.engine._mutate_state(
+            lambda st: st.update({"lastSwitchFrom": 2, "lastSwitchTo": "1"})
+        )
+        _hold(h, 1)
+        h.switcher.switch_to("2", json_output=True)
+        assert h.active_number() == 2
+
+        h.clock.advance(60)
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+
+        h.clock.advance(120)
+        h.events.clear()
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_the_return_waits_for_the_expiry_not_before(self, temp_home):
+        h = self._fleet(temp_home, strategy="consume-first", cooldown_seconds=0.0)
+        usage = {
+            "1": _usage7(20, 20, _rel(h, 10)),
+            "2": _usage7(20, 20, _rel(h, 50)),
+            "3": _usage7(20, 20, _rel(h, 100)),
+        }
+        _hold(h, 1)
+        h.tick_with_usage(usage)
+        assert h.active_number() == 2
+        h.clock.advance(119)
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+        h.clock.advance(2)
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_an_engine_departure_for_another_reason_still_bars_the_return(
+        self, temp_home
+    ):
+        h = self._fleet(temp_home, strategy="consume-first")
+        usage = {
+            "1": _usage7(20, 20, _rel(h, 10)),
+            "2": _usage7(20, 20, _rel(h, 50)),
+            "3": _usage7(20, 20, _rel(h, 100)),
+        }
+        h.switcher.switch_to("2", json_output=True)
+        h.engine._mutate_state(lambda st: st.update({
+            "lastSwitchFrom": 1,
+            "lastSwitchTo": "2",
+            "lastSwitchAt": h.clock.now,
+            "leftHeadroom": 80.0,
+            "leftRecoveryAt": None,
+            "leftTrigger": "consume-first",
+        }))
+        h.clock.advance(400)
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+
+    def test_consume_first_with_every_peer_held_reports_candidates_on_hold(
+        self, temp_home
+    ):
+        h = self._fleet(temp_home, strategy="consume-first")
+        _hold(h, 2)
+        _hold(h, 3)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _rel(h, 100)),
+            "2": _usage7(10, 10, _rel(h, 10)),
+            "3": _usage7(10, 10, _rel(h, 20)),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert _no_switch_reasons(h) == ["candidates-on-hold"]
+
+    def test_priority_with_every_peer_held_reports_candidates_on_hold(
+        self, temp_home
+    ):
+        h = self._fleet(temp_home, strategy="priority-consume-first")
+        _hold(h, 2)
+        _hold(h, 3)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _rel(h, 100)),
+            "2": _usage7(10, 10, _rel(h, 10)),
+            "3": _usage7(10, 10, _rel(h, 20)),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert _no_switch_reasons(h) == ["candidates-on-hold"]
+
+    def test_failback_with_every_primary_held_reports_candidates_on_hold(
+        self, temp_home
+    ):
+        h = self._fleet(temp_home, count=3)
+        h.switcher.set_account_standby("1", True)
+        _hold(h, 2)
+        _hold(h, 3)
+        outcome = h.tick_with_usage({
+            "1": _usage(20), "2": _usage(5), "3": _usage(5),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert _no_switch_reasons(h) == ["candidates-on-hold"]
+
+    def test_some_peer_not_held_keeps_the_usual_reason(self, temp_home):
+        h = self._fleet(temp_home, strategy="consume-first")
+        _hold(h, 2)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _rel(h, 10)),
+            "2": _usage7(10, 10, _rel(h, 5)),
+            "3": _usage7(10, 10, _rel(h, 20)),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert _no_switch_reasons(h) == ["already-consuming-soonest"]
+
+    def test_delay_is_capped_on_a_normal_tick(self, temp_home):
+        h = self._fleet(temp_home)
+        _hold(h, 2, seconds=10.0)
+        outcome = h.tick_with_usage({
+            "1": _usage(10), "2": _usage(5), "3": _usage(5),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.engine._next_delay(outcome) <= 12.0
+
+    def test_delay_is_capped_on_an_idle_hold(self, temp_home):
+        h = self._fleet(temp_home)
+        _hold(h, 2, seconds=10.0)
+        outcome = h.tick_with_usage({
+            "1": USAGE_TOKEN_EXPIRED, "2": _usage(5), "3": _usage(5),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert _no_switch_reasons(h) == ["active-idle"]
+        assert h.engine._next_delay(outcome) <= 12.0
+
+    def test_delay_is_capped_on_a_blocked_sleep(self, temp_home):
+        h = self._fleet(temp_home)
+        _hold(h, 3, seconds=30.0)
+        outcome = h.tick_with_usage({
+            "1": _usage(100, _rel(h, 40)),
+            "2": _usage(100, _rel(h, 50)),
+            "3": _usage(100, _rel(h, 60)),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.engine._sleep_until_ts is not None
+        assert h.engine._next_delay(outcome) <= 32.0
+
+    def test_delay_never_drops_below_one_second(self, temp_home):
+        h = self._fleet(temp_home)
+        _hold(h, 2, seconds=0.2)
+        outcome = h.tick_with_usage({
+            "1": _usage(10), "2": _usage(5), "3": _usage(5),
+        })
+        h.clock.advance(5.0)
+        assert h.engine._next_delay(outcome) == pytest.approx(1.0)
+
+    def test_without_a_hold_the_delay_is_untouched(self, temp_home):
+        h = self._fleet(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage(10), "2": _usage(5), "3": _usage(5),
+        })
+        assert h.engine._earliest_hold is None
+        assert h.engine._next_delay(outcome) >= 0.9 * h.settings.interval_seconds
+
+    def test_an_expired_hold_neither_ranks_nor_caps(self, temp_home):
+        h = self._fleet(temp_home)
+        _hold(h, 2, seconds=10.0)
+        h.clock.advance(20.0)
+        outcome = h.tick_with_usage({
+            "1": _usage(95), "2": _usage(1), "3": _usage(40),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert h.engine._earliest_hold is None
+
+    def test_a_hold_departure_sends_no_desktop_notification(self):
+        from unittest import mock
+
+        from claude_swap.notifications import make_notifying_emit
+
+        def event(trigger: str) -> SwitchEvent:
+            return SwitchEvent(
+                trigger=trigger,
+                from_ref={"number": 1, "email": "a@example.com"},
+                to_ref={"number": 2, "email": "b@example.com"},
+            )
+
+        inner = mock.Mock()
+        with mock.patch("claude_swap.notifications.send_notification") as sent:
+            emit = make_notifying_emit(inner)
+            emit(event("rate-limit-hold"))
+            sent.assert_not_called()
+            emit(event("at-limit"))
+            sent.assert_called_once()
+        assert inner.call_count == 2

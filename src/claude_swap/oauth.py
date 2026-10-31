@@ -350,6 +350,42 @@ def fetch_oauth_profile(access_token: str) -> dict | None:
     }
 
 
+def probe_oauth_profile_live(access_token: str, timeout_s: float = 5.0) -> bool | None:
+    """Is this access token still accepted by the API, right now?
+
+    Same endpoint as ``fetch_oauth_profile``, but that oracle deliberately
+    collapses every failure to ``None`` ("unresolvable, proceed as before") —
+    exactly wrong for a caller who needs to tell "this credential is dead"
+    (401: the server itself rejected it) from "no answer either way"
+    (timeout, connection error, 5xx). Returns ``True`` (live), ``False``
+    (dead — a 401), or ``None`` (transport failure — no verdict). Must not be
+    called while any credential/config lock is held (network under locks is
+    forbidden).
+    """
+    url = "https://api.anthropic.com/api/oauth/profile"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "User-Agent": "claude-swap/1.0",
+    }
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(
+            req, timeout=timeout_s, context=_pin_aware_ssl_context()
+        ) as resp:
+            resp.read()
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return False
+        _logger.debug(
+            "OAuth profile liveness probe failed: %s %s", type(e).__name__, e.code
+        )
+        return None
+    except Exception as e:
+        _logger.debug("OAuth profile liveness probe failed: %s", type(e).__name__)
+        return None
+
 
 def build_token_status(credentials: str) -> str | None:
     """Return a short debug summary of stored OAuth token state."""

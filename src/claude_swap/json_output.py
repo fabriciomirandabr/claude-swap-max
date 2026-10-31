@@ -341,9 +341,12 @@ def account_row(
     policy: AccountPolicy = AccountPolicy(),
     login_expires_at: str | None = None,
     subscription_plan: dict | None = None,
+    rate_limit_hold_until: float | None = None,
 ) -> dict:
     """A full account row for ``--list``. ``backoff_until`` is the live
-    backoff only; a lapsed one is the caller's to withhold."""
+    backoff only; a lapsed one is the caller's to withhold.
+    ``rate_limit_hold_until`` is the epoch an unexpired 429 hold ends, else
+    ``None``; the row always carries ``rateLimitHoldUntil`` (ISO or null)."""
     status, usage = usage_fields(usage_entry, usage_fetched_at)
     row = {
         "number": number,
@@ -354,6 +357,11 @@ def account_row(
         "active": active,
         "usageStatus": status,
         "usage": usage,
+        "rateLimitHoldUntil": (
+            _timestamp(rate_limit_hold_until)
+            if rate_limit_hold_until is not None
+            else None
+        ),
     }
     if alias:
         row["alias"] = alias

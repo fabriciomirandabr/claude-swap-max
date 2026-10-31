@@ -86,6 +86,8 @@ class AutoSwitchSettings:
     balance_five_hour_ceiling: float = 85.0
     balance_five_hour_weight: float = 0.5
     balance_load_per_session: float = 15.0
+    rate_limit_hold_seconds: float = 120.0
+    rate_limit_hold_max_seconds: float = 1800.0
 
 
 @dataclass(frozen=True)
@@ -219,6 +221,16 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "notify", "notify", "bool",
             help="Desktop notification when cswap auto switches/quarantines/exhausts",
+        ),
+        SettingSpec(
+            "autoswitch", "rateLimitHoldSeconds", "rate_limit_hold_seconds", "float",
+            10.0, 3600.0,
+            help="Base seconds an account stays on hold after a 429 (doubles per repeat; a longer Retry-After + 5 s wins)",
+        ),
+        SettingSpec(
+            "autoswitch", "rateLimitHoldMaxSeconds", "rate_limit_hold_max_seconds", "float",
+            60.0, 86400.0,
+            help="Longest an account stays on hold after a 429, whatever Retry-After says",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),

@@ -6992,6 +6992,843 @@ class TestUsageAwareSwitch:
         assert s._get_sequence_data()["activeAccountNumber"] == 3
 
 
+class TestCurrentAtLimitSwitch:
+    """``switch(current_at_limit=True, exclude=...)``: the proxy's 429 path."""
+
+    _setup = TestUsageAwareSwitch._setup
+    _seed = TestUsageAwareSwitch._seed
+    _make_live = TestUsageAwareSwitch._make_live
+    _usage = staticmethod(TestUsageAwareSwitch._usage)
+
+    def _fleet(self, temp_home: Path, count: int = 3) -> ClaudeAccountSwitcher:
+        s = self._setup(temp_home)
+        for num in range(1, count + 1):
+            self._seed(s, num, f"{chr(96 + num)}@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+        return s
+
+    @staticmethod
+    def _run(s, usage, **kwargs):
+        kwargs.setdefault("strategy", "best")
+        kwargs.setdefault("json_output", True)
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            return s.switch(**kwargs)
+
+    @staticmethod
+    def _active(s) -> int:
+        return s._get_sequence_data()["activeAccountNumber"]
+
+    def test_signature_is_keyword_only(self):
+        import inspect
+
+        params = inspect.signature(ClaudeAccountSwitcher.switch).parameters
+        assert params["current_at_limit"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert params["exclude"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert params["current_at_limit"].default is False
+        assert params["exclude"].default == frozenset()
+        inspect.signature(ClaudeAccountSwitcher.switch).bind(
+            None, strategy="best", json_output=True, current_at_limit=True,
+            models=("all",), exclude=frozenset({"2"}),
+        )
+
+    def test_current_scores_zero_even_when_its_usage_is_unknown(self, temp_home):
+        s = self._fleet(temp_home)
+        usage = {"1": None, "2": self._usage(90), "3": self._usage(20)}
+        result = self._run(s, usage, current_at_limit=True)
+        assert result["switched"] is True
+        assert result["to"]["number"] == 3
+        assert self._active(s) == 3
+
+    def test_without_the_flag_unknown_current_still_stays(self, temp_home):
+        s = self._fleet(temp_home)
+        usage = {"1": None, "2": self._usage(90), "3": self._usage(20)}
+        result = self._run(s, usage)
+        assert result["reason"] == "usage-unavailable"
+        assert self._active(s) == 1
+
+    def test_best_never_lands_on_an_excluded_slot(self, temp_home):
+        s = self._fleet(temp_home)
+        usage = {"1": self._usage(100), "2": self._usage(90), "3": self._usage(0)}
+        result = self._run(
+            s, usage, current_at_limit=True, exclude=frozenset({"3"})
+        )
+        assert result["to"]["number"] == 2
+
+    def test_all_excluded_is_candidates_exhausted_not_a_rotation(self, temp_home):
+        s = self._fleet(temp_home)
+        usage = {"1": self._usage(100), "2": self._usage(0), "3": self._usage(0)}
+        result = self._run(
+            s, usage, current_at_limit=True, exclude=frozenset({"2", "3"})
+        )
+        assert result["switched"] is False
+        assert result["reason"] == "candidates-exhausted"
+        assert "validated" not in result
+        assert self._active(s) == 1
+
+    def test_every_candidate_at_its_limit_is_candidates_exhausted(self, temp_home):
+        s = self._fleet(temp_home)
+        usage = {"1": self._usage(100), "2": self._usage(100), "3": self._usage(100)}
+        result = self._run(s, usage, current_at_limit=True)
+        assert result["reason"] == "candidates-exhausted"
+        assert self._active(s) == 1
+
+    def test_exclude_alone_still_answers_the_old_noop_reasons(self, temp_home):
+        s = self._fleet(temp_home, count=2)
+        result = self._run(
+            s, {"1": self._usage(10), "2": self._usage(0)},
+            strategy=None, exclude=frozenset({"2"}),
+        )
+        assert result["reason"] == "no-valid-target"
+        assert self._active(s) == 1
+
+    def test_next_available_skips_excluded(self, temp_home):
+        s = self._fleet(temp_home)
+        usage = {"1": self._usage(100), "2": self._usage(0), "3": self._usage(50)}
+        result = self._run(
+            s, usage, strategy="next-available", current_at_limit=True,
+            exclude=frozenset({"2"}),
+        )
+        assert result["to"]["number"] == 3
+        assert "Skipped Account-2 (excluded)" in result["warnings"]
+
+    def test_rotation_fallthrough_skips_excluded(self, temp_home):
+        s = self._fleet(temp_home)
+        result = self._run(s, {}, strategy=None, exclude=frozenset({"2"}))
+        assert result["to"]["number"] == 3
+
+    def test_rotation_with_everything_excluded_reports_exhausted(self, temp_home):
+        s = self._fleet(temp_home)
+        result = self._run(
+            s, {}, strategy=None, current_at_limit=True,
+            exclude=frozenset({"2", "3"}),
+        )
+        assert result["reason"] == "candidates-exhausted"
+        assert self._active(s) == 1
+
+    def test_primaries_win_over_a_standby_with_more_headroom(self, temp_home):
+        s = self._fleet(temp_home)
+        s.set_account_standby("2", True)
+        usage = {"1": self._usage(100), "2": self._usage(0), "3": self._usage(90)}
+        result = self._run(s, usage, current_at_limit=True)
+        assert result["to"]["number"] == 3
+
+    def test_standby_is_taken_when_no_primary_qualifies(self, temp_home):
+        s = self._fleet(temp_home)
+        s.set_account_standby("2", True)
+        usage = {"1": self._usage(100), "2": self._usage(0), "3": self._usage(100)}
+        result = self._run(s, usage, current_at_limit=True)
+        assert result["to"]["number"] == 2
+
+    def test_primary_excluded_leaves_the_standby(self, temp_home):
+        s = self._fleet(temp_home)
+        s.set_account_standby("2", True)
+        usage = {"1": self._usage(100), "2": self._usage(0), "3": self._usage(10)}
+        result = self._run(
+            s, usage, current_at_limit=True, exclude=frozenset({"3"})
+        )
+        assert result["to"]["number"] == 2
+
+    def test_unknown_usage_candidate_is_taken_when_no_known_has_headroom(
+        self, temp_home
+    ):
+        s = self._fleet(temp_home)
+        usage = {"1": self._usage(100), "2": self._usage(100), "3": None}
+        result = self._run(s, usage, current_at_limit=True)
+        assert result["to"]["number"] == 3
+
+    def test_unknown_candidates_resolve_in_rotation_order(self, temp_home):
+        s = self._fleet(temp_home, count=4)
+        self._make_live(temp_home, "b@example.com", 2)
+        data = s._get_sequence_data()
+        data["activeAccountNumber"] = 2
+        s._write_json(s.sequence_file, data)
+        usage = {"1": None, "2": self._usage(100), "3": None, "4": None}
+        result = self._run(s, usage, current_at_limit=True)
+        assert result["to"]["number"] == 3
+
+    def test_known_headroom_beats_an_unknown_candidate(self, temp_home):
+        s = self._fleet(temp_home)
+        usage = {"1": self._usage(100), "2": None, "3": self._usage(60)}
+        result = self._run(s, usage, current_at_limit=True)
+        assert result["to"]["number"] == 3
+
+    def test_unknown_candidate_excluded_is_not_taken(self, temp_home):
+        s = self._fleet(temp_home)
+        usage = {"1": self._usage(100), "2": None, "3": None}
+        result = self._run(
+            s, usage, current_at_limit=True, exclude=frozenset({"2", "3"})
+        )
+        assert result["reason"] == "candidates-exhausted"
+
+    @staticmethod
+    def _make_api_key(s, num: str) -> None:
+        data = s._get_sequence_data()
+        data["accounts"][num]["kind"] = "api_key"
+        s._write_json(s.sequence_file, data)
+
+    def test_best_at_limit_never_lands_on_an_api_key_slot_without_opt_in(
+        self, temp_home
+    ):
+        s = self._fleet(temp_home)
+        self._make_api_key(s, "2")
+        usage = {"1": self._usage(100), "2": self._usage(0), "3": self._usage(60)}
+        result = self._run(s, usage, current_at_limit=True)
+        assert result["to"]["number"] == 3
+
+    def test_best_at_limit_with_only_api_key_peers_is_exhausted(self, temp_home):
+        s = self._fleet(temp_home)
+        self._make_api_key(s, "2")
+        self._make_api_key(s, "3")
+        usage = {"1": self._usage(100), "2": self._usage(0), "3": None}
+        result = self._run(s, usage, current_at_limit=True)
+        assert result["reason"] == "candidates-exhausted"
+        assert self._active(s) == 1
+
+    def test_best_at_limit_takes_an_api_key_slot_with_the_opt_in(self, temp_home):
+        from claude_swap.settings import set_setting
+
+        s = self._fleet(temp_home)
+        self._make_api_key(s, "2")
+        set_setting(s.backup_dir, "autoswitch.includeApiKeyAccounts", "true")
+        usage = {"1": self._usage(100), "2": self._usage(0), "3": self._usage(60)}
+        result = self._run(s, usage, current_at_limit=True)
+        assert result["to"]["number"] == 2
+
+    @pytest.mark.parametrize("strategy", [None, "next-available"])
+    def test_rotation_at_limit_skips_an_api_key_slot_without_opt_in(
+        self, temp_home, strategy
+    ):
+        s = self._fleet(temp_home)
+        self._make_api_key(s, "2")
+        result = self._run(
+            s, {"1": self._usage(100), "2": self._usage(0), "3": self._usage(10)},
+            strategy=strategy, current_at_limit=True,
+        )
+        assert result["to"]["number"] == 3
+        assert "Skipped Account-2 (API key)" in result["warnings"]
+
+    def test_rotation_at_limit_with_only_api_key_peers_is_exhausted(
+        self, temp_home
+    ):
+        s = self._fleet(temp_home)
+        self._make_api_key(s, "2")
+        self._make_api_key(s, "3")
+        result = self._run(s, {}, strategy=None, current_at_limit=True)
+        assert result["reason"] == "candidates-exhausted"
+
+    def test_rotation_without_the_flag_still_reaches_an_api_key_slot(
+        self, temp_home
+    ):
+        s = self._fleet(temp_home)
+        self._make_api_key(s, "2")
+        result = self._run(s, {}, strategy=None)
+        assert result["to"]["number"] == 2
+
+    def test_rotation_branch_takes_a_primary_before_an_earlier_standby(
+        self, temp_home
+    ):
+        s = self._fleet(temp_home)
+        s.set_account_standby("2", True)
+        result = self._run(s, {}, strategy=None, current_at_limit=True)
+        assert result["to"]["number"] == 3
+
+    def test_rotation_branch_takes_the_standby_when_no_primary_is_left(
+        self, temp_home
+    ):
+        s = self._fleet(temp_home)
+        s.set_account_standby("2", True)
+        result = self._run(
+            s, {}, strategy=None, current_at_limit=True,
+            exclude=frozenset({"3"}),
+        )
+        assert result["to"]["number"] == 2
+
+    def _hold(self, s, slot: str) -> None:
+        from claude_swap import rate_limit_hold
+
+        rate_limit_hold.record_hold(s.backup_dir, slot, 600, time.time(), 120, 1800)
+
+    def test_a_hand_rotation_skips_a_held_slot(self, temp_home):
+        s = self._fleet(temp_home)
+        self._hold(s, "2")
+        result = self._run(s, {}, strategy=None)
+        assert result["to"]["number"] == 3
+        assert "Skipped Account-2 (on hold)" in result["warnings"]
+
+    def test_strategy_best_skips_a_held_slot(self, temp_home):
+        s = self._fleet(temp_home)
+        self._hold(s, "2")
+        usage = {"1": self._usage(80), "2": self._usage(0), "3": self._usage(40)}
+        result = self._run(s, usage)
+        assert result["to"]["number"] == 3
+
+    def test_next_available_skips_a_held_slot(self, temp_home):
+        s = self._fleet(temp_home)
+        self._hold(s, "2")
+        usage = {"1": self._usage(80), "2": self._usage(0), "3": self._usage(40)}
+        result = self._run(s, usage, strategy="next-available")
+        assert result["to"]["number"] == 3
+
+    def test_an_explicit_switch_to_a_held_slot_stays_free(self, temp_home):
+        s = self._fleet(temp_home)
+        self._hold(s, "2")
+        with patch.object(s, "list_accounts"):
+            s.switch_to("2")
+        assert self._active(s) == 2
+
+    def test_a_hold_on_every_peer_leaves_a_hand_rotation_nowhere_to_go(
+        self, temp_home
+    ):
+        s = self._fleet(temp_home)
+        self._hold(s, "2")
+        self._hold(s, "3")
+        result = self._run(s, {}, strategy=None)
+        assert result["switched"] is False
+        assert self._active(s) == 1
+
+    def test_the_fresh_machine_path_honours_exclude(self, temp_home):
+        s = self._setup(temp_home)
+        for num in (1, 2, 3):
+            self._seed(s, num, f"{chr(96 + num)}@example.com")
+        with patch.object(s, "list_accounts"):
+            result = s.switch(json_output=True, exclude=frozenset({"1"}))
+        assert result["to"]["number"] == 2
+        assert any("Account-1" in w and "excluded" in w for w in result["warnings"])
+
+    def test_the_fresh_machine_path_honours_a_hold(self, temp_home):
+        s = self._setup(temp_home)
+        for num in (1, 2, 3):
+            self._seed(s, num, f"{chr(96 + num)}@example.com")
+        self._hold(s, "1")
+        with patch.object(s, "list_accounts"):
+            result = s.switch(json_output=True)
+        assert result["to"]["number"] == 2
+        assert any("Account-1" in w and "on hold" in w for w in result["warnings"])
+
+    def test_the_fresh_machine_path_at_limit_with_everything_excluded_is_exhausted(
+        self, temp_home
+    ):
+        s = self._setup(temp_home)
+        for num in (1, 2, 3):
+            self._seed(s, num, f"{chr(96 + num)}@example.com")
+        with patch.object(s, "list_accounts"):
+            result = s.switch(
+                json_output=True, current_at_limit=True,
+                exclude=frozenset({"1", "2", "3"}),
+            )
+        assert result["switched"] is False
+        assert result["reason"] == "candidates-exhausted"
+        assert "no live login" in result["message"]
+
+    def _fresh_fleet(self, temp_home, count: int = 3) -> ClaudeAccountSwitcher:
+        s = self._setup(temp_home)
+        for num in range(1, count + 1):
+            self._seed(s, num, f"{chr(96 + num)}@example.com")
+        return s
+
+    def test_the_fresh_machine_path_at_limit_skips_an_api_key_slot_without_opt_in(
+        self, temp_home
+    ):
+        s = self._fresh_fleet(temp_home)
+        self._make_api_key(s, "1")
+        self._make_api_key(s, "2")
+        with patch.object(s, "list_accounts"):
+            result = s.switch(json_output=True, current_at_limit=True)
+        assert result["to"]["number"] == 3
+        assert "Skipped Account-1 (API key)" in result["warnings"]
+
+    def test_the_fresh_machine_path_at_limit_takes_an_api_key_slot_with_the_opt_in(
+        self, temp_home
+    ):
+        from claude_swap.settings import set_setting
+
+        s = self._fresh_fleet(temp_home)
+        self._make_api_key(s, "1")
+        set_setting(s.backup_dir, "autoswitch.includeApiKeyAccounts", "true")
+        with patch.object(s, "list_accounts"):
+            result = s.switch(json_output=True, current_at_limit=True)
+        assert result["to"]["number"] == 1
+
+    def test_the_fresh_machine_path_at_limit_with_only_api_key_slots_is_exhausted(
+        self, temp_home
+    ):
+        s = self._fresh_fleet(temp_home)
+        for num in ("1", "2", "3"):
+            self._make_api_key(s, num)
+        with patch.object(s, "list_accounts"):
+            result = s.switch(json_output=True, current_at_limit=True)
+        assert result["switched"] is False
+        assert result["reason"] == "candidates-exhausted"
+
+    def test_the_fresh_machine_path_without_the_flag_still_reaches_an_api_key_slot(
+        self, temp_home
+    ):
+        s = self._fresh_fleet(temp_home)
+        self._make_api_key(s, "1")
+        with patch.object(s, "list_accounts"):
+            result = s.switch(json_output=True)
+        assert result["to"]["number"] == 1
+
+    def test_the_fresh_machine_path_at_limit_lands_unprobed(self, temp_home):
+        s = self._fresh_fleet(temp_home)
+        probes: list[str] = []
+        with patch.object(
+            s, "_probe_switch_target", side_effect=lambda n: probes.append(n)
+        ), patch(
+            "claude_swap.oauth.probe_oauth_profile_live",
+            side_effect=lambda *a, **k: probes.append("live"),
+        ), patch.object(s, "list_accounts"):
+            result = s.switch(json_output=True, current_at_limit=True)
+        assert result["switched"] is True
+        assert "validated" not in result
+        assert probes == []
+
+    @staticmethod
+    def _quarantine(s, *slots: str) -> None:
+        (s.backup_dir / "autoswitch_state.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "quarantine": {
+                slot: {"email": f"{chr(96 + int(slot))}@example.com",
+                       "reason": "invalid_grant"}
+                for slot in slots
+            },
+        }))
+
+    def test_best_at_limit_never_lands_on_a_quarantined_slot(self, temp_home):
+        s = self._fleet(temp_home)
+        self._quarantine(s, "3")
+        usage = {"1": self._usage(100), "2": self._usage(60), "3": self._usage(0)}
+        result = self._run(s, usage, current_at_limit=True)
+        assert result["to"]["number"] == 2
+
+    def test_best_at_limit_with_every_peer_quarantined_is_exhausted(self, temp_home):
+        s = self._fleet(temp_home)
+        self._quarantine(s, "2", "3")
+        usage = {"1": self._usage(100), "2": self._usage(0), "3": self._usage(0)}
+        result = self._run(s, usage, current_at_limit=True)
+        assert result["reason"] == "candidates-exhausted"
+        assert self._active(s) == 1
+
+    def test_rotation_at_limit_skips_a_quarantined_slot(self, temp_home):
+        s = self._fleet(temp_home)
+        self._quarantine(s, "2")
+        result = self._run(s, {}, strategy=None, current_at_limit=True)
+        assert result["to"]["number"] == 3
+        assert "Skipped Account-2 (quarantined)" in result["warnings"]
+
+    def test_the_fresh_machine_path_at_limit_skips_a_quarantined_slot(
+        self, temp_home
+    ):
+        s = self._fresh_fleet(temp_home)
+        self._quarantine(s, "1")
+        with patch.object(s, "list_accounts"):
+            result = s.switch(json_output=True, current_at_limit=True)
+        assert result["to"]["number"] == 2
+        assert "Skipped Account-1 (quarantined)" in result["warnings"]
+
+    def test_a_hand_switch_does_not_read_the_quarantine(self, temp_home):
+        s = self._fleet(temp_home)
+        self._quarantine(s, "2")
+        usage = {"1": self._usage(80), "2": self._usage(0), "3": self._usage(40)}
+        result = self._run(s, usage)
+        assert result["to"]["number"] == 2
+
+    @pytest.mark.parametrize("content", ["{", "[]", '{"quarantine": []}', ""])
+    def test_an_unreadable_state_file_quarantines_nothing(self, temp_home, content):
+        from claude_swap.switcher import quarantined_slots
+
+        s = self._fleet(temp_home)
+        (s.backup_dir / "autoswitch_state.json").write_text(content)
+        assert quarantined_slots(s.backup_dir) == frozenset()
+
+    def _live_on_two_with_one_peer(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = self._setup(temp_home)
+        for num in (1, 2):
+            self._seed(s, num, f"{chr(96 + num)}@example.com")
+        data = s._get_sequence_data()
+        data["activeAccountNumber"] = 2
+        s._write_json(s.sequence_file, data)
+        self._make_live(temp_home, "b@example.com", 2)
+        return s
+
+    def test_a_quarantine_that_is_a_list_quarantines_nothing_and_switch_works(
+        self, temp_home
+    ):
+        s = self._live_on_two_with_one_peer(temp_home)
+        (s.backup_dir / "autoswitch_state.json").write_text(
+            json.dumps({"quarantine": [1]}))
+        usage = {"1": self._usage(0), "2": self._usage(100)}
+        result = self._run(s, usage, current_at_limit=True)
+        assert result["switched"] is True
+        assert result["to"]["number"] == 1
+        assert self._active(s) == 1
+
+    def test_a_state_file_that_is_not_utf8_quarantines_nothing_and_switch_works(
+        self, temp_home
+    ):
+        s = self._live_on_two_with_one_peer(temp_home)
+        (s.backup_dir / "autoswitch_state.json").write_bytes(
+            b'\xff\xfe{"quarantine": {"1": {}}}')
+        usage = {"1": self._usage(0), "2": self._usage(100)}
+        result = self._run(s, usage, current_at_limit=True)
+        assert result["switched"] is True
+        assert result["to"]["number"] == 1
+        assert self._active(s) == 1
+
+    def test_the_state_filename_is_the_engines(self):
+        from claude_swap import autoswitch
+        from claude_swap.switcher import AUTOSWITCH_STATE_FILENAME
+
+        assert autoswitch.STATE_FILENAME == AUTOSWITCH_STATE_FILENAME
+
+    @staticmethod
+    def _fable_usage(five_h: float, fable: float) -> dict:
+        return {
+            "five_hour": {"pct": five_h},
+            "seven_day": {"pct": 0.0},
+            "scoped": [{"name": "Fable", "pct": fable}],
+        }
+
+    def test_best_at_limit_falls_back_to_5h_7d_when_every_peer_has_fable_full(
+        self, temp_home
+    ):
+        s = self._fleet(temp_home)
+        usage = {
+            "1": self._fable_usage(100, 0),
+            "2": self._fable_usage(50, 100),
+            "3": self._fable_usage(20, 100),
+        }
+        result = self._run(s, usage, current_at_limit=True, models=("all",))
+        assert result["switched"] is True
+        assert result["to"]["number"] == 3
+
+    def test_best_at_limit_prefers_a_peer_with_room_in_every_window(self, temp_home):
+        s = self._fleet(temp_home)
+        usage = {
+            "1": self._fable_usage(100, 0),
+            "2": self._fable_usage(60, 10),
+            "3": self._fable_usage(20, 100),
+        }
+        result = self._run(s, usage, current_at_limit=True, models=("all",))
+        assert result["to"]["number"] == 2
+
+    def test_best_at_limit_with_no_room_on_either_basis_is_exhausted(
+        self, temp_home
+    ):
+        s = self._fleet(temp_home)
+        usage = {
+            "1": self._fable_usage(100, 0),
+            "2": self._fable_usage(100, 100),
+            "3": self._fable_usage(100, 0),
+        }
+        result = self._run(s, usage, current_at_limit=True, models=("all",))
+        assert result["reason"] == "candidates-exhausted"
+        assert self._active(s) == 1
+
+    def test_the_second_pass_still_skips_excluded_and_dead_targets(self, temp_home):
+        s = self._fleet(temp_home)
+        usage = {
+            "1": self._fable_usage(100, 0),
+            "2": self._fable_usage(50, 100),
+            "3": self._fable_usage(20, 100),
+        }
+        result = self._run(
+            s, usage, current_at_limit=True, models=("all",),
+            exclude=frozenset({"3"}),
+        )
+        assert result["to"]["number"] == 2
+
+    def test_the_second_pass_is_for_current_at_limit_only(self, temp_home):
+        s = self._fleet(temp_home)
+        usage = {
+            "1": self._fable_usage(10, 0),
+            "2": self._fable_usage(5, 100),
+            "3": self._fable_usage(5, 100),
+        }
+        result = self._run(s, usage, models=("all",))
+        assert result["switched"] is False
+
+    def _unreadable_for_3(self, s):
+        from claude_swap.exceptions import SwitchError
+
+        real = s._read_target_credentials
+
+        def unreadable(num, email):
+            if num == "3":
+                raise SwitchError("backup unreadable")
+            return real(num, email)
+
+        return patch.object(s, "_read_target_credentials", side_effect=unreadable)
+
+    def test_best_skips_a_target_whose_stored_credential_cannot_be_read(
+        self, temp_home
+    ):
+        s = self._fleet(temp_home)
+        usage = {"1": self._usage(100), "2": self._usage(50), "3": self._usage(10)}
+        with self._unreadable_for_3(s):
+            result = self._run(s, usage, current_at_limit=True)
+        assert result["to"]["number"] == 2
+
+    def test_rotation_skips_a_target_whose_stored_credential_cannot_be_read(
+        self, temp_home
+    ):
+        s = self._fleet(temp_home)
+        s.set_account_standby("2", True)
+        with self._unreadable_for_3(s):
+            result = self._run(s, {}, strategy=None, current_at_limit=True)
+        assert result["to"]["number"] == 2
+        assert any("Account-3" in w and "unreadable" in w
+                   for w in result["warnings"])
+
+
+class TestCurrentAtLimitProbe:
+    """R09: the pre-lock liveness probe and the ``validated`` result key."""
+
+    _setup = TestUsageAwareSwitch._setup
+    _seed = TestUsageAwareSwitch._seed
+    _make_live = TestUsageAwareSwitch._make_live
+    _usage = staticmethod(TestUsageAwareSwitch._usage)
+
+    USAGE = {
+        "1": TestUsageAwareSwitch._usage(100),
+        "2": TestUsageAwareSwitch._usage(50),
+        "3": TestUsageAwareSwitch._usage(10),
+    }
+
+    def _fleet(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = self._setup(temp_home)
+        for num in (1, 2, 3):
+            self._seed(s, num, f"{chr(96 + num)}@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+        return s
+
+    @staticmethod
+    def _probe(verdicts: dict[str, list]):
+        seen: list[str] = []
+
+        def fake(token, timeout_s=5.0):
+            seen.append(token)
+            return verdicts[token].pop(0)
+
+        return fake, seen
+
+    def _run(self, s, verdicts, **kwargs):
+        kwargs.setdefault("strategy", "best")
+        fake, seen = self._probe(verdicts)
+        with patch.object(s, "_usage_by_account", return_value=self.USAGE), \
+             patch.object(s, "list_accounts"), \
+             patch("claude_swap.oauth.probe_oauth_profile_live", fake):
+            result = s.switch(json_output=True, **kwargs)
+        return result, seen
+
+    def test_live_target_is_validated(self, temp_home):
+        s = self._fleet(temp_home)
+        result, seen = self._run(s, {"sk-3": [True]}, current_at_limit=True)
+        assert result["to"]["number"] == 3
+        assert result["validated"] is True
+        assert seen == ["sk-3"]
+
+    def test_refresh_after_401_then_200_is_validated_on_the_refreshed_grant(
+        self, temp_home
+    ):
+        s = self._fleet(temp_home)
+        refreshed = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-3b", "refreshToken": "rt-3"},
+        })
+
+        def consume(num, email, creds):
+            s._write_account_credentials(num, email, refreshed)
+            return oauth.RefreshOutcome(refreshed, None)
+
+        with patch.object(s, "consume_backup_grant", side_effect=consume) as gate:
+            result, seen = self._run(
+                s, {"sk-3": [False], "sk-3b": [True]}, current_at_limit=True
+            )
+        assert result["to"]["number"] == 3
+        assert result["validated"] is True
+        assert seen == ["sk-3", "sk-3b"]
+        gate.assert_called_once()
+        assert s._read_account_credentials("3", "c@example.com") == refreshed
+
+    def test_dead_target_falls_to_the_next_candidate_in_the_same_call(
+        self, temp_home
+    ):
+        s = self._fleet(temp_home)
+        dead = oauth.RefreshOutcome(None, "invalid_grant")
+        with patch.object(s, "consume_backup_grant", return_value=dead):
+            result, seen = self._run(
+                s, {"sk-3": [False], "sk-2": [True]}, current_at_limit=True
+            )
+        assert result["to"]["number"] == 2
+        assert result["validated"] is True
+        assert seen == ["sk-3", "sk-2"]
+
+    FABLE_FULL = {
+        "1": {"five_hour": {"pct": 100}, "seven_day": {"pct": 0.0},
+              "scoped": [{"name": "Fable", "pct": 0}]},
+        "2": {"five_hour": {"pct": 50}, "seven_day": {"pct": 0.0},
+              "scoped": [{"name": "Fable", "pct": 100}]},
+        "3": {"five_hour": {"pct": 20}, "seven_day": {"pct": 0.0},
+              "scoped": [{"name": "Fable", "pct": 100}]},
+    }
+
+    def _run_pass_two(self, s, verdicts):
+        fake, seen = self._probe(verdicts)
+        dead = oauth.RefreshOutcome(None, "invalid_grant")
+        with patch.object(s, "_usage_by_account", return_value=self.FABLE_FULL), \
+             patch.object(s, "list_accounts"), \
+             patch.object(s, "consume_backup_grant", return_value=dead), \
+             patch("claude_swap.oauth.probe_oauth_profile_live", fake):
+            result = s.switch(
+                strategy="best", json_output=True, current_at_limit=True,
+                models=("all",),
+            )
+        return result, seen
+
+    def test_the_second_pass_probes_its_target_and_skips_a_dead_one(
+        self, temp_home
+    ):
+        s = self._fleet(temp_home)
+        result, seen = self._run_pass_two(
+            s, {"sk-3": [False], "sk-2": [True]})
+        assert seen == ["sk-3", "sk-2"]
+        assert result["to"]["number"] == 2
+        assert result["validated"] is True
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_the_second_pass_with_every_target_dead_lands_nowhere(
+        self, temp_home
+    ):
+        s = self._fleet(temp_home)
+        result, seen = self._run_pass_two(
+            s, {"sk-3": [False], "sk-2": [False]})
+        assert seen == ["sk-3", "sk-2"]
+        assert result["switched"] is False
+        assert result["reason"] == "candidates-exhausted"
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+
+    def test_every_target_dead_is_candidates_exhausted(self, temp_home):
+        s = self._fleet(temp_home)
+        dead = oauth.RefreshOutcome(None, "invalid_grant")
+        with patch.object(s, "consume_backup_grant", return_value=dead):
+            result, _ = self._run(
+                s, {"sk-3": [False], "sk-2": [False]}, current_at_limit=True
+            )
+        assert result["switched"] is False
+        assert result["reason"] == "candidates-exhausted"
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+
+    def test_transport_failure_lands_without_the_key(self, temp_home):
+        s = self._fleet(temp_home)
+        result, _ = self._run(s, {"sk-3": [None]}, current_at_limit=True)
+        assert result["switched"] is True
+        assert result["to"]["number"] == 3
+        assert "validated" not in result
+
+    def test_transient_refresh_failure_lands_without_the_key(self, temp_home):
+        s = self._fleet(temp_home)
+        transient = oauth.RefreshOutcome(None, "transient")
+        with patch.object(s, "consume_backup_grant", return_value=transient):
+            result, _ = self._run(s, {"sk-3": [False]}, current_at_limit=True)
+        assert result["to"]["number"] == 3
+        assert "validated" not in result
+
+    def test_rotated_fingerprint_leaves_the_key_absent(self, temp_home):
+        s = self._fleet(temp_home)
+        with patch.object(
+            s, "_probe_switch_target", return_value=(True, "sha256:rotated")
+        ):
+            result, _ = self._run(s, {}, current_at_limit=True)
+        assert result["switched"] is True
+        assert "validated" not in result
+
+    def test_rotation_path_probes_and_validates(self, temp_home):
+        s = self._fleet(temp_home)
+        result, seen = self._run(
+            s, {"sk-2": [True]}, strategy="next-available", current_at_limit=True,
+        )
+        assert result["to"]["number"] == 2
+        assert result["validated"] is True
+        assert seen == ["sk-2"]
+
+    def test_other_callers_never_probe(self, temp_home):
+        s = self._fleet(temp_home)
+        result, seen = self._run(s, {})
+        assert result["switched"] is True
+        assert "validated" not in result
+        assert seen == []
+
+    def test_no_lock_is_held_while_probing(self, temp_home):
+        from claude_swap.locking import FileLock
+
+        s = self._fleet(temp_home)
+        held: list[bool] = []
+
+        def fake(token, timeout_s=5.0):
+            lock = FileLock(s.lock_file, timeout=0.2)
+            got = lock.acquire()
+            if got:
+                lock.release()
+            held.append(not got)
+            return True
+
+        with patch.object(s, "_usage_by_account", return_value=self.USAGE), \
+             patch.object(s, "list_accounts"), \
+             patch("claude_swap.oauth.probe_oauth_profile_live", fake):
+            s.switch(strategy="best", json_output=True, current_at_limit=True)
+        assert held == [False]
+
+
+@pytest.mark.no_switch_probe_fake
+class TestProbeOauthProfileLive:
+    def _urlopen(self, outcome):
+        def fake(req, timeout=None, context=None):
+            if isinstance(outcome, Exception):
+                raise outcome
+            resp = MagicMock()
+            resp.__enter__.return_value = resp
+            resp.read.return_value = b"{}"
+            return resp
+
+        return fake
+
+    def test_200_is_live(self):
+        with patch("urllib.request.urlopen", self._urlopen(None)):
+            assert oauth.probe_oauth_profile_live("tok") is True
+
+    def test_401_is_dead(self):
+        import urllib.error
+
+        err = urllib.error.HTTPError("u", 401, "no", {}, None)
+        with patch("urllib.request.urlopen", self._urlopen(err)):
+            assert oauth.probe_oauth_profile_live("tok") is False
+
+    @pytest.mark.parametrize("code", [403, 429, 500, 503])
+    def test_other_http_status_is_no_verdict(self, code):
+        import urllib.error
+
+        err = urllib.error.HTTPError("u", code, "x", {}, None)
+        with patch("urllib.request.urlopen", self._urlopen(err)):
+            assert oauth.probe_oauth_profile_live("tok") is None
+
+    def test_connection_error_is_no_verdict(self):
+        with patch("urllib.request.urlopen", self._urlopen(OSError("down"))):
+            assert oauth.probe_oauth_profile_live("tok") is None
+
+    def test_a_failure_never_logs_the_exception_text(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.DEBUG, logger="claude-swap"), patch(
+            "urllib.request.urlopen",
+            self._urlopen(ValueError("bad header sk-ant-oat01-LEAKME")),
+        ):
+            assert oauth.probe_oauth_profile_live("tok") is None
+        assert caplog.records
+        assert all("LEAKME" not in r.getMessage() for r in caplog.records)
+        assert any("ValueError" in r.getMessage() for r in caplog.records)
+
+
 class TestClaudeCodeLockCooperation:
     """_perform_switch must hold Claude Code's own advisory locks
     (~/.claude.lock and ~/.claude.json.lock) while mutating credentials/config,

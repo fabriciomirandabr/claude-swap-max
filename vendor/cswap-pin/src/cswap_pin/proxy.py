@@ -20,6 +20,7 @@ import base64
 import contextlib
 import datetime as _dt
 import glob
+import hashlib
 import inspect
 import itertools
 import json
@@ -21271,19 +21272,8 @@ _walled_switch_seen: dict[tuple[bytes, str | None],
 # still walled.
 _walled_slots: dict[str, float] = {}
 
-# (reset, slot, session) -> the monotonic deadline the bearer branch's OWN
-# 401 is good until. Separate from `_walled_switch_seen`, on purpose: that
-# memo is a SHARED verdict (did `switch()` actually move the account, a fact
-# every session should see alike), while a stale bearer is a PER-CLIENT fact
-# — one session's frozen credential says nothing about another session's.
-# Sharing the key made N stale sessions take N * 30s to all recover (one
-# converts, the other N-1 read its memo and relay raw 429s until it
-# expires); keying on the session too gives each its own one-401-per-TTL
-# instead. Pruned in `_switch_off_walled_account`'s bearer branch, every
-# time a session key is checked there — before the membership test, not
-# tied to a write — so no cap is needed: it self-limits to sessions that
-# hit a stale bearer within the last TTL.
-_walled_switch_seen_by_session: dict[tuple[bytes, str | None, str], float] = {}
+_walled_switch_seen_by_session: dict[
+    tuple[bytes, str | None, str, str], float] = {}
 
 # ~ the cross-process lock timeouts this daemon and cswap itself use: long
 # enough that a storm on one wall does not re-attempt for every repeat,
@@ -21379,24 +21369,26 @@ def _live_account_headroom(num: str) -> float | None:
     `_walled_switch_lock`. (`fetch=set()` is the other extreme and forbids
     every fetch, worthless at a wall.)
 
-    ``("all",)`` matches how the switch below ranks, and is what lets a
-    scoped-only account produce a number at all — so BOTH base windows are
-    required rather than assumed: `relevant_windows` appends each only when
-    the account reports it, so a reading missing one still yields a headroom
-    for a question nobody asked.
+    Judged on the 5h and 7d windows ONLY (``models=()``), never on a
+    per-model weekly window: the 401 this feeds sends the client to rebuild
+    onto the live account, and a live slot with Fable at 100% and 5h/7d at 30%
+    must still get that rebuild (the proxy never ends a client turn). BOTH
+    base windows are required rather than assumed: `relevant_windows` appends
+    each only when the account reports it, so a reading missing one still
+    yields a headroom for a question nobody asked, and comes back ``None``.
     """
     try:
         sw = require("switcher").ClaudeAccountSwitcher()
         entry = sw.usage_entries_by_account(fetch={num})[num]
         if getattr(entry, "walled", False):
             return 0.0
-        usage = entry.decision_value(("all",))
+        usage = entry.decision_value()
         # `relevant_windows` answers [] for anything that is not a window dict,
         # so a sentinel string and a None reading fail this test too.
         if not {"5h", "7d"} <= {
-                label for label, _, _ in oauth.relevant_windows(usage, ("all",))}:
+                label for label, _, _ in oauth.relevant_windows(usage, ())}:
             return None
-        return oauth.account_headroom(usage, ("all",))
+        return oauth.account_headroom(usage, ())
     except Exception:  # noqa: BLE001 — never let this break the relay
         return None
 
@@ -21444,40 +21436,189 @@ def _switch_takes_exclude() -> bool:
         return False
 
 
-_EXHAUSTED_RESET_CAP_S = 300.0
-# Epoch seconds the fleet is provably exhausted until, or 0.0 when it is
-# not (or nothing about its return could be proved). Written ONLY inside
-# `_switch_off_walled_account`, under `_walled_switch_lock`, after the
-# `switch()` call whose verdict this is about — a debounced repeat and the
-# per-session stale-bearer early return read whatever the last decision
-# wrote and never recompute it. `_relay_response`'s `_wall_relay` branch is
-# the only reader; this value is stored uncapped when every blocked slot
-# proved its own reset (see `_fleet_earliest_provable_reset`), and each
-# relay bounds it at relay time by that one request's own wall.
-_fleet_exhausted_until: float = 0.0
+_ALL_HELD_RELAY_DELAY_S = 120.0
+_ALL_HELD_RETRY_AFTER_MAX_S = 60
+_UNCONVERTED_RETRY_AFTER_S = 30
+_HOLD_RECORD_FAILURE_S = 120.0
+_HOLD_WAIT_SLICE_S = 0.25
+_fleet_held_until: float = 0.0
+_CONVERSION_WINDOW_S = 1800.0
+_CONVERSION_HOLD_FROM = 3
+_CONVERSION_RELAY_FROM = 6
+_CONVERSION_HOLD_S = 120.0
+_CONVERSION_RELAY_SPELL_S = 300.0
+_SESSION_MEMO_CAP = 256
+_walled_conversions_by_session: dict[str, list[float]] = {}
+_walled_relay_spell_by_session: dict[str, float] = {}
 
 
-def _fleet_earliest_provable_reset() -> tuple[float | None, bool]:
-    """The fleet's earliest provable recovery and whether every blocked slot
-    could prove one — mirrors `_earliest_recovery`'s (claude_swap/autoswitch.py)
-    SHAPE: per account, the latest reset among its >=100% relevant windows,
-    then the minimum across accounts. Not its basis: `_earliest_recovery`
-    ranks on the switcher's configured models, while this always ranks on
-    `("all",)`, the same basis the pin's own `switch()` call uses for this
-    wall — so a reset proved here is one `switch()` itself would have
-    weighed. Plus the disabled-slot filter `_earliest_recovery` lacks: a
-    slot the user disabled is never a `switch()` candidate, so folding it in
-    here would announce a reset the fleet cannot actually reach.
+class _WallNote:
+    """What `_decide_walled_switch` tells its caller besides the verdict:
+    ``debounced`` is True when the answer was a settled repeat of a wall
+    another request already decided (not a conversion of its own), and
+    ``memo`` is the per-session key it wrote, so the caller can take it back
+    when the 401 is turned into the waiting relay."""
 
-    Returns ``(earliest, all_provable)``. ``earliest`` is the minimum reset
-    among the blocked slots that DID prove one, or ``None`` if none did.
-    ``all_provable`` is False as soon as some blocked slot's own reset is
-    unprovable (absent, or already past — it could recover at any moment) —
-    that slot is skipped from the minimum rather than voiding it, exactly
-    like `_earliest_recovery`: what the others proved still stands. On any
-    exception (an older host without these symbols, a fake that lacks them)
-    this returns ``(None, True)``, which the caller reads as "nothing
-    proven" the same as an empty fleet.
+    __slots__ = ("debounced", "memo")
+
+    def __init__(self) -> None:
+        self.debounced = False
+        self.memo: tuple[bytes, str | None, str, str] | None = None
+
+
+def _bearer_digest(token: str) -> str:
+    """A short, one-way tag of a bearer for the per-session memo key; the
+    token itself is never stored or logged."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
+
+
+class _DelayedReply:
+    """What `_switch_off_walled_account` answers when the reply must be held
+    before its first byte: ``convert`` keeps it a 401, otherwise it is the
+    waiting relay (a stripped 429 with a `retry-after`)."""
+
+    __slots__ = ("convert", "hold_s")
+
+    def __init__(self, convert: bool, hold_s: float) -> None:
+        self.convert = convert
+        self.hold_s = hold_s
+
+
+def _held_slots(now: float) -> dict[str, float]:
+    """Slot -> expiry for every slot out of rotation at ``now``: this
+    daemon's unexpired `_walled_slots` joined with the holds persisted by the
+    host's ``rate_limit_hold`` (the later expiry wins), so a daemon restart
+    does not forget a hold. Prunes expired `_walled_slots` entries. Call under
+    `_walled_switch_lock`."""
+    for expired in [s for s, exp in _walled_slots.items() if exp <= now]:
+        del _walled_slots[expired]
+    held = dict(_walled_slots)
+    try:
+        persisted = require("rate_limit_hold").active_holds(
+            Path(require("paths").get_backup_root()), now)
+    except Exception as exc:  # noqa: BLE001
+        _log_lifecycle(
+            "429 on /v1/messages — could not read the persisted holds "
+            f"({exc.__class__.__name__}), using this process's own only"
+        )
+        return held
+    for slot, until in persisted.items():
+        if until > held.get(slot, 0.0):
+            held[slot] = until
+    return held
+
+
+def _record_rate_limit_hold(
+    slot: str, retry_after: bytes, reset: float | None, now: float,
+) -> float:
+    """Hold ``slot`` after a 429 on its own live token and return the hold
+    expiry. Persists through the host's ``record_hold`` and sets
+    ``_walled_slots[slot]`` to ``min(reset, expiry)`` (the expiry alone when
+    ``reset`` is not a finite epoch). A record failure (lock timeout, a host
+    without the module) is logged and holds the slot in memory for
+    `_HOLD_RECORD_FAILURE_S`; the relay carries on. Call under
+    `_walled_switch_lock`."""
+    raw = retry_after.decode("latin1", "replace")
+    try:
+        parsed: float | None = float(raw)
+    except ValueError:
+        parsed = None
+    count = None
+    try:
+        backup = Path(require("paths").get_backup_root())
+        cfg = require("settings").load_settings(backup)
+        hold = require("rate_limit_hold")
+        until = hold.record_hold(
+            backup, slot, parsed, now,
+            cfg.rate_limit_hold_seconds, cfg.rate_limit_hold_max_seconds)
+        count = hold._load(backup, now).get(slot, {}).get("count")
+    except Exception as exc:  # noqa: BLE001
+        until = now + _HOLD_RECORD_FAILURE_S
+        _log_lifecycle(
+            f"429 on /v1/messages — could not persist the hold on slot {slot} "
+            f"({exc.__class__.__name__}), holding it in memory for "
+            f"{_HOLD_RECORD_FAILURE_S:.0f}s"
+        )
+    _walled_slots[slot] = (
+        until if reset is None or not math.isfinite(reset)
+        else min(reset, until))
+    shown = (
+        "absent" if not raw
+        else f"{parsed:g}" if parsed is not None else repr(raw[:32]))
+    _log_lifecycle(
+        f"429 on /v1/messages — slot {slot} on hold for "
+        f"{max(0.0, until - now):.0f}s (retry-after={shown}, "
+        f"n={count if count is not None else '?'})"
+    )
+    return until
+
+
+def _fleet_hold_only_until(held: dict[str, float]) -> float | None:
+    """The earliest expiry among the held slots that are held and nothing
+    more, or ``None`` when there is none (or the host cannot say). Hold-only:
+    in the roster, not disabled, not walled by the host, and under 100% on
+    every `("all",)` window or with no usable reading. Store rows only
+    (``fetch=set()``), so no network. Call under `_walled_switch_lock`."""
+    try:
+        sw = require("switcher").ClaudeAccountSwitcher()
+        entries = sw.usage_entries_by_account(fetch=set())
+        earliest: float | None = None
+        for slot, until in held.items():
+            entry = entries.get(slot)
+            if entry is None or sw.is_account_disabled(slot):
+                continue
+            if getattr(entry, "walled", False):
+                continue
+            usage = entry.decision_value()
+            if isinstance(usage, dict) and any(
+                    pct >= 100.0 for _, pct, _ in
+                    oauth.relevant_windows(usage, ("all",))):
+                continue
+            if earliest is None or until < earliest:
+                earliest = until
+        return earliest
+    except Exception as exc:  # noqa: BLE001
+        _log_lifecycle(
+            "429 on /v1/messages — could not tell hold-only slots from walled "
+            f"ones ({exc.__class__.__name__}), treating none as hold-only"
+        )
+        return None
+
+
+def _hold_relay_wait(seconds: float) -> float:
+    """Block THIS request's thread for at most ``seconds``, in short slices,
+    while `_fleet_held_until` still lies ahead: each slice re-reads the global,
+    so a wall that cleared it (a conversion, a landed switch) or a draining
+    process ends the wait at once. Returns that last read of
+    `_fleet_held_until`, so the caller's `retry-after` comes from the same
+    value the loop judged. Holds no lock."""
+    deadline = time.monotonic() + seconds
+    until = _fleet_held_until
+    while until > time.time() and not this_process_is_draining():
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        time.sleep(min(_HOLD_WAIT_SLICE_S, left))
+        until = _fleet_held_until
+    return until
+
+
+def _fleet_earliest_provable_reset() -> float | None:
+    """The fleet's earliest provable recovery — mirrors `_earliest_recovery`'s
+    (claude_swap/autoswitch.py) SHAPE: per account, the latest reset among its
+    >=100% relevant windows, then the minimum across accounts. Not its basis:
+    `_earliest_recovery` ranks on the switcher's configured models, while
+    this always ranks on `("all",)`, the same basis the pin's own `switch()`
+    call uses for this wall. Plus the disabled-slot filter
+    `_earliest_recovery` lacks: a slot the user disabled is never a
+    `switch()` candidate, so folding it in here would announce a reset the
+    fleet cannot actually reach.
+
+    Returns the minimum FUTURE reset among the blocked slots that proved one,
+    or ``None`` if none did (a reset that is absent, or already past, is
+    skipped: that slot could recover at any moment). On any exception (an
+    older host without these symbols, a fake that lacks them) this returns
+    ``None``, the same as an empty fleet.
 
     Call under `_walled_switch_lock`, exactly like `_live_account_headroom`
     — `fetch=set()` forbids a network fetch, so this reads store rows only.
@@ -21487,11 +21628,10 @@ def _fleet_earliest_provable_reset() -> tuple[float | None, bool]:
         poll_policy = require("poll_policy")
         now = time.time()
         earliest: float | None = None
-        all_provable = True
         for num, entry in sw.usage_entries_by_account(fetch=set()).items():
             if sw.is_account_disabled(num):
                 continue
-            usage = entry.decision_value(("all",))
+            usage = entry.decision_value()
             if not isinstance(usage, dict):
                 continue
             if not any(pct >= 100.0 for _, pct, _ in
@@ -21499,19 +21639,166 @@ def _fleet_earliest_provable_reset() -> tuple[float | None, bool]:
                 continue
             reset = poll_policy.limiting_reset_ts(usage, ("all",))
             if reset is None or reset <= now:
-                all_provable = False  # could return any moment — don't oversleep
                 continue
             if earliest is None or reset < earliest:
                 earliest = reset
-        return earliest, all_provable
+        return earliest
     except Exception:  # noqa: BLE001 — never let this break the relay
-        return None, True
+        return None
+
+
+def _note_conversion(session: str) -> int:
+    """Count one 401 conversion for ``session`` inside the rolling
+    `_CONVERSION_WINDOW_S` (wall clock: the monotonic clock stops while the
+    machine sleeps) and return the number it now stands at. A conversion at
+    `_CONVERSION_RELAY_FROM` or more is not recorded, whether it becomes the
+    waiting relay (no 401 delivered) or is the one held 401 the relay spell
+    lets through, so the window can slide. Sessions with nothing
+    left in the window are dropped and the dict is capped at
+    `_SESSION_MEMO_CAP`. Call under `_walled_switch_lock`."""
+    now = time.time()
+    horizon = now - _CONVERSION_WINDOW_S
+    for stale in [s for s, stamps in _walled_conversions_by_session.items()
+                  if not stamps or stamps[-1] <= horizon]:
+        del _walled_conversions_by_session[stale]
+    stamps = [t for t in _walled_conversions_by_session.pop(session, ())
+              if t > horizon]
+    count = len(stamps) + 1
+    if count < _CONVERSION_RELAY_FROM:
+        stamps.append(now)
+    if stamps:
+        _walled_conversions_by_session[session] = stamps
+        if len(_walled_conversions_by_session) > _SESSION_MEMO_CAP:
+            del _walled_conversions_by_session[
+                next(iter(_walled_conversions_by_session))]
+    return count
+
+
+def _relay_spell_open(session: str, live_held: bool) -> bool:
+    """True when a session already past `_CONVERSION_RELAY_FROM` may have one
+    held 401 through: the live slot is not held and the session has had none
+    inside `_CONVERSION_RELAY_SPELL_S` (wall clock). The grant is recorded; a
+    refusal records nothing. Entries older than the spell are dropped and the
+    dict is capped at `_SESSION_MEMO_CAP`. Call under `_walled_switch_lock`."""
+    now = time.time()
+    horizon = now - _CONVERSION_RELAY_SPELL_S
+    for stale in [s for s, at in _walled_relay_spell_by_session.items()
+                  if at <= horizon]:
+        del _walled_relay_spell_by_session[stale]
+    if live_held or session in _walled_relay_spell_by_session:
+        return False
+    _walled_relay_spell_by_session[session] = now
+    if len(_walled_relay_spell_by_session) > _SESSION_MEMO_CAP:
+        del _walled_relay_spell_by_session[
+            next(iter(_walled_relay_spell_by_session))]
+    return True
+
+
+def _hold_reply(seconds: float) -> None:
+    """Block THIS request's thread for at most ``seconds``, in short slices,
+    before the first byte of its reply; a draining process ends it at once.
+    Holds no lock."""
+    deadline = time.monotonic() + seconds
+    while not this_process_is_draining():
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return
+        time.sleep(min(_HOLD_WAIT_SLICE_S, left))
 
 
 def _switch_off_walled_account(
     reset: bytes, retry_after: bytes, auth: str = "", session: str = "",
-) -> bool:
+) -> bool | _DelayedReply:
+    """`_decide_walled_switch`, run a second time with a fresh (slot, token)
+    pair when its first pass found the live slot had moved between the
+    caller's pair read and the lock being taken.
+
+    Every 401 conversion is counted per ``session`` (none without an
+    ``x-claude-code-session-id``) over a rolling `_CONVERSION_WINDOW_S`, so a
+    fleet-wide throttle cannot spend Claude Code's whole retry budget on
+    instant 401s: from the `_CONVERSION_HOLD_FROM`-th conversion the reply
+    is held before its first byte (`_CONVERSION_HOLD_S`) and stays a 401, and
+    from the `_CONVERSION_RELAY_FROM`-th it becomes the waiting relay, except
+    that one held 401 per `_CONVERSION_RELAY_SPELL_S` goes through while the
+    live slot is not held, so a client that rebuilds on a 401 reaches a
+    healthy slot. A bearer that never rebuilds ends on the client's own
+    retry budget."""
+    note = _WallNote()
+    verdict = _decide_walled_switch(
+        reset, retry_after, auth, session, None, note=note)
+    if isinstance(verdict, tuple):
+        note = _WallNote()
+        verdict = _decide_walled_switch(
+            reset, retry_after, auth, session, verdict, note=note)
+    if verdict is True and session and not note.debounced:
+        with _walled_switch_lock:
+            converted = _note_conversion(session)
+        relaying = converted >= _CONVERSION_RELAY_FROM
+        if relaying:
+            live_now = _live_account_slot()
+            with _walled_switch_lock:
+                live_held = (live_now is not None
+                             and live_now in _held_slots(time.time()))
+                relaying = not _relay_spell_open(session, live_held)
+                if relaying and note.memo is not None:
+                    _walled_switch_seen_by_session.pop(note.memo, None)
+            if not relaying:
+                _log_lifecycle(
+                    "429 on /v1/messages — conversion "
+                    f"{converted} of this session, the live slot is not "
+                    "held: letting one 401 through so the client rebuilds "
+                    "onto it"
+                )
+                return _DelayedReply(True, _CONVERSION_HOLD_S)
+        if relaying:
+            return _DelayedReply(False, _CONVERSION_HOLD_S)
+        if converted >= _CONVERSION_HOLD_FROM:
+            return _DelayedReply(True, _CONVERSION_HOLD_S)
+    return verdict
+
+
+def _moved_slot_verdict(
+    pair: tuple[float, str | None, str | None] | None, slot_now: str,
+) -> bool | tuple[float, str | None, str | None]:
+    """The answer of `_decide_walled_switch` when the live slot is no longer
+    the one its pair named. First pass: the fresh pair, for the caller to
+    decide again. Second pass: the slot moved AGAIN, so there is no stable
+    account to judge; nothing is held or switched and the 429 is relayed.
+    Call under `_walled_switch_lock`."""
+    global _fleet_held_until
+    if pair is None:
+        return time.monotonic(), slot_now, _active_oauth_token()
+    _fleet_held_until = 0.0
+    _log_lifecycle(
+        "429 on /v1/messages — the live slot moved again while this wall was "
+        f"being decided (now slot {slot_now}), relaying the 429 with headers "
+        "stripped, without holding or switching"
+    )
+    return False
+
+
+def _slot_moved_to(slot: str | None) -> str | None:
+    """The slot cswap has live now when it differs from ``slot``; ``None``
+    when it is the same or cannot be read (a ``None`` read is not a move)."""
+    slot_now = _live_account_slot()
+    return slot_now if slot_now is not None and slot_now != slot else None
+
+
+def _decide_walled_switch(
+    reset: bytes, retry_after: bytes, auth: str, session: str,
+    pair: tuple[float, str | None, str | None] | None,
+    note: _WallNote | None = None,
+) -> bool | tuple[float, str | None, str | None]:
     """Switch cswap off the account that just 429'd, at most once per wall.
+
+    ``pair`` is ``None`` on the first pass: this function reads (seen_at,
+    slot, live token) itself, and re-reads the slot UNDER `_walled_switch_
+    lock` immediately before it records the hold and calls `switch()`. When
+    that second read differs, nothing has been recorded or switched yet; it
+    returns the fresh ``(seen_at, slot, live token)`` tuple and the caller
+    decides again with it as ``pair`` — which is how a client whose bearer
+    went stale while this thread waited for the lock takes the stale-bearer
+    branch instead of walling the slot it just left.
 
     ``session`` is the request's ``x-claude-code-session-id`` — stable per
     session and never rotated on retry, unlike the bearer. The absolute-form
@@ -21539,13 +21826,16 @@ def _switch_off_walled_account(
     Code's partial-result set {rate_limit, overloaded, server_error}, so three
     fable subagents lost their context outright instead of sleeping
     (req_011Cepk7iQtQCjPtKjVxCxna and two siblings in the same minute). The
-    switch below therefore ranks with every per-model weekly window folded in,
-    which is what makes a full one able to answer "nowhere to land" and keep
-    the wall a wall.
+    switch below therefore ranks with every per-model weekly window folded in
+    first; when no peer qualifies on that basis the host ranks again on 5h/7d
+    alone (owner decision: a peer with room there takes the request even with
+    one model window full), and only then answers "nowhere to land".
 
     True means "turn the 429 the client will see into a 401" — because this
-    call switched the account off onto a credential the host confirmed is
-    LIVE, or an earlier call for this same wall already did AND THAT VERDICT
+    call switched the account off onto a credential the host did not find
+    DEAD (a landing with no verdict counts as good: availability beats a rare
+    dead credential, and a target the probe proves dead is never landed on),
+    or an earlier call for this same wall already did AND THAT VERDICT
     STILL HOLDS (a request whose own slot read happened before the switch is
     a storm waiter and gets the debounce as-is; one whose slot read happened
     after, and still names the walled slot, means the wall let the account
@@ -21561,13 +21851,15 @@ def _switch_off_walled_account(
     (three fable subagents' `authentication_failed` was the OTHER direction of
     this same mistake; a cold cache stalling a good retry is the direction
     this reverses). False (a KNOWN wall on the live account, `switch()`
-    raised, `switch()` landed a credential it never validated, this session
-    already spent its own bearer-branch 401 for this wall, or a repeat of a
-    wall that never earned a 401 and whose expiry has not passed) means relay
-    the 429 with its rate-limit headers stripped, so the client backs off and
-    retries instead of sleeping the wall's own reset window; a 401 onto a
-    credential nobody confirmed is alive is worse than the wall itself,
-    because CC rebuilds onto it.
+    raised, or a repeat of a wall that never earned a 401 and whose expiry
+    has not passed) means relay the 429 with its rate-limit headers
+    stripped, so the client backs off and retries instead of sleeping the
+    wall's own reset window. A session that already spent its own
+    bearer-branch 401 for this wall and bearer inside
+    `_WALLED_SWITCH_RAISE_TTL` gets a `_DelayedReply` instead (the waiting
+    relay), so a sibling sharing the session id gets its 401 on its next
+    attempt, and the slot moving again between the two passes relays the
+    429 with nothing held or switched.
 
     Storm control and per-wall debounce are the SAME guard, and the lock is
     held ACROSS `switch()`: the wall claims its slot and every waiter blocks
@@ -21585,7 +21877,7 @@ def _switch_off_walled_account(
     still debounces a storm without silencing the wall for its whole
     window.
     """
-    global _fleet_exhausted_until
+    global _fleet_held_until
     if not reset:
         _log_lifecycle(
             "429 on /v1/messages — no reset header, not an account-level "
@@ -21617,9 +21909,12 @@ def _switch_off_walled_account(
     # reason: it dates this request's own look at the slot, which is what
     # tells a storm waiter (its look predates the verdict) from a later
     # request finding the walled slot live again (its look postdates it).
-    seen_at = time.monotonic()
-    slot = _live_account_slot()
-    live = _active_oauth_token()
+    if pair is None:
+        seen_at = time.monotonic()
+        slot = _live_account_slot()
+        live = _active_oauth_token()
+    else:
+        seen_at, slot, live = pair
     with _walled_switch_lock:
         # KEYED ON (WALL, ACCOUNT), because a unified-reset epoch is a CLOCK
         # BOUNDARY and not an identity -- 1788925200, this seam's own event,
@@ -21664,6 +21959,8 @@ def _switch_off_walled_account(
                         f"{reset.decode('latin1', 'replace')}, relaying "
                         f"{'a 401' if ok else 'the 429 with headers stripped'}"
                     )
+                    if note is not None:
+                        note.debounced = slot is not None
                     return ok
                 _log_lifecycle(
                     "429 on /v1/messages — wall reset="
@@ -21673,6 +21970,9 @@ def _switch_off_walled_account(
                 )
                 # Falls through to the ordinary decision path below.
             # The negative's short expiry passed: treat this wall as unseen.
+        moved_to = _slot_moved_to(slot)
+        if moved_to is not None:
+            return _moved_slot_verdict(pair, moved_to)
         # NO SWITCH IS NEEDED WHEN THE HOST HAS ALREADY MOVED. `switch()`
         # answers "did I just switch?"; what decides whether a 401 helps is
         # "is the client's bearer still the live account?". The pin forwards
@@ -21701,22 +22001,27 @@ def _switch_off_walled_account(
             # relay never reaches this function at all, see the docstring
             # above) falls through unchanged and is recorded into the shared
             # `key` below instead, exactly as before this parameter existed.
-            session_key = (reset, slot, session) if session else None
-            now2 = time.monotonic()
+            digest = _bearer_digest(token)
+            session_key = ((reset, slot, session, digest)
+                           if session else None)
+            now2 = time.time()
             if session_key is not None:
                 for expired in [k for k, exp in
                                  _walled_switch_seen_by_session.items()
                                  if exp <= now2]:
                     del _walled_switch_seen_by_session[expired]
+                for rebuilt in [k for k in _walled_switch_seen_by_session
+                                if k[2] == session and k[3] != digest]:
+                    del _walled_switch_seen_by_session[rebuilt]
                 if session_key in _walled_switch_seen_by_session:
                     _log_lifecycle(
                         "429 on /v1/messages — this session already had its "
                         "bearer converted for wall reset="
-                        f"{reset.decode('latin1', 'replace')}, relaying the "
+                        f"{reset.decode('latin1', 'replace')}, holding the "
                         "429 with headers stripped rather than repeat the "
                         "401 with nothing changed"
                     )
-                    return False
+                    return _DelayedReply(False, _CONVERSION_HOLD_S)
             # NOT KNOWN WALLED, AND ONLY THEN. `_walled_slots` is this
             # daemon's own record of a wall it saw directly; `headroom`
             # below can now also read `0.0` from cswap's OWN persisted wall
@@ -21727,9 +22032,11 @@ def _switch_off_walled_account(
             # later than this record's clear time, so one extra switch() can
             # still run across a pin-recorded clear -- at most 2 per key per
             # `_WALLED_SWITCH_RAISE_TTL`.
-            walled = _walled_slots.get(slot, 0.0) > time.time()
+            now_wall = time.time()
+            walled_until = _held_slots(now_wall).get(slot, 0.0)
+            walled = walled_until > now_wall
             if walled:
-                cap_epoch = _walled_slots.get(slot)
+                cap_epoch = walled_until
             # UNKNOWN HEADROOM NO LONGER FAILS CLOSED HERE. It used to: a
             # cold cache (`decision_value` returns `None` for "no reading
             # recent enough to act on", a property of the CACHE, not of the
@@ -21758,27 +22065,17 @@ def _switch_off_walled_account(
                     + "; relaying a 401 so the client rebuilds onto it, "
                     "without switching"
                 )
-                # RECORD A NEGATIVE, RETURN TRUE: this request gets its 401
-                # and the next 429 on this wall does not, until the entry
-                # expires -- so the wall converts at most once per
-                # `_WALLED_SWITCH_RAISE_TTL`, never once and never freely. A
-                # repeat carrying the same reset is proof the conversion did
-                # not land: the epoch is per (account, window), so a client
-                # that really rebuilt onto another account cannot re-earn it.
-                # Recorded as a settled TRUE it was permanent: a same-account
-                # token ROTATION reaches it (bearer != live, account unchanged
-                # and still walled), giving 401 -> 429 -> 401 with no sleep
-                # until the retry loop exhausts into `authentication_failed`.
                 if session_key is not None:
                     _walled_switch_seen_by_session[session_key] = (
                         now2 + _WALLED_SWITCH_RAISE_TTL)
+                    if len(_walled_switch_seen_by_session) > _SESSION_MEMO_CAP:
+                        del _walled_switch_seen_by_session[
+                            next(iter(_walled_switch_seen_by_session))]
+                    if note is not None:
+                        note.memo = session_key
                 else:
                     _remember_walled_switch(key, False)
-                # The live slot was just judged able to take a retry (known
-                # headroom, or unknown but not known walled) — a stale
-                # exhausted verdict from an earlier wall must not survive
-                # this, since the fleet is not, in fact, known exhausted.
-                _fleet_exhausted_until = 0.0
+                _fleet_held_until = 0.0
                 return True
         # THE WALL ITSELF, RECORDED — only for a 429 whose bearer is the
         # live slot's OWN token: a bearer-branch 429 (handled above) is
@@ -21794,11 +22091,19 @@ def _switch_off_walled_account(
         # is set ONLY by the walled branch above (`_walled_slots[slot]`, the
         # LIVE slot's own already-known clear time); every other path keeps
         # main's full `_WALLED_SWITCH_RAISE_TTL` negative.
+        moved_to = _slot_moved_to(slot)
+        if moved_to is not None:
+            return _moved_slot_verdict(pair, moved_to)
         if slot is not None and token and live and token == live:
+            if session:
+                for rebuilt in [k for k in _walled_switch_seen_by_session
+                                if k[2] == session]:
+                    del _walled_switch_seen_by_session[rebuilt]
             try:
-                _walled_slots[slot] = float(reset)
+                own_reset: float | None = float(reset)
             except ValueError:
-                pass
+                own_reset = None
+            _record_rate_limit_hold(slot, retry_after, own_reset, time.time())
         try:
             switcher = require("switcher")
             # NOT `switch_off_at_limit_account`, which passes no `models` and
@@ -21833,11 +22138,8 @@ def _switch_off_walled_account(
                 current_at_limit=True, models=("all",),
             )
             if _switch_takes_exclude():
-                now = time.time()
-                for expired in [s for s, exp in _walled_slots.items()
-                                 if exp <= now]:
-                    del _walled_slots[expired]
-                switch_kwargs["exclude"] = frozenset(_walled_slots)
+                switch_kwargs["exclude"] = frozenset(
+                    _held_slots(time.time()))
             result = switcher.ClaudeAccountSwitcher().switch(**switch_kwargs)
         except Exception as exc:  # noqa: BLE001 — never let this break the relay
             _log_lifecycle(
@@ -21845,73 +22147,35 @@ def _switch_off_walled_account(
                 f"{exc.__class__.__name__}, relaying the 429 with headers "
                 f"stripped"
             )
-            _fleet_exhausted_until = 0.0
+            _fleet_held_until = 0.0
             _remember_walled_switch(key, False, cap_epoch)
             return False
-        # THE FLEET FACT, decided for every `switch()` verdict on this wall
-        # — never on the debounced-repeat or stale-bearer-session returns
-        # above, which read whatever this wrote last instead of
-        # recomputing it. `candidates-exhausted` means every switchable
-        # slot is walled and the fleet is merely exhausted, not that this
-        # particular switch failed (see `_fleet_earliest_provable_reset`);
-        # any other reason, or a landed switch, means the fact does not
-        # hold and the memo clears.
         if result.get("reason") == "candidates-exhausted":
-            earliest, all_provable = _fleet_earliest_provable_reset()
-            if earliest is None:
-                _fleet_exhausted_until = 0.0
-            else:
-                if all_provable:
-                    # Every blocked slot proved its own reset: store the
-                    # fleet's real worst case UNCAPPED, however far out —
-                    # each relay is bounded by its own wall instead (see
-                    # `_relay_response`'s `_fleet_reset`). Claude
-                    # Code 2.1.283's quota auto-resume re-arms at most twice
-                    # (`consecutiveRearms >= H`, `H = 2`), so capping this at
-                    # `_EXHAUSTED_RESET_CAP_S` would buy an interactive session
-                    # only ~3 short resumes against a measured 53-minute wall
-                    # and then let it stop cold. The residual this accepts: a
-                    # sleeping client cannot see capacity added mid-sleep (a
-                    # slot re-enabled, a fresh login) — but the sleep is
-                    # visible in the client and interruptible, and while every
-                    # blocked slot's own reset is provable no switch could
-                    # have freed it any sooner anyway.
-                    _fleet_exhausted_until = earliest
-                else:
-                    # NOT every blocked slot proved a reset: the one(s) that
-                    # did not could beat `earliest`, so relaying it unbounded
-                    # risks sleeping past a slot that frees up sooner. Capped
-                    # at `_EXHAUSTED_RESET_CAP_S` instead — the earliest
-                    # provable moment, with a bounded re-check rather than a
-                    # sleep toward a reset an unprovable peer may beat (the
-                    # same trade `_earliest_recovery`'s own caller makes).
-                    _fleet_exhausted_until = min(
-                        earliest, time.time() + _EXHAUSTED_RESET_CAP_S)
+            held_until = _fleet_hold_only_until(_held_slots(time.time()))
+            if held_until is None:
+                held_until = _fleet_earliest_provable_reset()
+            if held_until is None:
+                held_until = time.time() + _ALL_HELD_RELAY_DELAY_S
+            _fleet_held_until = held_until
         else:
-            _fleet_exhausted_until = 0.0
+            _fleet_held_until = 0.0
         landed = bool(
             result and result.get("switched") and not result.get("needsLogin")
         )
         validated = result.get("validated")
-        ok = landed and validated is True
-        if landed and not ok:
-            _log_lifecycle(
-                "429 on /v1/messages — switch landed but the host did not "
-                "validate the landing credential "
-                f"(validated {'absent' if validated is None else validated}), "
-                "relaying the 429 with headers stripped"
-            )
-        else:
-            _log_lifecycle(
-                "429 on /v1/messages — walled account switched off, relaying "
-                "a 401"
-                if ok else
-                f"429 on /v1/messages — switch() reported switched="
-                f"{result.get('switched') if result else None} needsLogin="
-                f"{result.get('needsLogin') if result else None} "
-                f"reason={result.get('reason') if result else None}, "
-                f"relaying the 429 with headers stripped"
-            )
+        ok = landed and validated is not False
+        _log_lifecycle(
+            "429 on /v1/messages — walled account switched off, relaying "
+            "a 401"
+            + ("" if validated else " (the landing carries no validation "
+               "verdict)")
+            if ok else
+            f"429 on /v1/messages — switch() reported switched="
+            f"{result.get('switched') if result else None} needsLogin="
+            f"{result.get('needsLogin') if result else None} "
+            f"reason={result.get('reason') if result else None}, "
+            f"relaying the 429 with headers stripped"
+        )
         _remember_walled_switch(key, ok, cap_epoch)
         return ok
 
@@ -22146,6 +22410,7 @@ def _relay_response(
     # 429, but its rate-limit headers are stripped below so it backs off
     # instead of sleeping the wall's own reset window.
     _wall_relay = False
+    _delayed: _DelayedReply | None = None
     if (status_line.startswith(b"HTTP/1.1 429")
             and (path or "").split("?", 1)[0].rstrip("/") == "/v1/messages"):
         reset = next(
@@ -22158,50 +22423,16 @@ def _relay_response(
              if l.lower().startswith(b"retry-after:")),
             b"",
         )
-        _walled_401 = _switch_off_walled_account(reset, retry_after, auth, session)
+        _verdict = _switch_off_walled_account(reset, retry_after, auth, session)
+        if isinstance(_verdict, _DelayedReply):
+            _delayed = _verdict
+            _walled_401 = _delayed.convert
+        else:
+            _walled_401 = _verdict
         _wall_relay = bool(reset) and not _walled_401
-        try:
-            _own_reset: float | None = float(reset)
-        except ValueError:
-            _own_reset = None
-    else:
-        _own_reset = None
-    # The fleet's own reset for an unconverted wall — read ONCE into a
-    # local (a concurrent write of 0.0 between two reads of the module
-    # global would relay `anthropic-ratelimit-unified-reset: 0`), then
-    # used for both the trace note below and the synthetic headers further
-    # down. Any capping already happened at decision time
-    # (`_fleet_earliest_provable_reset`'s caller). Relayed as the MINIMUM
-    # of the fleet value and THIS 429's own reset, when that own value
-    # parses and is still ahead: both are upper bounds on when this client
-    # is served again — the upstream's own reset says when the bearer's
-    # own account serves this very request, the fleet value says when a
-    # slot becomes a `switch()`/401 target on the `("all",)` basis the pin
-    # decides with. A minimum can only shorten the sleep, never lengthen
-    # it, so a frozen bearer's far own reset is never relayed past the
-    # fleet value, and each request is bounded by its own wall — no wall's
-    # bound leaks into another wall's debounced repeat. `None` unless the
-    # fleet is provably exhausted right now.
-    _exhausted_until = _fleet_exhausted_until
-    _fleet_reset = None
-    if _wall_relay and _exhausted_until > time.time():
-        _fleet_reset = _exhausted_until
-        # `math.isfinite` first: `float("nan")`/`float("inf")` both parse
-        # without raising, and a NaN compares False against everything
-        # (silently skipping both branches below, same as a reset that
-        # never parsed) while an `inf` would win the `min()` and then blow
-        # up `int()` when it reached the header further down.
-        if _own_reset is not None and math.isfinite(_own_reset):
-            if _own_reset > time.time():
-                _fleet_reset = min(_fleet_reset, _own_reset)
-            else:
-                # A PAST own reset is the same case
-                # `_fleet_earliest_provable_reset` treats as unprovable:
-                # this request's own account could recover at any moment,
-                # so the far fleet value is bounded at the cap rather than
-                # relayed as-is.
-                _fleet_reset = min(
-                    _fleet_reset, time.time() + _EXHAUSTED_RESET_CAP_S)
+    _held_until = _fleet_held_until
+    _all_held = (_wall_relay and _delayed is None
+                 and _held_until > time.time())
     if _walled_401:
         if _TRACE is not None:
             _TRACE.write(
@@ -22216,8 +22447,8 @@ def _relay_response(
             f"[c{cid}]     <- {status_line.decode('latin1', 'replace')}"
             " (wall could not be converted — rate-limit headers stripped so"
             " the client backs off instead of sleeping the wall's window)"
-            + (f" (fleet exhausted — relaying reset={int(_fleet_reset)})"
-               if _fleet_reset is not None else "")
+            + (f" (every candidate on hold until {int(_held_until)} — "
+               "holding the reply)" if _all_held else "")
             + "\n"
         )
         _TRACE.flush()
@@ -22284,28 +22515,16 @@ def _relay_response(
         if kl in _HOP_BY_HOP_BYTES:
             continue
         out.append(line)
-    if _fleet_reset is not None:
-        # AN UNCONVERTED WALL WITH A PROVABLY EXHAUSTED FLEET is otherwise
-        # indistinguishable, to Claude Code's own retry loop, from a
-        # subscriber 429 with no unified rate-limit headers at all —
-        # measured in its 2.1.283 source, that shape backs off for
-        # ~160-200s and then ends the turn, instead of sleeping to a
-        # stated reset and quota-auto-resuming. These three headers give
-        # it that reset instead — the fleet's own value, capped at
-        # `_EXHAUSTED_RESET_CAP_S` only when some blocked slot's own return
-        # could not be proved (see where `_fleet_exhausted_until` is
-        # written). The reset relayed is NEVER LATER than the fleet's
-        # value: this 429's own `reset` is folded in only when it is
-        # EARLIER, since a frozen bearer's own reset can belong to another
-        # walled account whose reset is days away, and telling the client
-        # to sleep until then would be worse than the wall it already
-        # backs off from.
-        out.append(b"anthropic-ratelimit-unified-status: rejected")
-        out.append(
-            b"anthropic-ratelimit-unified-reset: "
-            + str(int(_fleet_reset)).encode())
-        out.append(
-            b"anthropic-ratelimit-unified-representative-claim: five_hour")
+    if _delayed is not None:
+        _hold_reply(_delayed.hold_s)
+    if _all_held:
+        _until_now = _hold_relay_wait(
+            min(_ALL_HELD_RELAY_DELAY_S, _held_until - time.time()))
+        out.append(b"retry-after: " + str(max(1, min(
+            _ALL_HELD_RETRY_AFTER_MAX_S,
+            math.ceil(_until_now - time.time())))).encode())
+    elif _wall_relay:
+        out.append(b"retry-after: " + str(_UNCONVERTED_RETRY_AFTER_S).encode())
     if chunked:
         # Transfer-Encoding is hop-by-hop, so the loop above drops it — but
         # _pipe_chunked relays the chunk-size lines VERBATIM. Announcing no

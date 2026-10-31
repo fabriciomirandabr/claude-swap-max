@@ -54,6 +54,8 @@ class TestConfigList:
             "autoswitch.balanceFiveHourCeiling",
             "autoswitch.balanceFiveHourWeight",
             "autoswitch.balanceLoadPerSession",
+            "autoswitch.rateLimitHoldSeconds",
+            "autoswitch.rateLimitHoldMaxSeconds",
             "ui.theme",
             "ui.showEmail",
             "ui.watchSort",
@@ -61,7 +63,7 @@ class TestConfigList:
             "updates.check",
         ):
             assert key in out
-        assert out.count("(default)") == 19
+        assert out.count("(default)") == 21
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -88,7 +90,9 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 19
+        assert len(by_key) == 21
+        assert by_key["autoswitch.rateLimitHoldSeconds"]["value"] == 120.0
+        assert by_key["autoswitch.rateLimitHoldMaxSeconds"]["value"] == 1800.0
         assert by_key["autoswitch.threshold"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
         assert by_key["autoswitch.balanceLeadHours"]["value"] == 24.0

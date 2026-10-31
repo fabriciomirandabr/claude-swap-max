@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -22,6 +23,7 @@ from claude_swap.json_output import (
 )
 from claude_swap.credentials import ActiveCredentials
 from claude_swap.models import Platform
+from claude_swap.rate_limit_hold import record_hold
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -259,6 +261,62 @@ class TestListJson:
         by_num = {a["number"]: a for a in payload["accounts"]}
         assert by_num[1]["alias"] == "dev"
         assert "alias" not in by_num[2]
+
+    def test_list_payload_carries_rate_limit_hold_until(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        until = record_hold(
+            switcher.backup_dir, "2", 600.0, time.time(), 120.0, 1800.0
+        )
+        record_hold(
+            switcher.backup_dir, "1", 600.0, time.time() - 4000.0, 120.0, 1800.0
+        )
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch.object(switcher, "_read_account_credentials", return_value=""), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
+            payload = switcher.list_accounts(json_output=True)
+
+        by_num = {a["number"]: a for a in payload["accounts"]}
+        assert by_num[2]["rateLimitHoldUntil"] == (
+            datetime.fromtimestamp(until, tz=timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
+        assert by_num[1]["rateLimitHoldUntil"] is None
+
+    def test_list_human_view_marks_a_held_account(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, capsys,
+    ):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        record_hold(switcher.backup_dir, "2", 600.0, time.time(), 120.0, 1800.0)
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch.object(switcher, "_read_account_credentials", return_value=""), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)), \
+             patch("claude_swap.switcher.get_running_instances", return_value=([], [])):
+            switcher.list_accounts()
+
+        out = capsys.readouterr().out
+        held_line = next(line for line in out.splitlines() if line.startswith("  2:"))
+        first_line = next(line for line in out.splitlines() if line.startswith("  1:"))
+        assert "(on hold 11m)" in held_line
+        assert "on hold" not in first_line
 
     def test_list_payload_reports_login_expiry_from_the_stored_credential(
         self, temp_home: Path, mock_claude_config: Path,
@@ -740,6 +798,22 @@ class TestAccountRowFailure:
         )
         assert "usageError" not in row
         assert "usageRetryAt" not in row
+
+
+class TestAccountRowRateLimitHold:
+    """The ``rateLimitHoldUntil`` field on --list rows: ISO or null."""
+
+    def test_hold_renders_iso(self):
+        row = account_row(
+            2, "b@example.com", "", "", False, None,
+            rate_limit_hold_until=1_800_000_000.0,
+        )
+        assert row["rateLimitHoldUntil"] == "2027-01-15T08:00:00Z"
+
+    def test_no_hold_is_null(self):
+        row = account_row(2, "b@example.com", "", "", False, None)
+        assert "rateLimitHoldUntil" in row
+        assert row["rateLimitHoldUntil"] is None
 
 
 class TestAccountRowDisabled:

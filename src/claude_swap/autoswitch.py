@@ -60,11 +60,12 @@ from claude_swap.poll_policy import (
     RESET_SLACK_S,
     binding_pct,
 )
+from claude_swap.rate_limit_hold import active_holds
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
-from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.switcher import AUTOSWITCH_STATE_FILENAME, ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
-STATE_FILENAME = "autoswitch_state.json"
+STATE_FILENAME = AUTOSWITCH_STATE_FILENAME
 STATE_SCHEMA_VERSION = 1
 
 _logger = logging.getLogger("claude-swap")
@@ -646,6 +647,7 @@ class AutoSwitchEngine:
         # longer than the normal interval.
         self._sleep_until_ts: float | None = None
         self._blocked_wait_long = False
+        self._earliest_hold: float | None = None
         # Idle-hold: when the active token expired while Claude Code owns it
         # (and is therefore idle), crawl instead of counting unhealthy ticks.
         # ``_idle_hold_since`` survives across ticks (elapsed-time cap);
@@ -1157,6 +1159,8 @@ class AutoSwitchEngine:
         self._idle_hold_slow = False
         settings = self.settings
         priority_mode = settings.strategy == "priority-consume-first"
+        holds = active_holds(self.switcher.backup_dir, self.clock())
+        self._earliest_hold = min(holds.values(), default=None)
         state = self._read_state()
         if not self.dry_run:
             # Dry-run must not write anything, so recovered quarantines are
@@ -1264,7 +1268,11 @@ class AutoSwitchEngine:
 
         active_headroom = headroom.get(current)
         active_binding: BindingWindow | None = None
-        if active_headroom is not None:
+        if current in holds:
+            self._unhealthy_ticks = 0
+            self._idle_hold_since = None
+            trigger = "rate-limit-hold"
+        elif active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             # Each window against its OWN line, the closest one decides (see
@@ -1394,6 +1402,8 @@ class AutoSwitchEngine:
         # exhausted. The reserve is filtered out of the *ranking* instead —
         # inside `_rank`, so both consume-first commit phases inherit it.
         standbys = set(self.switcher.standby_account_numbers())
+        rankable = [n for n in oauth_candidates if n not in holds]
+        held_peers = [n for n in oauth_candidates if n in holds]
         # The no-return bar itself lives in `_rank` below: it is a statement
         # about the CHOICE, so it belongs where the choice is made rather than
         # in this census of what exists. See `_no_return_account` for the
@@ -1487,7 +1497,8 @@ class AutoSwitchEngine:
                         usage=kw["usage"], headroom=kw["headroom"],
                         current=current,
                         active_enabled=(
-                            current in switchable and trigger != "failback"
+                            current in switchable
+                            and trigger not in ("failback", "rate-limit-hold")
                         ),
                         settings=settings, now=kw["now"], thresholds=thresholds,
                         policies=policies,
@@ -1558,7 +1569,7 @@ class AutoSwitchEngine:
         ordered, any_known, active_reset_ts = _rank(
             trigger=trigger,
             consume_first=consume_first,
-            oauth_candidates=oauth_candidates,
+            oauth_candidates=rankable,
             usage=usage,
             headroom=headroom,
             current=current,
@@ -1590,7 +1601,7 @@ class AutoSwitchEngine:
             ordered, any_known, active_reset_ts = _rank(
                 trigger=trigger,
                 consume_first=consume_first,
-                oauth_candidates=oauth_candidates,
+                oauth_candidates=rankable,
                 usage=usage,
                 headroom=headroom,
                 current=current,
@@ -1656,8 +1667,13 @@ class AutoSwitchEngine:
             )
             return TickOutcome.NO_ACTION
 
-        priority_active_ready = priority_mode and current in switchable and self._priority_ready(
-            usage.get(current), headroom.get(current), settings, thresholds[current]
+        priority_active_ready = (
+            priority_mode
+            and trigger != "rate-limit-hold"
+            and current in switchable
+            and self._priority_ready(
+                usage.get(current), headroom.get(current), settings, thresholds[current]
+            )
         )
         if (
             not ordered and api_key_candidates
@@ -1672,10 +1688,23 @@ class AutoSwitchEngine:
             # expensive thing in the fleet. The same two-pass filter applies
             # here, so a reserve that happens to be an API-key account is the
             # last thing reached rather than the first.
-            primary_api_keys = [n for n in api_key_candidates if n not in standbys]
-            ordered = primary_api_keys or api_key_candidates
+            api_key_rankable = [n for n in api_key_candidates if n not in holds]
+            primary_api_keys = [n for n in api_key_rankable if n not in standbys]
+            ordered = primary_api_keys or api_key_rankable
 
         if not ordered:
+            if (
+                held_peers
+                and not rankable
+                and trigger in ("consume-first", "priority", "failback")
+            ):
+                self._emit(
+                    NoSwitchEvent(
+                        reason="candidates-on-hold",
+                        detail="every other account is on a rate-limit hold",
+                    )
+                )
+                return TickOutcome.NO_ACTION
             if trigger == "failback":
                 # ABOVE `if not any_known:` deliberately. The predicate is
                 # store-only, so it fires even when no primary has readable
@@ -1991,6 +2020,8 @@ class AutoSwitchEngine:
             thresholds = ThresholdMap({}, settings.threshold)
         came_from = state.get("lastSwitchFrom")
         if trigger not in ("proactive", "consume-first") or came_from is None:
+            return None
+        if state.get("leftTrigger") == "rate-limit-hold":
             return None
         # Only while we are still standing where that switch put us. A manual
         # switch away already undid the move, so there is nothing left to
@@ -2448,7 +2479,7 @@ class AutoSwitchEngine:
         over_by_account = {
             num: (b.over if b is not None else None) for num, b in bindings.items()
         }
-        if trigger in ("at-limit", "failover"):
+        if trigger in ("at-limit", "failover", "rate-limit-hold"):
             all_above = _every_candidate_above_threshold(
                 oauth_candidates, over_by_account
             )
@@ -2991,6 +3022,13 @@ class AutoSwitchEngine:
         )
 
     def _next_delay(self, outcome: TickOutcome) -> float:
+        """Seconds to sleep, never past the earliest hold expiry plus 2 s."""
+        delay = self._uncapped_delay(outcome)
+        if self._earliest_hold is None:
+            return delay
+        return min(delay, max(self._earliest_hold - self.clock() + 2.0, 1.0))
+
+    def _uncapped_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds
         if outcome is TickOutcome.BLOCKED:
             if self._sleep_until_ts is not None:

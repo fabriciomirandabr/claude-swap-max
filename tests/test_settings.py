@@ -154,6 +154,56 @@ class TestBalanceSettings:
         assert loaded.balance_five_hour_weight == 0.0
         assert loaded.balance_load_per_session == 100.0
 
+    def test_rate_limit_hold_defaults(self):
+        s = AutoSwitchSettings()
+        assert s.rate_limit_hold_seconds == 120.0
+        assert s.rate_limit_hold_max_seconds == 1800.0
+
+    def test_rate_limit_hold_keys_load_and_clamp(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({
+            "autoswitch": {
+                "rateLimitHoldSeconds": 5,
+                "rateLimitHoldMaxSeconds": 999999,
+            }
+        }))
+        loaded = load_settings(tmp_path)
+        assert loaded.rate_limit_hold_seconds == 10.0
+        assert loaded.rate_limit_hold_max_seconds == 86400.0
+
+    def test_rate_limit_hold_bad_types_fall_back_to_defaults(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({
+            "autoswitch": {
+                "rateLimitHoldSeconds": "soon",
+                "rateLimitHoldMaxSeconds": True,
+            }
+        }))
+        loaded = load_settings(tmp_path)
+        assert loaded.rate_limit_hold_seconds == 120.0
+        assert loaded.rate_limit_hold_max_seconds == 1800.0
+
+    @pytest.mark.parametrize(
+        ("key", "value", "bounds"),
+        [
+            ("autoswitch.rateLimitHoldSeconds", "9", "between 10 and 3600"),
+            ("autoswitch.rateLimitHoldSeconds", "3601", "between 10 and 3600"),
+            ("autoswitch.rateLimitHoldMaxSeconds", "59", "between 60 and 86400"),
+            ("autoswitch.rateLimitHoldMaxSeconds", "86401", "between 60 and 86400"),
+        ],
+    )
+    def test_rate_limit_hold_set_rejects_out_of_range(
+        self, tmp_path: Path, key, value, bounds
+    ):
+        with pytest.raises(ConfigError, match=bounds):
+            set_setting(tmp_path, key, value)
+        assert not settings_path(tmp_path).exists()
+
+    def test_rate_limit_hold_set_accepts_boundaries(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.rateLimitHoldSeconds", "3600")
+        set_setting(tmp_path, "autoswitch.rateLimitHoldMaxSeconds", "60")
+        loaded = load_settings(tmp_path)
+        assert loaded.rate_limit_hold_seconds == 3600.0
+        assert loaded.rate_limit_hold_max_seconds == 60.0
+
     def test_balance_bad_types_fall_back_to_defaults(self, tmp_path: Path):
         settings_path(tmp_path).write_text(json.dumps({
             "autoswitch": {"balanceLeadHours": "soon", "balanceFiveHourWeight": True}

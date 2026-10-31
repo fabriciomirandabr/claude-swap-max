@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -101,7 +102,9 @@ from claude_swap.paths import (
 from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
 from claude_swap.settings import load_settings, parse_model_names, settings_path
+from claude_swap.rate_limit_hold import active_holds
 from claude_swap.usage_store import (
+    PERMANENT_AUTH_ERRORS,
     FetchRecord,
     UsageEntry,
     UsageStore,
@@ -129,6 +132,24 @@ _FETCH_STAGGER_S = 0.25
 # serve TTL the data is current by design (that is the polling cadence), so
 # an age note there would be permanent noise.
 _USAGE_AGE_NOTE_S = poll_policy.SERVE_TTL_S
+
+AUTOSWITCH_STATE_FILENAME = "autoswitch_state.json"
+
+
+def quarantined_slots(backup_dir: Path) -> frozenset[str]:
+    """Slots the autoswitch engine has quarantined (``quarantine`` in its
+    state file). Read here, not through the engine, which imports this module.
+    A missing or unreadable file, like the engine's own reader, means none."""
+    try:
+        raw = json.loads(
+            (backup_dir / AUTOSWITCH_STATE_FILENAME).read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return frozenset()
+    quarantine = raw.get("quarantine") if isinstance(raw, dict) else None
+    if not isinstance(quarantine, dict):
+        return frozenset()
+    return frozenset(str(number) for number in quarantine)
 
 
 def _pace_marker(window: dict, fetched_at: float | None) -> str:
@@ -6905,6 +6926,8 @@ class ClaudeAccountSwitcher:
         current_num: str | None,
         models: tuple[str, ...] = (),
         usage: dict | None = None,
+        current_at_limit: bool = False,
+        exclude: frozenset[str] = frozenset(),
     ) -> tuple[str | None, str]:
         """Decide the ``best`` strategy target relative to the current account.
 
@@ -6931,11 +6954,19 @@ class ClaudeAccountSwitcher:
 
         Ties (including current-vs-other) resolve in favour of staying put.
         Never raises on network failure.
+
+        ``exclude`` names slots that are never a target. With
+        ``current_at_limit`` the current account counts as 0 headroom whatever
+        its reading, primaries are ranked before standbys (a standby only when
+        no primary qualifies), and when no known candidate has headroom the
+        first unknown-usage candidate in rotation order is taken. The notes
+        for that mode are ``"none"`` (no candidate left) and ``"exhausted"``.
         """
         data = self._get_sequence_data() or {}
         others = [
             str(n) for n in data.get("sequence", [])
             if str(n) != str(current_num)
+            and str(n) not in exclude
             and self._account_is_switchable(str(n))
             and not self._disabled_from_data(data, str(n))
         ]
@@ -6944,6 +6975,12 @@ class ClaudeAccountSwitcher:
 
         if usage is None:
             usage = self._usage_by_account()
+
+        if current_at_limit:
+            return self._select_when_current_at_limit(
+                current_num, others, data, usage, models
+            )
+
         current_headroom = oauth.account_headroom(usage.get(str(current_num)), models)
         if current_headroom is None:
             # Can't measure where the user is → can't prove any target is
@@ -6970,6 +7007,108 @@ class ClaudeAccountSwitcher:
         if current_headroom <= 0:
             return None, "exhausted"
         return None, "stay"
+
+    def _select_when_current_at_limit(
+        self,
+        current_num: str | None,
+        others: list[str],
+        data: dict,
+        usage: dict,
+        models: tuple[str, ...],
+    ) -> tuple[str | None, str]:
+        """``_select_best_switchable`` for a current account known at its limit.
+
+        Candidates are walked in rotation order from the slot after the
+        current one. A pool (primaries first, then standbys) yields its known
+        candidate with the most headroom above 0, else its first unknown-usage
+        candidate. API-key slots are never candidates unless
+        ``autoswitch.includeApiKeyAccounts`` is on: a 429 must not move the
+        fleet onto per-token billing unasked. Returns ``(None, "exhausted")``
+        when no pool qualifies.
+        """
+        sequence = [str(n) for n in data.get("sequence", [])]
+        if str(current_num) in sequence:
+            at = sequence.index(str(current_num))
+            sequence = sequence[at + 1:] + sequence[:at]
+        allow_api_key = load_settings(self.backup_dir).include_api_key_accounts
+        ordered = [
+            n for n in sequence
+            if n in others and (allow_api_key or self._account_kind(n) != "api_key")
+        ]
+        standby = set(self.standby_account_numbers())
+        pools = (
+            [n for n in ordered if n not in standby],
+            [n for n in ordered if n in standby],
+        )
+        for pool in pools:
+            scored = [(oauth.account_headroom(usage.get(n), models), n) for n in pool]
+            known = [(h, n) for h, n in scored if h is not None and h > 0]
+            if known:
+                return max(known, key=lambda t: t[0])[1], ""
+            unknown = next((n for h, n in scored if h is None), None)
+            if unknown is not None:
+                return unknown, ""
+        return None, "exhausted"
+
+    def _probe_switch_target(self, num: str) -> tuple[bool | None, str | None]:
+        """Ask the API whether a switch target's stored credential is live.
+
+        Runs before any credential lock is taken. Returns ``(live,
+        fingerprint)``: ``(True, fp)`` for a profile 200, or a 401 followed by
+        a successful ``consume_backup_grant`` and a 200 on the refreshed
+        token (``fp`` is the refreshed credential's); ``(False, None)`` for a
+        dead credential; ``(None, None)`` for a transport failure or a
+        credential with nothing to probe, which lands without a verdict.
+        """
+        data = self._get_sequence_data() or {}
+        email = data.get("accounts", {}).get(num, {}).get("email", "")
+        creds = self._read_target_credentials(num, email)
+        access = (oauth.extract_oauth_data(creds) or {}).get("accessToken")
+        if not access:
+            return None, None
+        live = oauth.probe_oauth_profile_live(access)
+        if live is True:
+            return True, oauth.credential_fingerprint(creds)
+        if live is None:
+            return None, None
+        outcome = self.consume_backup_grant(num, email, creds)
+        if outcome.error is None and outcome.credentials:
+            refreshed = (oauth.extract_oauth_data(outcome.credentials) or {}).get(
+                "accessToken"
+            )
+            if not refreshed:
+                return None, None
+            again = oauth.probe_oauth_profile_live(refreshed)
+            if again is True:
+                return True, oauth.credential_fingerprint(outcome.credentials)
+            if again is False:
+                return False, None
+            return None, None
+        if outcome.error in PERMANENT_AUTH_ERRORS:
+            return False, None
+        return None, None
+
+    def _probe_or_skip(
+        self, candidate: str, json_output: bool, warnings: list[str]
+    ) -> tuple[bool | None, str | None]:
+        """`_probe_switch_target` for a walk that moves on past a bad target.
+
+        A dead credential, or one whose stored backup cannot be read
+        (``SwitchError``), is reported as skipped and answers ``(False,
+        None)`` so the caller takes the next candidate.
+        """
+        try:
+            live, fingerprint = self._probe_switch_target(candidate)
+        except SwitchError:
+            message = f"Skipped Account-{candidate} (stored credential unreadable)"
+            if json_output:
+                warnings.append(message)
+            else:
+                print(f"{accent('Skipping')} {message.removeprefix('Skipped ')}")
+            return False, None
+        if live is False:
+            self._warn_dead_target(candidate, json_output, warnings)
+        return live, fingerprint
 
     def _duplicate_account_warnings(
         self, accounts_info: list[tuple[int, str, str, str, bool, str, str]]
@@ -7090,6 +7229,7 @@ class ClaudeAccountSwitcher:
         accounts = []
         seq_data = self._get_sequence_data() or {}
         now = self._usage_store.clock()
+        holds = active_holds(self.backup_dir, now)
         for num, email, org_name, org_uuid, is_active, creds, alias in accounts_info:
             if is_active:
                 active_num = num
@@ -7114,6 +7254,7 @@ class ClaudeAccountSwitcher:
                     policy=self._policy_from_data(seq_data, str(num)),
                     login_expires_at=oauth.login_expires_at_iso(creds),
                     subscription_plan=(plans or {}).get(str(num)),
+                    rate_limit_hold_until=holds.get(str(num)),
                 )
             )
         payload = {
@@ -7172,6 +7313,8 @@ class ClaudeAccountSwitcher:
         seq_data = self._get_sequence_data() or {}
         print(bolded("Accounts:"))
         show_email = self.show_email()
+        now = self._usage_store.clock()
+        holds = active_holds(self.backup_dir, now)
         for i, (num, email, org_name, org_uuid, is_active, _, alias) in enumerate(accounts_info):
             tag = self._get_display_tag(email, org_name, org_uuid)
             label = account_display(
@@ -7183,7 +7326,11 @@ class ClaudeAccountSwitcher:
                 markers += f" {bold_accent('(active)')}"
             if self._disabled_from_data(seq_data, str(num)):
                 markers += f" {muted('(disabled)')}"
-            markers += _plan_marker(plans.get(str(num)), self._usage_store.clock())
+            markers += _plan_marker(plans.get(str(num)), now)
+            hold_until = holds.get(str(num))
+            if hold_until is not None:
+                minutes = max(1, math.ceil((hold_until - now) / 60))
+                markers += f" {yellowed(f'(on hold {minutes}m)')}"
             print(f"  {num}: {label}{markers}")
             for line in _usage_entry_lines(entries[str(num)]):
                 print(f"     {line}")
@@ -7397,7 +7544,7 @@ class ClaudeAccountSwitcher:
         else:
             reason = "already-active"
             message = f"Already on Account-{to_ref['number']} ({to_ref['email']})"
-        return {
+        result = {
             "schemaVersion": SCHEMA_VERSION,
             "switched": switched,
             "from": from_ref,
@@ -7407,6 +7554,9 @@ class ClaudeAccountSwitcher:
             "message": message,
             "warnings": (extra_warnings or []) + op["warnings"],
         }
+        if op.get("validated"):
+            result["validated"] = True
+        return result
 
     def _switch_noop(
         self,
@@ -7438,12 +7588,52 @@ class ClaudeAccountSwitcher:
             "warnings": warnings or [],
         }
 
+    @staticmethod
+    def _warn_dead_target(
+        candidate: str, json_output: bool, warnings: list[str]
+    ) -> None:
+        message = f"Skipped Account-{candidate} (stored credential rejected by the API)"
+        if json_output:
+            warnings.append(message)
+        else:
+            print(f"{accent('Skipping')} {message.removeprefix('Skipped ')}")
+
+    def _noop_candidates_exhausted(
+        self,
+        strategy_label: str,
+        current_num: str | None,
+        current_ref: dict | None,
+        warnings: list[str],
+        json_output: bool,
+        models: tuple[str, ...],
+    ) -> dict | None:
+        """The ``candidates-exhausted`` no-op of a ``current_at_limit`` switch."""
+        limits_label = "usage limits" if models else "5h/7d limit"
+        staying = (
+            f"staying on Account-{current_num}" if current_num is not None
+            else "no live login to stay on"
+        )
+        message = (
+            f"No other account can take over (at their {limits_label}, on hold "
+            f"or excluded) — {staying}."
+        )
+        if json_output:
+            return self._switch_noop(
+                strategy=strategy_label, reason="candidates-exhausted",
+                to_ref=current_ref, warnings=warnings, message=message,
+            )
+        warning(message)
+        return None
+
     def switch(
         self,
         strategy: str | None = None,
         json_output: bool = False,
         models: tuple[str, ...] = (),
         model_source: str | None = None,
+        *,
+        current_at_limit: bool = False,
+        exclude: frozenset[str] = frozenset(),
     ) -> dict | None:
         """Switch to next account in sequence.
 
@@ -7460,6 +7650,19 @@ class ClaudeAccountSwitcher:
             model_source: Where ``models`` came from (``"cli"`` or
                   ``"autoswitch.model"``) — announced up front so a config
                   fallback silently steering the pick is impossible.
+            current_at_limit: The caller (the proxy, on a 429) knows the live
+                  account is at its limit. It then ranks at 0 headroom,
+                  primaries win over standbys, an unknown-usage candidate is
+                  taken when no known one has headroom, the chosen target's
+                  credential is probed before any lock (a dead one is skipped
+                  for the next candidate; the result carries ``validated`` when
+                  the activated credential is the probed one), and finding no
+                  target reports ``candidates-exhausted`` instead of rotating.
+            exclude: Slots never landed on by any strategy, rotation and the
+                  fresh-machine path included. Slots on an active rate-limit
+                  hold are always added to it, so a hand ``--switch``, the
+                  menu bar and ``--strategy best`` skip them too;
+                  ``switch_to`` stays free to pick one.
 
         ``"best"`` only switches when it can prove another account has more
         remaining quota; if usage can't be fetched or no candidate is provably
@@ -7471,6 +7674,25 @@ class ClaudeAccountSwitcher:
         """
         strategy_label = strategy if strategy in ("best", "next-available") else "rotation"
         warnings: list[str] = []
+        explicit = frozenset(str(n) for n in exclude)
+        quarantined = (
+            quarantined_slots(self.backup_dir) if current_at_limit else frozenset()
+        )
+        excluded = (
+            explicit
+            | quarantined
+            | frozenset(active_holds(self.backup_dir, time.time()))
+        )
+
+        def skip_label(slot: str) -> str:
+            if slot in explicit:
+                return "excluded"
+            return "quarantined" if slot in quarantined else "on hold"
+
+        allow_api_key = (
+            not current_at_limit
+            or load_settings(self.backup_dir).include_api_key_accounts
+        )
         if strategy_label == "rotation":
             models = ()  # model limits only steer the usage-aware strategies
         if models and not json_output:
@@ -7507,9 +7729,22 @@ class ClaudeAccountSwitcher:
 
             target = str(preferred)
             target_disabled = self._disabled_from_data(data, target)
-            if target_disabled or not self._account_is_switchable(target):
+            target_skipped = target in excluded
+            target_api_key = (
+                not allow_api_key and self._account_kind(target) == "api_key"
+            )
+            if (
+                target_disabled
+                or target_skipped
+                or target_api_key
+                or not self._account_is_switchable(target)
+            ):
                 if target_disabled:
                     reason = console_reason = "(disabled)"
+                elif target_skipped:
+                    reason = console_reason = f"({skip_label(target)})"
+                elif target_api_key:
+                    reason = console_reason = "(API key)"
                 else:
                     reason = "(no stored credentials/config)"
                     console_reason = (
@@ -7523,10 +7758,17 @@ class ClaudeAccountSwitcher:
                 fallback = next(
                     (str(num) for num in sequence
                      if str(num) != target
+                     and str(num) not in excluded
+                     and (allow_api_key
+                          or self._account_kind(str(num)) != "api_key")
                      and not self._disabled_from_data(data, str(num))
                      and self._account_is_switchable(str(num))),
                     None,
                 )
+                if not fallback and current_at_limit:
+                    return self._noop_candidates_exhausted(
+                        strategy_label, None, None, warnings, json_output, models,
+                    )
                 if not fallback:
                     if any(
                         self._account_is_switchable(str(num)) for num in sequence
@@ -7602,14 +7844,43 @@ class ClaudeAccountSwitcher:
         if strategy == "best":
             best_usage = self._usage_by_account()
             self._warn_inert_models(best_usage, models, json_output, warnings)
-            target, note = self._select_best_switchable(
-                current_num, models, best_usage
-            )
+            struck = set(excluded)
+            probed_fp: str | None = None
+            passes = (models, ()) if current_at_limit and models else (models,)
+            for pass_models in passes:
+                while True:
+                    target, note = self._select_best_switchable(
+                        current_num,
+                        pass_models,
+                        best_usage,
+                        current_at_limit=current_at_limit,
+                        exclude=frozenset(struck),
+                    )
+                    if target is None or not current_at_limit:
+                        break
+                    try:
+                        live, probed_fp = self._probe_switch_target(target)
+                    except SwitchError:
+                        struck.add(target)
+                        continue
+                    if live is False:
+                        struck.add(target)
+                        continue
+                    break
+                if target is not None:
+                    break
             if target is not None:
-                op = self._perform_switch(target, emit_output=not json_output)
+                op = self._perform_switch(
+                    target, emit_output=not json_output, probed_fp=probed_fp
+                )
                 return (
                     self._switch_result_from_op(op, strategy_label, warnings)
                     if json_output else None
+                )
+            if current_at_limit:
+                return self._noop_candidates_exhausted(
+                    strategy_label, current_num, current_ref, warnings,
+                    json_output, models,
                 )
             if note == "current-unavailable":
                 if json_output:
@@ -7716,8 +7987,26 @@ class ClaudeAccountSwitcher:
 
         next_account: str | None = None
         skipped_exhausted: list[str] = []
+        rotation_fp: str | None = None
+        standby_slots = (
+            set(self.standby_account_numbers()) if current_at_limit else set()
+        )
+        standby_pool: list[str] = []
         for offset in range(1, len(sequence)):
             candidate = str(sequence[(current_index + offset) % len(sequence)])
+            if candidate in excluded:
+                label = skip_label(candidate)
+                if json_output:
+                    warnings.append(f"Skipped Account-{candidate} ({label})")
+                else:
+                    print(f"{accent('Skipping')} Account-{candidate} ({label})")
+                continue
+            if not allow_api_key and self._account_kind(candidate) == "api_key":
+                if json_output:
+                    warnings.append(f"Skipped Account-{candidate} (API key)")
+                else:
+                    print(f"{accent('Skipping')} Account-{candidate} (API key)")
+                continue
             if self._disabled_from_data(data, candidate):
                 if json_output:
                     warnings.append(f"Skipped Account-{candidate} (disabled)")
@@ -7760,11 +8049,36 @@ class ClaudeAccountSwitcher:
                     else:
                         print(f"{accent('Skipping')} Account-{candidate} (at {label} limit)")
                     continue
+            if current_at_limit:
+                if candidate in standby_slots:
+                    standby_pool.append(candidate)
+                    continue
+                live, fingerprint = self._probe_or_skip(
+                    candidate, json_output, warnings
+                )
+                if live is False:
+                    continue
+                rotation_fp = fingerprint
             next_account = candidate
             break
 
+        if next_account is None:
+            for candidate in standby_pool:
+                live, fingerprint = self._probe_or_skip(
+                    candidate, json_output, warnings
+                )
+                if live is False:
+                    continue
+                next_account, rotation_fp = candidate, fingerprint
+                break
+
         # Every rotation target is at its limit. Switching onto an exhausted
         # account would not help, so stay on the current one instead.
+        if next_account is None and current_at_limit:
+            return self._noop_candidates_exhausted(
+                strategy_label, current_num, current_ref, warnings,
+                json_output, models,
+            )
         if next_account is None and skipped_exhausted:
             # With model limits in play the binding window may be a scoped
             # one (the per-skip lines name it), so don't claim "5h/7d".
@@ -7826,7 +8140,10 @@ class ClaudeAccountSwitcher:
                 return None
 
         op = self._perform_switch(
-            next_account, emit_output=not json_output, provenance=provenance
+            next_account,
+            emit_output=not json_output,
+            provenance=provenance,
+            probed_fp=rotation_fp,
         )
         return (
             self._switch_result_from_op(op, strategy_label, warnings)
@@ -8419,8 +8736,13 @@ class ClaudeAccountSwitcher:
         emit_output: bool = True,
         force_activate: bool = False,
         provenance: dict | None = None,
+        probed_fp: str | None = None,
     ) -> dict:
         """Switch, then re-ask the org-policy question. See the body below.
+
+        ``probed_fp`` is the fingerprint of the credential a pre-lock liveness
+        probe confirmed; the result carries ``validated: True`` only when the
+        credential actually activated has that same fingerprint.
 
         THE REFRESH IS NETWORK I/O AND THE BODY HOLDS THREE LOCKS -- two of
         them Claude Code's own, which it blocks on during a credential
@@ -8440,6 +8762,7 @@ class ClaudeAccountSwitcher:
             emit_output=emit_output,
             force_activate=force_activate,
             provenance=provenance,
+            probed_fp=probed_fp,
         )
         self._refresh_policy_cache()
         return result
@@ -8450,6 +8773,7 @@ class ClaudeAccountSwitcher:
         emit_output: bool = True,
         force_activate: bool = False,
         provenance: dict | None = None,
+        probed_fp: str | None = None,
     ) -> dict:
         """Perform the actual account switch with transaction support.
 
@@ -8472,6 +8796,7 @@ class ClaudeAccountSwitcher:
 
         self._refuse_session_shell()
         warnings_out: list[str] = []
+        validated = False
         # Session-mode drift. Switching the default login to an account that
         # also has a live session profile puts the same refresh token in two
         # config dirs — if the server rotates it, one copy goes stale — which
@@ -8624,6 +8949,9 @@ class ClaudeAccountSwitcher:
                     from_ref = account_ref(int(current_account), current_identity[0])
                 target_creds = self._read_target_credentials(
                     target_account, target_email
+                )
+                validated = bool(probed_fp) and (
+                    oauth.credential_fingerprint(target_creds) == probed_fp
                 )
                 target_config = self._read_account_config(target_account, target_email)
                 if not target_config:
@@ -8835,7 +9163,10 @@ class ClaudeAccountSwitcher:
                     target_email,
                     data["accounts"][target_account].get("organizationUuid", ""),
                 )
-                return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
+                direct_op = {"from": from_ref, "to": to_ref, "warnings": warnings_out}
+                if validated:
+                    direct_op["validated"] = True
+                return direct_op
 
             # NOT `current_identity[0]`: when the override above was
             # rejected, that email is the identity file's unverified claim
@@ -9084,6 +9415,9 @@ class ClaudeAccountSwitcher:
                 target_creds = self._read_target_credentials(
                     target_account, target_email
                 )
+                validated = bool(probed_fp) and (
+                    oauth.credential_fingerprint(target_creds) == probed_fp
+                )
                 target_config = self._read_account_config(target_account, target_email)
 
                 if not target_config:
@@ -9200,7 +9534,10 @@ class ClaudeAccountSwitcher:
             target_email,
             data["accounts"][target_account].get("organizationUuid", ""),
         )
-        return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
+        op = {"from": from_ref, "to": to_ref, "warnings": warnings_out}
+        if validated:
+            op["validated"] = True
+        return op
 
     def _print_switch_followup(self) -> None:
         """Print the note after a successful switch, keyed to where the active

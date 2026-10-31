@@ -69,6 +69,7 @@ packages = ["src/cswap_pin"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
 # PARALLEL BY DEFAULT. 12.2s -> ~5.0s on 4 workers, measured; 8 and 12 workers
 # were no faster, because the floor is the single longest test (the real
 # spawned-successor handover, 3.1s) and no number of workers splits that.

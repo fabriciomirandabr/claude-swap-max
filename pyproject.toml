@@ -97,7 +97,7 @@ cswap-pin = { path = "vendor/cswap-pin" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "vendor/cswap-pin/src"]
 # A THREAD THAT DIES ON AN EXCEPTION FAILS THE RUN. Unhandled it is only a
 # warning, and a warning in a list of ~50 is read by nobody: one sat on every
 # run for as long as anyone had looked. This makes the next one fail instead
@@ -118,5 +118,6 @@ asyncio_default_fixture_loop_scope = "function"
 markers = [
     "no_keychain_fake: opt out of the autouse in-memory Keychain guard (test mocks subprocess itself, or runs against a temp keychain on GitHub Actions)",
     "no_oauth_profile_fake: opt out of the autouse fetch_oauth_profile stub (test exercises fetch_oauth_profile itself against a mocked urlopen)",
+    "no_switch_probe_fake: opt out of the autouse probe_oauth_profile_live stub (test exercises probe_oauth_profile_live itself against a mocked urlopen)",
     "no_policy_limits_fake: opt out of the autouse fetch_policy_limits stub (test exercises fetch_policy_limits itself against a mocked urlopen)",
 ]

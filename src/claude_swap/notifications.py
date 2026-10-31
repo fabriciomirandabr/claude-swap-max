@@ -131,11 +131,14 @@ def make_notifying_emit(
     source of truth and must not depend on the notifier's health. Only the
     kinds in :data:`NOTIFIED_KINDS` pop up; a dry-run switch event says
     "would switch" in its own ``human()`` text, so it stays honest with no
-    special case here.
+    special case here. A switch whose trigger is ``rate-limit-hold`` stays
+    silent: it is a routine move off an account that answered a 429.
     """
 
     def emit(event: AutoSwitchEvent) -> None:
         inner(event)
+        if getattr(event, "trigger", None) == "rate-limit-hold":
+            return
         if event.kind in NOTIFIED_KINDS:
             try:
                 send_notification(
