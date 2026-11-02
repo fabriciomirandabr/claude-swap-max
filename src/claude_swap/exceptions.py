@@ -37,6 +37,18 @@ class SwitchError(ClaudeSwitchError):
     pass
 
 
+class ConsumeInFlightError(SwitchError):
+    """Another process is mid-refresh on this slot's backup grant.
+
+    The refresh token in the store is on the wire and is spent the moment the
+    server answers, so nothing may copy it anywhere. Not a verdict on the
+    credential: the slot is not dead, only unavailable until the consumer
+    persists its successor.
+    """
+
+    pass
+
+
 class SessionError(ClaudeSwitchError):
     """Error setting up or launching a session-mode profile."""
 

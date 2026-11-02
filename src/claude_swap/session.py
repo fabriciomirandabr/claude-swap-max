@@ -753,6 +753,13 @@ class SessionManager:
             outcome = self.switcher.consume_backup_grant(
                 account_num, email, pre_creds
             )
+            if outcome.error == "consume-busy":
+                raise SessionError(
+                    f"Account-{account_num} has a token refresh in flight, so "
+                    f"its stored refresh token is being spent and a profile "
+                    f"seeded from it would fail on its first refresh. Retry in "
+                    f"a moment."
+                )
             if outcome.error is not None and outcome.credentials:
                 # `error is None` is the gate's own "the slot is freshened
                 # and safe to activate" signal, and it is NOT implied by

@@ -66,6 +66,92 @@ class TestMoveAccount:
         data = switcher._get_sequence_data()
         assert data["sequence"] == [2, 5]
 
+    @staticmethod
+    def _hold(switcher, slot: str) -> float:
+        import time
+
+        from claude_swap.rate_limit_hold import record_hold
+
+        return record_hold(
+            switcher.backup_dir, slot, None, time.time(), 600.0, 1800.0
+        )
+
+    @staticmethod
+    def _holds(switcher) -> dict:
+        import time
+
+        from claude_swap.rate_limit_hold import active_holds
+
+        return active_holds(switcher.backup_dir, time.time())
+
+    def test_move_to_empty_slot_carries_the_rate_limit_hold(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """A 429 hold belongs to the account; it is keyed by slot number, so a
+        renumber that left it behind would hold whatever lands on the old
+        number and free the account that was actually limited."""
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        until = self._hold(switcher, "2")
+
+        switcher.move_account("2", "5")
+
+        assert self._holds(switcher) == {"5": until}
+
+    def test_move_onto_an_occupied_slot_swaps_the_holds(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        until_one = self._hold(switcher, "1")
+
+        switcher.move_account("1", "2")
+
+        assert self._holds(switcher) == {"2": until_one}
+
+    def test_swap_moves_both_holds_with_their_accounts(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        until_one = self._hold(switcher, "1")
+        until_two = self._hold(switcher, "2")
+
+        switcher.swap_accounts("1", "2")
+
+        assert self._holds(switcher) == {"2": until_one, "1": until_two}
+
+    def test_move_leaves_other_slots_holds_alone(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        until_one = self._hold(switcher, "1")
+
+        switcher.move_account("2", "5")
+
+        assert self._holds(switcher) == {"1": until_one}
+
+    def test_a_hold_that_cannot_be_carried_does_not_fail_the_move(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch, caplog
+    ):
+        import logging
+
+        from claude_swap.exceptions import LockError
+
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+
+        def busy(*args, **kwargs):
+            raise LockError("holds lock busy")
+
+        monkeypatch.setattr("claude_swap.switcher.rekey_holds", busy)
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            result = switcher.move_account("2", "5")
+
+        assert result == ("2", "5", False)
+        assert "Could not carry rate-limit holds" in caplog.text
+
     def test_move_holds_account_lock(
         self, temp_home: Path, sample_sequence_data: dict, monkeypatch
     ):

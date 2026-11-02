@@ -22,6 +22,7 @@ from claude_swap.rate_limit_hold import (
     RETRY_AFTER_MARGIN_S,
     active_holds,
     record_hold,
+    rekey_holds,
 )
 
 NOW = 1_800_000_000.0
@@ -406,3 +407,48 @@ class TestLocking:
         expected = {f"{tag}{i}" for tag in ("a", "b") for i in range(15)}
         assert set(_raw(tmp_path)["holds"]) == expected
         assert set(active_holds(tmp_path, NOW)) == expected
+
+
+class TestRekey:
+    def test_a_relocation_moves_the_entry_and_drops_a_stale_destination(
+        self, tmp_path
+    ):
+        moved = _record(tmp_path, slot="2")
+        _record(tmp_path, slot="5", retry_after=900)
+        other = _record(tmp_path, slot="1")
+
+        rekey_holds(tmp_path, {"2": "5"}, NOW)
+
+        assert active_holds(tmp_path, NOW) == {"5": moved, "1": other}
+
+    def test_a_swap_exchanges_both_entries(self, tmp_path):
+        first = _record(tmp_path, slot="1")
+        second = _record(tmp_path, slot="2", retry_after=900)
+
+        rekey_holds(tmp_path, {"1": "2", "2": "1"}, NOW)
+
+        assert active_holds(tmp_path, NOW) == {"2": first, "1": second}
+        assert _raw(tmp_path)["holds"]["2"]["count"] == 1
+
+    def test_an_unheld_move_writes_nothing(self, tmp_path):
+        _record(tmp_path, slot="7")
+        before = _file(tmp_path).read_bytes()
+
+        rekey_holds(tmp_path, {"2": "5"}, NOW)
+
+        assert _file(tmp_path).read_bytes() == before
+
+    def test_no_file_is_created_when_there_are_no_holds(self, tmp_path):
+        rekey_holds(tmp_path, {"2": "5"}, NOW)
+
+        assert not _file(tmp_path).exists()
+
+    def test_a_busy_lock_raises(self, tmp_path):
+        _record(tmp_path, slot="2")
+        held = FileLock(tmp_path / HOLDS_LOCK_FILENAME)
+        assert held.acquire()
+        try:
+            with pytest.raises(LockError):
+                rekey_holds(tmp_path, {"2": "5"}, NOW)
+        finally:
+            held.release()

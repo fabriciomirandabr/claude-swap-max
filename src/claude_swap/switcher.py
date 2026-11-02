@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import logging
@@ -20,6 +21,7 @@ from claude_swap import macos_keychain
 from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
+    ConsumeInFlightError,
     CredentialReadError,
     CredentialWriteError,
     LockError,
@@ -102,7 +104,7 @@ from claude_swap.paths import (
 from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
 from claude_swap.settings import load_settings, parse_model_names, settings_path
-from claude_swap.rate_limit_hold import active_holds
+from claude_swap.rate_limit_hold import active_holds, rekey_holds
 from claude_swap.usage_store import (
     PERMANENT_AUTH_ERRORS,
     FetchRecord,
@@ -1540,6 +1542,19 @@ class ClaudeAccountSwitcher:
             )
         return creds
 
+    def _rekey_rate_limit_holds(self, moves: dict[str, str]) -> None:
+        """Carry the 429 holds, keyed by slot number, to their account's new
+        number. Runs after the commit point under the holds lock; a failure
+        leaves a hold on the old number until it expires and is logged, never
+        raised: the move itself already happened."""
+        try:
+            rekey_holds(self.backup_dir, moves, time.time())
+        except (LockError, OSError) as e:
+            self._logger.warning(
+                "Could not carry rate-limit holds %s to their new slots: %s",
+                moves, e,
+            )
+
     def _swap_accounts_locked(self, first: str, second: str) -> tuple[str, str]:
         """Body of :meth:`swap_accounts`; the caller holds ``self.lock_file``.
 
@@ -1662,6 +1677,8 @@ class ClaudeAccountSwitcher:
                 staging,
             )
             raise
+
+        self._rekey_rate_limit_holds({num_a: num_b, num_b: num_a})
 
         # Post-commit cleanup, all best-effort: the records already reference
         # the new keys only. A failure here leaks a stale file, never a wrong
@@ -2112,6 +2129,8 @@ class ClaudeAccountSwitcher:
             except Exception as e:
                 self._logger.error(f"Cleanup after failed move incomplete: {e}")
             raise
+
+        self._rekey_rate_limit_holds({num_src: target})
 
         # Post-commit: clear the old keys, best effort — the records now
         # reference the target slot only. _delete_account_files drops the
@@ -2935,8 +2954,10 @@ class ClaudeAccountSwitcher:
         # window where a second gate re-read the unchanged backup and POSTed
         # the same one-time-use grant (freshen vs collector). This dedicated
         # lock is contended ONLY by other gates — waiting on it is exactly
-        # the serialization wanted, and the POST is bounded (10 s), so a
-        # loser waits briefly or defers.
+        # the serialization wanted. The POST is bounded
+        # (oauth.OAUTH_REFRESH_TIMEOUT_S) but may outlast a loser's acquire;
+        # that loser defers (`consume-busy`) rather than POSTing a grant that
+        # is still on the wire.
         consume_lock = FileLock(
             self.credentials_dir / f".consume-{account_num}.lock"
         )
@@ -7059,6 +7080,11 @@ class ClaudeAccountSwitcher:
         token (``fp`` is the refreshed credential's); ``(False, None)`` for a
         dead credential; ``(None, None)`` for a transport failure or a
         credential with nothing to probe, which lands without a verdict.
+
+        Raises ``ConsumeInFlightError`` when the 401's refresh is deferred
+        because another gate is mid-POST on this slot: the stored refresh
+        token is being spent, so landing on it would copy it into the live
+        login. Not a dead credential.
         """
         data = self._get_sequence_data() or {}
         email = data.get("accounts", {}).get(num, {}).get("email", "")
@@ -7072,6 +7098,10 @@ class ClaudeAccountSwitcher:
         if live is None:
             return None, None
         outcome = self.consume_backup_grant(num, email, creds)
+        if outcome.error == "consume-busy":
+            raise ConsumeInFlightError(
+                f"Account-{num} has a token refresh in flight"
+            )
         if outcome.error is None and outcome.credentials:
             refreshed = (oauth.extract_oauth_data(outcome.credentials) or {}).get(
                 "accessToken"
@@ -7099,6 +7129,13 @@ class ClaudeAccountSwitcher:
         """
         try:
             live, fingerprint = self._probe_switch_target(candidate)
+        except ConsumeInFlightError:
+            message = f"Skipped Account-{candidate} (token refresh in flight)"
+            if json_output:
+                warnings.append(message)
+            else:
+                print(f"{accent('Skipping')} {message.removeprefix('Skipped ')}")
+            return False, None
         except SwitchError:
             message = f"Skipped Account-{candidate} (stored credential unreadable)"
             if json_output:
@@ -8767,6 +8804,26 @@ class ClaudeAccountSwitcher:
         self._refresh_policy_cache()
         return result
 
+    @contextlib.contextmanager
+    def _target_consume_lock(self, account_num: str):
+        """The switch target's consume lock, taken in the gate's own order
+        (consume lock, then ``lock_file``). A consumer holds it from before its
+        POST to after its CAS, so owning it here means the stored refresh token
+        is not on the wire while it is copied into the live login. Busy
+        raises ``ConsumeInFlightError``: nothing is written and the caller
+        takes another candidate or retries.
+        """
+        lock = FileLock(self.credentials_dir / f".consume-{account_num}.lock")
+        if not lock.acquire():
+            raise ConsumeInFlightError(
+                f"Account-{account_num} has a token refresh in flight; its "
+                "stored refresh token is being spent. Retry in a moment."
+            )
+        try:
+            yield
+        finally:
+            lock.release()
+
     def _perform_switch_locked(
         self,
         target_account: str,
@@ -8892,7 +8949,12 @@ class ClaudeAccountSwitcher:
         # ~/.claude.json.lock likewise keeps the oauthAccount splice from
         # interleaving with Claude Code's own config writes. Everything under
         # here is local I/O — no network while locks are held.
-        with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
+        with (
+            self._target_consume_lock(target_account),
+            FileLock(self.lock_file),
+            claude_credentials_lock(),
+            claude_config_lock(),
+        ):
             data = self._get_sequence_data()
             active_account = data.get("activeAccountNumber")
             current_account = str(active_account) if active_account is not None else None

@@ -116,6 +116,27 @@ def _valid_retry_after(retry_after) -> float | None:
         return math.inf
 
 
+def rekey_holds(backup_dir: Path, moves: dict[str, str], now: float) -> None:
+    """Carry holds to their account's new slot after ``cswap move``/``swap``.
+
+    ``moves`` maps each old slot number to the number its account now holds
+    (a swap passes both directions). A hold belongs to the account, not to
+    the number; a slot that is a destination keeps nothing of its previous
+    occupant, whose entry is dropped. Writers share ``record_hold``'s lock.
+    Raises ``LockError`` if the lock is not acquired within ``LOCK_TIMEOUT_S``.
+    """
+    path = _holds_path(backup_dir)
+    with FileLock(backup_dir / HOLDS_LOCK_FILENAME, timeout=LOCK_TIMEOUT_S):
+        holds = _load(backup_dir, now)
+        moved = {moves[slot]: entry for slot, entry in holds.items() if slot in moves}
+        affected = set(moves) | set(moves.values())
+        if not any(slot in holds for slot in affected):
+            return
+        kept = {slot: entry for slot, entry in holds.items() if slot not in affected}
+        kept.update(moved)
+        atomic_write_json(path, {"schemaVersion": SCHEMA_VERSION, "holds": kept})
+
+
 def record_hold(
     backup_dir: Path,
     slot: str,

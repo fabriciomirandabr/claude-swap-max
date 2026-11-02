@@ -12292,7 +12292,7 @@ class TestThePinStateVerb:
         monkeypatch.setattr(pin, "serving_port", lambda *a, **k: 4242)
         monkeypatch.setattr(
             pin, "_daemon_can_pin",
-            lambda *a, **k: (False, "mint stalled 90s past the 60s wedge"))
+            lambda *a, **k: (False, "mint stalled 120s past the 100s wedge"))
         rc = pin.run(self._sw(tmp_path), None, state=True)
         assert rc == 0
         captured = capsys.readouterr()
@@ -12381,14 +12381,14 @@ class TestDaemonCanPinReadsHealth:
             (b"[1, 2, 3]", None, "valid json but not an object: no can_pin on it"),
             # Exactly at the wedge is not past it: mirrors the pin's own strict
             # `>`, not `>=`.
-            (b'{"can_pin": true, "mint_stalled_s": 60.0}', True, "at the wedge"),
+            (b'{"can_pin": true, "mint_stalled_s": 100.0}', True, "at the wedge"),
             # Every HEALTHY 0.1.262 daemon publishes `mint_stalled_s` on every
             # response, `null` when nothing is stalled: the live common case,
             # distinct from a field genuinely absent (an old daemon).
             (b'{"can_pin": true, "mint_stalled_s": null}', True, "explicit null"),
             # The wedge check runs before `can_pin` is even read, so it
             # overrides a missing field too, not only `can_pin: true`.
-            (b'{"mint_stalled_s": 90.0}', False, "past the wedge, no can_pin"),
+            (b'{"mint_stalled_s": 120.0}', False, "past the wedge, no can_pin"),
         ):
             self._stub_urlopen(monkeypatch, body)
             assert pin._daemon_can_pin(4242, timeout=1.0)[0] is verdict, why
@@ -12429,7 +12429,7 @@ class TestDaemonCanPinReadsHealth:
         from claude_swap import pin
 
         self._stub_urlopen(
-            monkeypatch, b'{"can_pin": true, "mint_stalled_s": 90.0}')
+            monkeypatch, b'{"can_pin": true, "mint_stalled_s": 120.0}')
         can_pin, why = pin._daemon_can_pin(4242, timeout=1.0)
         assert can_pin is False
         assert "stall" in why, why

@@ -2114,7 +2114,7 @@ def serving_port(switcher, *, connect_timeout: float = 2.0) -> int | None:
     return port if _port_answers(port, connect_timeout) else None
 
 
-_MINT_STALL_WEDGE_S = 60.0  # matches cswap-pin's own bound, proxy.py _serving_can_pin
+_MINT_STALL_WEDGE_S = 100.0  # matches cswap-pin's own bound, proxy.py _serving_can_pin
 
 
 def _daemon_can_pin(port: int, *, timeout: float) -> tuple[bool | None, str]:

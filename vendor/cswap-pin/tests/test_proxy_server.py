@@ -8,9 +8,12 @@ original on everything else.
 from __future__ import annotations
 
 import contextlib
+import errno
 import http.client
 import io
 import json
+import math
+import os
 import types
 import pathlib
 import re
@@ -25,7 +28,7 @@ import pytest
 
 from cswap_pin.proxy import ensure_ca
 
-from conftest import PIN_STAMP, run_cases
+from conftest import PIN_STAMP, run_cases, short_root
 
 
 @pytest.fixture(autouse=True)
@@ -56,7 +59,15 @@ class _FakeUpstream:
     def __init__(self, certdir: Path,
                  reject_bearer: "str | set[str] | None" = None,
                  reject_status: int = 403, reply: bytes | None = None,
-                 reject_missing_auth: bool = False):
+                 reject_missing_auth: bool = False,
+                 reject_headers: bytes = b"", reject_body: bytes = b"",
+                 reject_two_credentials: bool = False,
+                 replies: "list[bytes] | None" = None):
+        # replies: one whole response per request, in order (then `reply`, or
+        # the 200): a conversation whose every turn is answered differently.
+        self.replies = list(replies or [])
+        # reject_two_credentials: also answer `reject_status` to a request whose
+        # `x-api-key` is not the bearer it carries ("more than one credential").
         # reject_bearer: answer `reject_status` to exactly this credential
         # (or any credential in the set), 200 to any other. Models an
         # endpoint the pinned account may not use — the shape that makes a
@@ -69,6 +80,8 @@ class _FakeUpstream:
         self._reject = ({reject_bearer} if isinstance(reject_bearer, str)
                          else set(reject_bearer or ()))
         self._reject_missing_auth = reject_missing_auth
+        self.reject_headers = reject_headers
+        self.reject_body = reject_body
         self.reject_status = reject_status
         self.reply = reply
         self.seen_auth: str | None = None
@@ -76,9 +89,14 @@ class _FakeUpstream:
         # request-response case reconnects per attempt (`Connection: close`
         # below), so `seen_auth` alone loses everything but the last one.
         self.auths_seen: list[str] = []
+        self.bodies_seen: list[bytes] = []
+        self.heads_seen: list[str] = []  # every request head, in order
+        self._two_credentials = reject_two_credentials
         self.seen_path: str | None = None
         self.seen_body: bytes = b""
         self.seen_head: str = ""
+        # seconds a reply's connection stays open after its last byte
+        self.linger = 0.0
         self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self._ctx.load_cert_chain(str(certdir / "leaf.pem"), str(certdir / "leaf.key"))
         self._srv = socket.socket()
@@ -123,20 +141,29 @@ class _FakeUpstream:
                     if line.lower().startswith("authorization:"):
                         self.seen_auth = line.split(":", 1)[1].strip()
                 self.auths_seen.append(self.seen_auth)
+                self.bodies_seen.append(bytes(rest))
+                self.heads_seen.append(head)
+                key = next((l.split(":", 1)[1].strip() for l in lines[1:]
+                            if l.lower().startswith("x-api-key:")), None)
                 if (self.seen_auth in {f"Bearer {b}" for b in self._reject}
                         or (self.seen_auth is None
-                            and self._reject_missing_auth)):
+                            and self._reject_missing_auth)
+                        or (self._two_credentials and key is not None
+                            and self.seen_auth != f"Bearer {key}")):
                     tls.sendall(
                         f"HTTP/1.1 {self.reject_status} Rejected\r\n"
-                        "Content-Length: 0\r\nConnection: close\r\n\r\n"
-                        .encode("latin1")
+                        .encode("latin1") + self.reject_headers
+                        + b"Content-Length: %d\r\nConnection: close\r\n\r\n"
+                        % len(self.reject_body) + self.reject_body
                     )
                     tls.close()
                     continue
-                tls.sendall(self.reply or (
+                tls.sendall((self.replies.pop(0) if self.replies else None)
+                            or self.reply or (
                     b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
                     b"Content-Type: application/json\r\n\r\n{}"
                 ))
+                time.sleep(self.linger)
                 tls.close()
             except Exception:
                 pass
@@ -206,6 +233,8 @@ class _RecordingChain:
                     if not d:
                         break
                     buf += d
+                if not buf:  # a stray sends nothing (T2954)
+                    continue
                 self.seen.append(buf)
                 c.sendall(self.answer(buf))
             except OSError:
@@ -230,19 +259,23 @@ class _RecordingChain:
 def _request_through_proxy(proxy_port: int, ca_path: Path, path: str,
                            bearer: "str | None" = None,
                            ua: str | None = None, body: str = "{}",
-                           extra_headers: "dict[str, str] | None" = None):
-    """Make an HTTPS request to api.anthropic.com<path> via the proxy (CONNECT),
-    trusting the proxy's CA. Returns the response status.
+                           extra_headers: "dict[str, str] | None" = None,
+                           method: str = "POST",
+                           headers_out: "dict[str, str] | None" = None,
+                           body_out: "list | None" = None,
+                           host: str = "api.anthropic.com"):
+    """Make an HTTPS request to <host><path> via the proxy (CONNECT),
+    trusting the proxy's CA. Returns the response status; `headers_out`, when
+    given, is filled with the response headers (lower-cased names), and
+    `body_out` gets the response body (a chunked one decoded).
 
     `bearer=None` sends no `Authorization` header at all -- a client that
     never had one, not one that was cleared. `extra_headers` merges in
     anything else the case needs on the wire, e.g. `x-claude-code-session-id`."""
     ctx = ssl.create_default_context(cafile=str(ca_path))
-    conn = http.client.HTTPSConnection(
-        "api.anthropic.com", context=ctx, timeout=10
-    )
-    conn.set_tunnel("api.anthropic.com", 443)
-    # Point the socket at the proxy instead of resolving api.anthropic.com.
+    conn = http.client.HTTPSConnection(host, context=ctx, timeout=10)
+    conn.set_tunnel(host, 443)
+    # Point the socket at the proxy instead of resolving the host.
     conn._create_connection = lambda *a, **k: socket.create_connection(
         ("127.0.0.1", proxy_port), timeout=10
     )
@@ -251,11 +284,56 @@ def _request_through_proxy(proxy_port: int, ca_path: Path, path: str,
         headers["User-Agent"] = ua
     if extra_headers:
         headers.update(extra_headers)
-    conn.request("POST", path, body=body, headers=headers)
+    conn.request(method, path, body=body, headers=headers)
     resp = conn.getresponse()
-    resp.read()
+    got = resp.read()
     conn.close()
+    if headers_out is not None:
+        headers_out.update((k.lower(), v) for k, v in resp.getheaders())
+    if body_out is not None:
+        body_out.append(got)
     return resp.status
+
+
+def _kept_socket(proxy_port: int, ca_path: Path, host: str = "api.anthropic.com"):
+    """A TLS socket inside the proxy's CONNECT tunnel: one kept-alive client
+    connection, for a case that reads the head and the close itself."""
+    raw = socket.create_connection(("127.0.0.1", proxy_port), timeout=10)
+    raw.sendall(f"CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n".encode())
+    assert b" 200 " in raw.recv(1024)
+    ctx = ssl.create_default_context(cafile=str(ca_path))
+    return ctx.wrap_socket(raw, server_hostname=host)
+
+
+def _reply_on(tls, path: str = "/v1/messages") -> "tuple[str, bytes]":
+    """Send one request on `tls`; return (head, body), the body read to its
+    Content-Length. A server that closed early shows as a short body."""
+    tls.sendall(f"POST {path} HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                "Authorization: Bearer t\r\nContent-Length: 2\r\n\r\n{}".encode())
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = tls.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+    head, _, body = buf.partition(b"\r\n\r\n")
+    want = next((int(h.split(b":")[1]) for h in head.split(b"\r\n")
+                 if h.lower().startswith(b"content-length:")), 0)
+    while len(body) < want:
+        chunk = tls.recv(4096)
+        if not chunk:
+            break
+        body += chunk
+    return head.decode("latin1"), body
+
+
+def _server_closed(tls) -> bool:
+    """True when the server has closed `tls` (EOF), False if it is still open."""
+    tls.settimeout(2)
+    try:
+        return tls.recv(1) == b""
+    except socket.timeout:
+        return False
 
 
 def _refetch_switcher(certdir, token_for_read):
@@ -290,11 +368,13 @@ def _refetch_switcher(certdir, token_for_read):
     return _Switcher()
 
 
-def _post_and_abandon(proxy_port: int, ca_path: Path, path: str, body: str):
+def _post_and_abandon(proxy_port: int, ca_path: Path, path: str, body: str,
+                      extra: str = ""):
     """Send one POST through the proxy's CONNECT tunnel and close WITHOUT
     reading a response -- the client that aborts its own socket, which is
     what T0955 is about: a request held on the pin whose sender is already
-    gone by the time the hold ends."""
+    gone by the time the hold ends. ``extra`` is more header lines, each
+    ending in CRLF."""
     raw = socket.create_connection(("127.0.0.1", proxy_port), timeout=10)
     raw.sendall(b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
                 b"Host: api.anthropic.com:443\r\n\r\n")
@@ -308,8 +388,8 @@ def _post_and_abandon(proxy_port: int, ca_path: Path, path: str, body: str):
     tls = ctx.wrap_socket(raw, server_hostname="api.anthropic.com")
     body_b = body.encode()
     req = (f"POST {path} HTTP/1.1\r\nHost: api.anthropic.com\r\n"
-          f"Authorization: Bearer t\r\nContent-Length: {len(body_b)}\r\n\r\n"
-          ).encode() + body_b
+          f"Authorization: Bearer t\r\n{extra}"
+          f"Content-Length: {len(body_b)}\r\n\r\n").encode() + body_b
     tls.sendall(req)
     tls.close()
 
@@ -371,6 +451,27 @@ def _mkdir(p):
 @pytest.fixture
 def certdir(tmp_path):
     return _make_certdir(tmp_path)
+
+
+@pytest.fixture
+def short_certdir():
+    """A factory for a certdir short enough to bind `.carry-<pid>.sock` in: an
+    AF_UNIX path holds 103 bytes on macOS (107 on Linux) and the CI runner's
+    pytest tree is 82 before `/c<n>0/.carry-<pid>.sock`. Rooted at `/tmp/r*`
+    like the other cases that bind one (`short_root`), removed with the test.
+    Ask for the case's own `certdir` too: it is built first and fills the CA
+    cache."""
+    import shutil
+
+    made = []
+
+    def make():
+        made.append(short_root().resolve())
+        return _make_certdir(made[-1])
+
+    yield make
+    for root in made:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 class _StallableBridgeUpstream:
@@ -584,6 +685,80 @@ class TestPinProxyServer:
         finally:
             proxy.stop()
             upstream.stop()
+
+    def case_a_swapped_profile_answer_carries_no_request_id(self, certdir):
+        # CC 2.1.304 stamps a profile answer by its `request-id` and copies the
+        # PINNED account's plan into the active credential; unstamped, the
+        # identity write still runs. Only the swapped answer loses the header.
+        from cswap_pin.proxy import PinProxy
+
+        reply = (b"HTTP/1.1 200 OK\r\nrequest-id: req_0123abc\r\n"
+                 b"Content-Length: 2\r\n\r\n{}")
+        # (path, ua, upstream refuses the pin's bearer, request-id kept)
+        for path, ua, refuse, kept in (
+            ("/api/oauth/profile", "claude-code/2.1.304", False, False),
+            ("/api/oauth/profile?a=b", "claude-code/2.1.304", False, False),
+            ("/api/oauth/profile", "claude-swap/1.0", False, True),
+            # the swap was refused: the unswapped fall-back answer is the
+            # active account's own and keeps its stamp
+            ("/api/oauth/profile", "claude-code/2.1.304", True, True),
+            ("/api/oauth/validate", "claude-code/2.1.304", False, True),
+        ):
+            upstream = _FakeUpstream(
+                certdir, reply=reply, reject_status=401,
+                reject_bearer="PIN-TOKEN" if refuse else None)
+            proxy = PinProxy(
+                certdir=certdir,
+                pin_token_provider=lambda: "PIN-TOKEN",
+                upstream=("127.0.0.1", upstream.port),
+            )
+            proxy.start()
+            try:
+                got: dict[str, str] = {}
+                status = _request_through_proxy(
+                    proxy.port, certdir / "ca.pem", path, bearer="disk-token",
+                    ua=ua, method="GET", body="", headers_out=got)
+                assert status == 200, (path, ua, refuse)
+                assert ("request-id" in got) is kept, (path, ua, refuse, got)
+            finally:
+                proxy.stop()
+                upstream.stop()
+
+    def case_an_absolute_form_swapped_profile_answer_carries_no_request_id(
+        self, certdir
+    ):
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        chain = _RecordingChain(lambda req: (
+            b"HTTP/1.1 200 OK\r\nrequest-id: req_0123abc\r\n"
+            b"Content-Length: 2\r\n\r\n{}"))
+        proxy = None
+        try:
+            write_upstream_hint(certdir, f"http://127.0.0.1:{chain.port}")
+            proxy = PinProxy(certdir=certdir,
+                             pin_token_provider=lambda: "PINTOKEN",
+                             rediscover_chain=True)
+            proxy.start()
+            for ua, kept in (("claude-code/2.1.304", False),
+                             ("claude-swap/1.0", True)):
+                c = socket.create_connection(("127.0.0.1", proxy.port),
+                                             timeout=10)
+                try:
+                    c.sendall(
+                        "GET https://api.anthropic.com/api/oauth/profile "
+                        "HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                        f"User-Agent: {ua}\r\nConnection: close\r\n"
+                        "Authorization: Bearer ACTIVE\r\n\r\n".encode())
+                    answer = b""
+                    while chunk := c.recv(4096):
+                        answer += chunk
+                finally:
+                    c.close()
+                assert (b"request-id:" in answer.lower()) is kept, (ua, answer)
+        finally:
+            if proxy:
+                proxy.stop()
+            chain.stop()
 
     def case_inference_route_keeps_original_bearer(self, certdir):
         from cswap_pin.proxy import PinProxy
@@ -940,10 +1115,15 @@ class TestPinProxyServer:
         import cswap_pin.proxy as pp
 
         holds: list[tuple[str, bool]] = []
+        abandoned = threading.Event()
         real_hold = pp.PinProxy._hold_bridge_attach
 
         def _spy_hold(self, cse):
             event, waited = real_hold(self, cse)
+            # With no earlier entry the hung-up check is a single poll(0)
+            # the instant this returns, so it must not run before the client
+            # has actually closed. Bounded, so a broken run fails, not hangs.
+            abandoned.wait(5)
             holds.append((cse, waited))
             return event, waited
 
@@ -956,6 +1136,7 @@ class TestPinProxyServer:
         try:
             _post_and_abandon(proxy.port, certdir / "ca.pem",
                               "/v1/code/sessions/cse_first/bridge", "FIRST")
+            abandoned.set()
             time.sleep(0.5)  # let the abandoned send actually land
             assert upstream.received == [], (
                 "a first attempt (no earlier hold entry) whose client "
@@ -1199,19 +1380,13 @@ class _StreamingUpstream:
         self._srv.bind(("127.0.0.1", 0))
         self._srv.listen(5)
         self.port = self._srv.getsockname()[1]
+        self._stopped = threading.Event()
         self._thr = threading.Thread(target=self._loop, daemon=True)
         self._thr.start()
 
     def _loop(self):
         try:
-            conn, _ = self._srv.accept()
-            tls = self._ctx.wrap_socket(conn, server_side=True)
-            data = b""
-            while b"\r\n\r\n" not in data:
-                chunk = tls.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
+            tls, _ = _accept_head(self._srv, self._ctx, stop=self._stopped)
             tls.sendall(
                 b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
                 b"Transfer-Encoding: chunked\r\n\r\n"
@@ -1224,6 +1399,7 @@ class _StreamingUpstream:
             pass
 
     def stop(self):
+        self._stopped.set()
         try:
             with socket.create_connection(self._srv.getsockname(),
                                           timeout=0.2):
@@ -1250,6 +1426,7 @@ class TestStreamingRelay:
         )
         proxy.start()
         try:
+            _stray(upstream.port)
             # Raw client through the proxy so we can read incrementally.
             raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
             raw.sendall(
@@ -1492,8 +1669,7 @@ class _IdleClosingUpstream(_FakeUpstream):
                 conn, _ = self._srv.accept()
             except OSError:
                 return
-            self.accepted += 1
-            tls = None
+            tls, counted = None, False
             try:
                 tls = self._ctx.wrap_socket(conn, server_side=True)
                 tls.settimeout(self.hold)
@@ -1504,6 +1680,9 @@ class _IdleClosingUpstream(_FakeUpstream):
                         if not chunk:
                             raise OSError("client closed")
                         data += chunk
+                    if not counted:  # a stray sends no head (T2964)
+                        self.accepted += 1
+                        counted = True
                     head, _, rest = data.partition(b"\r\n\r\n")
                     m = [l for l in head.decode("latin1").lower().split("\r\n")
                          if l.startswith("content-length:")]
@@ -1513,7 +1692,7 @@ class _IdleClosingUpstream(_FakeUpstream):
                         if not chunk:
                             raise OSError("client closed")
                         rest += chunk
-                    tls.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    tls.sendall(self._reply())
             except (OSError, ssl.SSLError):
                 pass
             finally:
@@ -1523,6 +1702,21 @@ class _IdleClosingUpstream(_FakeUpstream):
                     (tls or conn).close()
                 except OSError:
                     pass
+
+    def _reply(self) -> bytes:
+        return b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+
+
+class _FirstConnection502Upstream(_IdleClosingUpstream):
+    """A hop that opened the tunnel and then failed inside it: every answer on
+    its first TCP connection is a 502 (Content-Length, NO `Connection: close`,
+    so the response alone does not retire the socket), every later connection
+    answers 200."""
+
+    def _reply(self) -> bytes:
+        if self.accepted == 1:
+            return b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 3\r\n\r\nbad"
+        return super()._reply()
 
 
 class _FramingUpstream:
@@ -1994,6 +2188,8 @@ class TestTheChainsCredentialIsSent:
                         if not d:
                             break
                         buf += d
+                    if not buf:  # a stray sends nothing (T2954)
+                        continue
                     seen.append(buf.decode("latin1"))
                     conn.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                 finally:
@@ -2019,6 +2215,7 @@ class TestTheChainsCredentialIsSent:
         write_upstream_hint(certdir, f"http://alice:s3cr3t@127.0.0.1:{port}")
         proxy.start()
         try:
+            _stray(port)
             raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
             raw.sendall(
                 b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
@@ -2120,16 +2317,14 @@ class _LoopbackConnectProxy:
         self._srv.listen(5)
         self.port = self._srv.getsockname()[1]
         self.connects = 0
+        self._stopped = threading.Event()
         self._thr = threading.Thread(target=self._loop, daemon=True)
         self._thr.start()
 
     def _loop(self):
         try:
-            conn, _ = self._srv.accept()
+            conn, _ = _accept_head(self._srv, stop=self._stopped)
             self.connects += 1
-            buf = b""
-            while b"\r\n\r\n" not in buf:
-                buf += conn.recv(1)
             up = socket.create_connection(self._target, timeout=10)
             conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             # blind-pipe both directions
@@ -2147,6 +2342,7 @@ class _LoopbackConnectProxy:
             pass
 
     def stop(self):
+        self._stopped.set()
         try:
             with socket.create_connection(self._srv.getsockname(),
                                           timeout=0.2):
@@ -2161,6 +2357,17 @@ class TestLoopbackChainTrust:
 
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)
+
+    def case_a_chain_stopped_before_any_connect_ends_its_thread(self):
+        """`stop()` wakes the accept with a connect that closes at once. The
+        helper's head read took that EOF for "more later" and spun on `recv`
+        for the rest of the process, a core each (T2951: two of them burnt 55.6
+        s and 24.8 s of CPU in one file run, starving every real-socket timing
+        case after them)."""
+        chain = _LoopbackConnectProxy(("127.0.0.1", 9))
+        chain.stop()
+        assert not chain._thr.is_alive(), (
+            "the stopped chain's thread is still running")
 
     def case_relays_through_untrusted_loopback_mitm(self, certdir, tmp_path):
         from cswap_pin.proxy import PinProxy
@@ -2180,6 +2387,7 @@ class TestLoopbackChainTrust:
         )
         proxy.start()
         try:
+            _stray(chain.port)
             status = _request_through_proxy(
                 proxy.port, certdir / "ca.pem", "/v1/messages", bearer="t",
             )
@@ -2252,6 +2460,907 @@ class TestLoopbackChainTrust:
         finally:
             proxy.stop()
             upstream.stop()
+
+
+class _StallingHop:
+    """An egress hop that accepts and then does not answer, or answers late.
+
+    ``delay=None``: after the request head (a CONNECT it answers 200 first) it
+    reads and says nothing until the pin lets go. ``delay=s``: it waits ``s``
+    seconds and then serves, a CONNECT blind-piped to ``target`` and anything
+    else a canned 200. ``reached`` is set when the request head arrived;
+    ``cut`` when the pin's side of that leg ended (EOF or reset), which is how
+    a case sees the hop leg closed; a connection that ends before its head is
+    not that leg (T2951: something on the host connects to loopback listeners
+    and closes at once). ``reply`` (with ``delay=None``) is sent
+    first and then nothing: a reply head and part of a body, then silence.
+    ``max_conns`` makes it a hop out of fds: past that many live connections a
+    request is answered 502. ``hold_rest``: a CONNECT for anything but
+    ``target`` is answered 200 and then held silent."""
+
+    def __init__(self, delay: "float | None" = None, target=None,
+                 reply: bytes = b"", max_conns: "int | None" = None,
+                 hold_rest: bool = False):
+        self._delay, self._target, self._reply = delay, target, reply
+        self._budget = max_conns and threading.BoundedSemaphore(max_conns)
+        self._hold_rest = hold_rest
+        self.reached, self.cut = threading.Event(), threading.Event()
+        self._conns: list = []
+        self._srv = socket.socket()
+        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(5)
+        self.port = self._srv.getsockname()[1]
+        self._thr = threading.Thread(target=self._accept, daemon=True)
+        self._thr.start()
+
+    def _accept(self):
+        while True:
+            try:
+                conn, _ = self._srv.accept()
+            except OSError:
+                return
+            self._conns.append(conn)
+            threading.Thread(target=self._serve, args=(conn,),
+                             daemon=True).start()
+
+    def _serve(self, conn):
+        import select
+
+        counted = served = False
+        try:
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                head += chunk
+            served = True
+            self.reached.set()
+            if self._budget:
+                counted = self._budget.acquire(blocking=False)
+                if not counted:
+                    conn.sendall(b"HTTP/1.1 502 Bad Gateway\r\n"
+                                 b"Content-Length: 0\r\n\r\n")
+                    return
+            connect = head.startswith(b"CONNECT")
+            if connect:
+                conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            held = self._hold_rest and (
+                f"{self._target[0]}:{self._target[1]}".encode() not in head)
+            if self._delay is None or held:
+                if self._reply:
+                    conn.sendall(self._reply)
+                while conn.recv(65536):
+                    pass
+                return
+            time.sleep(self._delay)
+            if not connect:
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+                return
+            up = socket.create_connection(self._target, timeout=10)
+            self._conns.append(up)
+            while True:
+                ready, _, _ = select.select([conn, up], [], [], 10)
+                if not ready:
+                    return
+                for s in ready:
+                    data = s.recv(65536)
+                    if not data:
+                        return
+                    (up if s is conn else conn).sendall(data)
+        except OSError:
+            pass
+        finally:
+            if counted:
+                self._budget.release()
+            if served:
+                self.cut.set()
+
+    def stop(self):
+        self._srv.close()
+        for c in self._conns:
+            try:
+                c.close()
+            except OSError:
+                pass
+
+
+def _stray(port: int) -> None:
+    """What something on the host sends to loopback listeners: a connect that
+    closes at once (T2951: 4 in 60 s on a bare listener). A fixture's only
+    accept must not be spent on one (T2954); a connect that fails fails the
+    case, so a row that calls this proves the stray arrived."""
+    socket.create_connection(("127.0.0.1", port), timeout=5).close()
+
+
+def _record_dials(monkeypatch) -> list:
+    """Every address the pin dials, hop or direct, as the pin itself saw it
+    (`_happy_dial` is where all of them go). A peer socket cannot tell a direct
+    dial that is then refused from a stray: both connect and close at once
+    (T2964)."""
+    import cswap_pin.proxy as pp
+
+    dialled, real = [], pp._happy_dial
+
+    def record(address, *a, **k):
+        dialled.append(address)
+        return real(address, *a, **k)
+
+    monkeypatch.setattr(pp, "_happy_dial", record)
+    return dialled
+
+
+def _accept_head(srv, ctx=None, timeout=None, stop=None):
+    """Accept until a connection delivers a request head: ``(conn, head)``.
+    A connect that closes first is a stray and is dropped, as `_StallingHop`
+    drops it, so a fixture's only accept is not spent on one (T2954). ``ctx``
+    makes each connection a TLS server's before the head is read. ``stop`` is
+    the fixture's own Event: its `stop()` wakes the accept with a connect that
+    closes at once, which ends the wait with OSError instead of being dropped
+    as a stray (T2964)."""
+    from cswap_pin.proxy import _read_head
+
+    while True:
+        conn, _ = srv.accept()
+        if stop is not None and stop.is_set():
+            conn.close()
+            raise OSError("stopped")
+        conn.settimeout(timeout)
+        try:
+            if ctx:
+                conn = ctx.wrap_socket(conn, server_side=True)
+            head = _read_head(conn)
+        except OSError:  # a stray fails its handshake (ssl.SSLError is one)
+            head = None
+        if head:
+            return conn, head
+        conn.close()
+
+
+def _is_stray(conn) -> bool:
+    """Whether ``conn`` is a stray: it closed within 0.1 s having sent nothing.
+    One that sends or stays open is a dial. For a peer that is dialled and not
+    spoken to first, where no request head tells the two apart (T2964). Peeks,
+    so nothing is consumed."""
+    conn.settimeout(0.1)
+    try:
+        return conn.recv(1, socket.MSG_PEEK) == b""
+    except socket.timeout:
+        return False
+    except OSError:  # a reset
+        return True
+    finally:
+        conn.settimeout(None)
+
+
+def _accept_held(srv):
+    """Accept until a connection is not a stray (`_is_stray`): ``conn``."""
+    while True:
+        conn, _ = srv.accept()
+        if not _is_stray(conn):
+            return conn
+        conn.close()
+
+
+class _MidBodyOrigin:
+    """A TLS origin that answers its one request with ``reply`` (a head and
+    part of a body) and then says nothing. ``cut`` is set when the pin's side
+    of the connection ends, which is how a case sees the upstream leg closed."""
+
+    def __init__(self, certdir: Path, reply: bytes):
+        self.cut = threading.Event()
+        self._reply = reply
+        self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self._ctx.load_cert_chain(str(certdir / "leaf.pem"),
+                                  str(certdir / "leaf.key"))
+        self._srv = socket.socket()
+        self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(1)
+        self.port = self._srv.getsockname()[1]
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        try:
+            tls, _ = _accept_head(self._srv, self._ctx, 15)
+            tls.sendall(self._reply)
+            while tls.recv(4096):
+                pass
+        except (OSError, ssl.SSLError):
+            pass
+        finally:
+            self.cut.set()
+
+    def stop(self):
+        self._srv.close()
+
+
+# What a hop or an origin says before it goes silent, one per way a body is
+# framed: each ends in its own blocking read in `_relay_response`.
+_MID_BODY = {
+    "length": (b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\npartial"),
+    "chunked": (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                b"7\r\npartial\r\n"),
+    "eof": (b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n"
+            b"partial"),
+}
+
+
+class TestAClientThatHangsUpOnASilentHop:
+    """T1894. Once a hop has accepted, the serving thread blocked with no
+    timeout and never looked at its client, so a client that hung up while its
+    request waited on a silent hop left its fd open and its debt in `_owed`
+    for ever. A draining daemon held 38 such closed fds for 3 h.
+
+    The fix watches the client, and only the client: a slow first byte from a
+    LIVE request is legitimate and a live session channel is never cut, so the
+    controls below keep the client connected through a slow hop.
+
+    T1989: the same holds once the reply head is in. An upstream that goes
+    silent mid-body held both fds for ever, so the body relay is watched too."""
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    @staticmethod
+    def _eventually(pred, bound: float = 5.0) -> bool:
+        deadline = time.monotonic() + bound
+        while time.monotonic() < deadline:
+            if pred():
+                return True
+            time.sleep(0.05)
+        return pred()
+
+    def _assert_let_go(self, proxy, client_closed, hop=None):
+        # Waits for all that is asserted below, the open count included.
+        self._eventually(lambda: proxy.inflight_requests() == 0
+                         and proxy.live_client_count() == 0
+                         and client_closed() and (hop is None or hop.cut.is_set()))
+        assert proxy.inflight_requests() == 0, (
+            "the hung-up client's request is still owed after 5s")
+        assert proxy.live_client_count() == 0, (
+            "the hung-up client is still counted open after 5s")
+        assert client_closed(), (
+            "the pin kept its side of the hung-up client's socket open")
+        assert hop is None or hop.cut.is_set(), "the hop leg was never closed"
+
+    @staticmethod
+    def _proxy(certdir, hop, upstream=("127.0.0.1", 9)):
+        from cswap_pin.proxy import PinProxy
+
+        return PinProxy(certdir=certdir, pin_token_provider=lambda: None,
+                        upstream=upstream, chain_proxy=("127.0.0.1", hop.port))
+
+    @staticmethod
+    def _served_tls(proxy) -> list:
+        """The TLS socket the pin holds for each client it MITMs: a client's
+        side of the connection is closed when its `fileno()` is -1."""
+        served = []
+        wrap = proxy._server_ctx.wrap_socket
+
+        def _spy(*a, **k):
+            served.append(wrap(*a, **k))
+            return served[-1]
+
+        proxy._server_ctx.wrap_socket = _spy
+        return served
+
+    def case_mitm_hop_answers_connect_then_goes_silent(self, certdir):
+        hop = _StallingHop()
+        proxy = self._proxy(certdir, hop)
+        served = self._served_tls(proxy)
+        proxy.start()
+        try:
+            _post_and_abandon(proxy.port, certdir / "ca.pem", "/v1/messages",
+                              "{}")
+            assert hop.reached.wait(5), "premise: the request never reached the hop"
+            self._assert_let_go(proxy, lambda: served[0].fileno() < 0, hop)
+        finally:
+            hop.stop()
+            proxy.stop()
+
+    def _mitm_origin_stalls(self, certdir, extra: str = ""):
+        """The handshake is done, so the wait is the reply (or, with an
+        Upgrade in ``extra``, the 101) read through TLS."""
+        upstream = _StallableBridgeUpstream(certdir)
+        hop = _LoopbackConnectProxy(("127.0.0.1", upstream.port))
+        proxy = self._proxy(certdir, hop, upstream=("127.0.0.1", upstream.port))
+        served = self._served_tls(proxy)
+        proxy.start()
+        try:
+            _post_and_abandon(proxy.port, certdir / "ca.pem", "/v1/messages",
+                              "STALL", extra)
+            assert self._eventually(lambda: upstream.received), (
+                "premise: the request never reached the origin")
+            self._assert_let_go(proxy, lambda: served[0].fileno() < 0)
+        finally:
+            upstream.release.set()
+            hop.stop()
+            proxy.stop()
+            upstream.stop()
+
+    def _plain_hop_stalls(self, certdir, extra: bytes = b""):
+        hop = _StallingHop()
+        proxy = self._proxy(certdir, hop)
+        proxy.start()
+        try:
+            raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
+            raw.sendall(b"GET http://example.com/x HTTP/1.1\r\n"
+                        b"Host: example.com\r\n" + extra + b"\r\n")
+            assert hop.reached.wait(5), "premise: the request never reached the hop"
+            assert proxy.inflight_requests() == 1, "premise: the request is owed"
+            with proxy._live_lock:
+                (conn,) = proxy._open_conns
+            raw.close()
+            self._assert_let_go(proxy, lambda: conn.fileno() < 0, hop)
+        finally:
+            hop.stop()
+            proxy.stop()
+
+    def case_mitm_origin_takes_the_request_and_never_answers(self, certdir):
+        self._mitm_origin_stalls(certdir)
+
+    def case_plain_hop_accepts_and_never_answers(self, certdir):
+        self._plain_hop_stalls(certdir)
+
+    def case_mitm_upgrade_origin_takes_the_request_and_never_answers(
+            self, certdir):
+        """An upgrade stays owed until its 101, and its handshake read
+        (`_relay_upgrade`) is a hop wait of the same shape as the head read."""
+        self._mitm_origin_stalls(
+            certdir, "Connection: Upgrade\r\nUpgrade: websocket\r\n")
+
+    def case_plain_upgrade_hop_accepts_and_never_answers(self, certdir):
+        """The plain path's `_peek_status` is the same wait."""
+        self._plain_hop_stalls(
+            certdir, b"Connection: Upgrade\r\nUpgrade: websocket\r\n")
+
+    def case_control_mitm_a_slow_hop_still_answers_a_connected_client(
+            self, certdir):
+        upstream = _FakeUpstream(certdir)
+        hop = _StallingHop(delay=2.0, target=("127.0.0.1", upstream.port))
+        proxy = self._proxy(certdir, hop, upstream=("127.0.0.1", upstream.port))
+        proxy.start()
+        try:
+            t0 = time.monotonic()
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem", "/v1/messages", bearer="t")
+            assert time.monotonic() - t0 >= 1.9, "premise: the hop was not slow"
+            assert status == 200, f"a slow hop cut a connected client: {status}"
+            assert upstream.seen_path == "/v1/messages"
+        finally:
+            hop.stop()
+            proxy.stop()
+            upstream.stop()
+
+    def case_control_plain_a_slow_hop_still_answers_a_connected_client(
+            self, certdir):
+        hop = _StallingHop(delay=2.0)
+        proxy = self._proxy(certdir, hop)
+        proxy.start()
+        try:
+            raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            t0 = time.monotonic()
+            raw.sendall(b"GET http://example.com/x HTTP/1.1\r\n"
+                        b"Host: example.com\r\n\r\n")
+            got = b""
+            while not got.endswith(b"hi"):
+                chunk = raw.recv(4096)
+                if not chunk:
+                    break
+                got += chunk
+            raw.close()
+            assert time.monotonic() - t0 >= 1.9, "premise: the hop was not slow"
+            assert got.startswith(b"HTTP/1.1 200") and got.endswith(b"hi"), (
+                f"a slow hop cut a connected client: {got!r}")
+        finally:
+            hop.stop()
+            proxy.stop()
+
+    @staticmethod
+    def _read_partial(sock):
+        """Read until the reply's first body bytes are in hand: the client has
+        its head, so what follows is the body relay, not the head wait."""
+        sock.settimeout(5)
+        got = b""
+        while b"partial" not in got:
+            chunk = sock.recv(4096)
+            assert chunk, f"the reply never reached the client: {got!r}"
+            got += chunk
+
+    def _mid_body(self, certdir, framing, *, plain, hang_up):
+        """The reply head and part of the body reach the client, the upstream
+        goes silent, and the client then hangs up (``hang_up``) or stays
+        connected, pipelining a byte as a client waiting for this reply may."""
+        from cswap_pin.proxy import PinProxy
+
+        reply = _MID_BODY[framing]
+        if plain:
+            far = _StallingHop(reply=reply)
+            proxy = self._proxy(certdir, far)
+        else:
+            far = _MidBodyOrigin(certdir, reply)
+            proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None,
+                             upstream=("127.0.0.1", far.port))
+            served = self._served_tls(proxy)
+        proxy.start()
+        try:
+            _stray(far.port)
+            raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
+            if plain:
+                client = raw
+                client.sendall(b"GET http://example.com/x HTTP/1.1\r\n"
+                               b"Host: example.com\r\n\r\n")
+            else:
+                raw.sendall(b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
+                            b"Host: api.anthropic.com:443\r\n\r\n")
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    buf += raw.recv(1)
+                client = ssl.create_default_context(
+                    cafile=str(certdir / "ca.pem")).wrap_socket(
+                        raw, server_hostname="api.anthropic.com")
+                client.sendall(b"GET /v1/messages HTTP/1.1\r\n"
+                               b"Host: api.anthropic.com\r\n"
+                               b"Authorization: Bearer t\r\n\r\n")
+            self._read_partial(client)
+            assert proxy.inflight_requests() == 1, "premise: the reply is owed"
+            if plain:
+                with proxy._live_lock:
+                    (conn,) = proxy._open_conns
+            if hang_up:
+                client.close()
+                self._assert_let_go(
+                    proxy, (lambda: conn.fileno() < 0) if plain
+                    else (lambda: served[0].fileno() < 0), far)
+            else:
+                if plain:
+                    # Not the request leg: something on the host connects to a
+                    # loopback listener and closes at once (T2951: measured on
+                    # a bare hop with no pin, 4 in 60 s).
+                    _stray(far.port)
+                client.sendall(b"G")
+                assert not far.cut.wait(2.0), (
+                    "a connected client's reply was cut mid-body")
+                assert proxy.inflight_requests() == 1
+                assert proxy.live_client_count() == 1
+                client.close()
+        finally:
+            far.stop()
+            proxy.stop()
+
+    def case_mitm_client_hangs_up_mid_body_content_length(self, certdir):
+        self._mid_body(certdir, "length", plain=False, hang_up=True)
+
+    def case_mitm_client_hangs_up_mid_body_chunked(self, certdir):
+        self._mid_body(certdir, "chunked", plain=False, hang_up=True)
+
+    def case_mitm_client_hangs_up_mid_body_unframed(self, certdir):
+        self._mid_body(certdir, "eof", plain=False, hang_up=True)
+
+    def case_plain_client_hangs_up_mid_body_content_length(self, certdir):
+        self._mid_body(certdir, "length", plain=True, hang_up=True)
+
+    def case_plain_client_hangs_up_mid_body_chunked(self, certdir):
+        self._mid_body(certdir, "chunked", plain=True, hang_up=True)
+
+    def case_plain_client_hangs_up_mid_body_unframed(self, certdir):
+        self._mid_body(certdir, "eof", plain=True, hang_up=True)
+
+    def case_control_mitm_a_connected_client_is_not_cut_mid_body(self, certdir):
+        self._mid_body(certdir, "length", plain=False, hang_up=False)
+
+    def case_control_plain_a_connected_client_is_not_cut_mid_body(self, certdir):
+        self._mid_body(certdir, "length", plain=True, hang_up=False)
+
+    @staticmethod
+    def _tcp_pair():
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        a = socket.create_connection(srv.getsockname(), timeout=5)
+        b, _ = srv.accept()
+        srv.close()
+        return a, b
+
+    def case_client_gone_reads_a_close_and_a_reset_not_pending_bytes(self):
+        """A pipelined byte is a client still waiting, not one that left; a FIN
+        (with bytes unread behind it or not) and a reset are a hang-up. The
+        same on Linux (POLLRDHUP) and macOS (POLLHUP), measured on both, so
+        this runs natively on each and models neither."""
+        import struct
+
+        from cswap_pin.proxy import _client_gone
+
+        a, b = self._tcp_pair()
+        assert _client_gone(a.fileno()) is False, "an idle client read as gone"
+        b.sendall(b"x")
+        time.sleep(0.05)
+        assert _client_gone(a.fileno()) is False, (
+            "a client with a pipelined byte read as gone")
+        b.close()
+        time.sleep(0.05)
+        assert _client_gone(a.fileno()) is True, (
+            "a FIN behind an unread byte was missed")
+        a.close()
+
+        a, b = self._tcp_pair()
+        b.close()
+        time.sleep(0.05)
+        assert _client_gone(a.fileno()) is True, "a plain FIN was missed"
+        a.close()
+
+        a, b = self._tcp_pair()
+        b.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                     struct.pack("ii", 1, 0))
+        b.close()
+        time.sleep(0.05)
+        assert _client_gone(a.fileno()) is True, "a reset was missed"
+        a.close()
+
+    def case_a_watch_holds_only_for_its_block(self):
+        from cswap_pin.proxy import _ClientWatch
+
+        a, b = self._tcp_pair()
+        c, d = self._tcp_pair()
+        watch = _ClientWatch()
+        with watch.over(a, c):
+            assert len(watch._waits) == 1
+        assert not watch._waits, "a finished wait stayed registered"
+        with watch.over(object(), c):
+            assert not watch._waits, "an unwatchable client was registered"
+        for s in (a, b, c, d):
+            s.close()
+
+    def case_let_go_waits_for_the_release_not_only_the_close(self):
+        """`_pump` closes the client socket, then its frames unwind to
+        `_release`: a wait that stopped at "closed" read the count in between
+        and failed on the macOS runner without waiting out its 5 s, the pin
+        having let the client go (macOS, poll spinning: 91 of 100 failed, a
+        13 ms median gap, 37 ms worst, never stuck)."""
+        release_at = time.monotonic() + 0.3
+        late = types.SimpleNamespace(
+            inflight_requests=lambda: 0,
+            live_client_count=lambda: int(time.monotonic() < release_at))
+        self._assert_let_go(late, lambda: True)
+
+
+class TestTunnelsToOtherHostsCannotTakeTheWholeHop:
+    """T2031. A tunnel fan-out to hosts that are not Anthropic's (one agent's
+    parallel bulk transfers, measured at ~500 tunnels) used every fd the hop
+    had, and Claude's own /v1/messages CONNECTs through the same hop got 502.
+    The pin caps what the other hosts may hold; Anthropic's domains are never
+    counted. The hop here is out of fds past 5 live connections, the cap is 3."""
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    @staticmethod
+    def _pin(certdir, monkeypatch, hop, upstream_port=9, cap=3):
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import PinProxy
+
+        monkeypatch.setattr(pin_proxy, "_BLIND_TUNNEL_CAP", cap)
+        monkeypatch.setattr(pin_proxy, "_CHAIN_HEAL_GRACE_S", 0.2)
+        monkeypatch.setattr(pin_proxy, "_CHAIN_HEAL_POLL_S", 0.05)
+        monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None,
+                         upstream=("127.0.0.1", upstream_port),
+                         chain_proxy=("127.0.0.1", hop.port))
+        assert proxy._chain_candidates(), "premise: this host has a chain"
+        proxy.start()
+        return proxy, proxy._tunnel_slots
+
+    @staticmethod
+    def _open(proxy, hosts):
+        """CONNECT to every host through the pin at once. The open sockets and
+        the status code each got, in order."""
+        socks = []
+        for host in hosts:
+            s = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            s.sendall(f"CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n"
+                      .encode())
+            socks.append(s)
+        codes = []
+        for s in socks:
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                head += chunk
+            codes.append(head.split(b"\r\n")[0].decode().split(" ")[1])
+        return socks, codes
+
+    def case_a_flood_to_other_hosts_leaves_the_hop_room_for_the_api(
+            self, certdir, monkeypatch):
+        upstream = _FakeUpstream(certdir)
+        hop = _StallingHop(delay=0.0, target=("127.0.0.1", upstream.port),
+                           max_conns=5, hold_rest=True)
+        proxy, _ = self._pin(certdir, monkeypatch, hop, upstream.port)
+        socks = []
+        try:
+            socks, codes = self._open(
+                proxy, [f"bulk{i}.example.test" for i in range(8)])
+            api = _request_through_proxy(
+                proxy.port, certdir / "ca.pem", "/v1/messages", bearer="t")
+            assert api == 200, (
+                f"the hop's fds went to the other hosts' tunnels, so the API "
+                f"request got {api}; the tunnels answered {codes}")
+            assert sorted(codes) == ["200"] * 3 + ["503"] * 5, (
+                f"3 tunnels fit the cap and 5 are refused with a 503: {codes}")
+        finally:
+            for s in socks:
+                s.close()
+            hop.stop()
+            proxy.stop()
+            upstream.stop()
+
+    def case_anthropic_domains_are_never_capped(self, certdir, monkeypatch):
+        hop = _StallingHop(delay=0.0, target=("127.0.0.1", 9), hold_rest=True)
+        proxy, _ = self._pin(certdir, monkeypatch, hop)
+        socks = []
+        try:
+            socks, codes = self._open(
+                proxy, [f"bulk{i}.example.test" for i in range(3)])
+            assert codes == ["200"] * 3, f"premise: the cap is full: {codes}"
+            more, codes = self._open(proxy, [
+                "bridge.claudeusercontent.com", "downloads.claude.ai",
+                "claude.com", "Statsig.Anthropic.COM",
+                # Lookalikes: a suffix match must stop at the dot.
+                "notclaude.ai", "evilanthropic.com"])
+            socks += more
+            assert codes == ["200"] * 4 + ["503"] * 2, codes
+        finally:
+            for s in socks:
+                s.close()
+            hop.stop()
+            proxy.stop()
+
+    def case_slots_come_back_when_tunnels_end_or_are_refused(
+            self, certdir, monkeypatch):
+        # A hop that fits ONE tunnel: the other two are refused by the hop,
+        # which is an exit that never reaches the pump.
+        hop = _StallingHop(delay=0.0, target=("127.0.0.1", 9), max_conns=1,
+                           hold_rest=True)
+        proxy, slots = self._pin(certdir, monkeypatch, hop)
+        socks = []
+        try:
+            socks, codes = self._open(
+                proxy, [f"bulk{i}.example.test" for i in range(3)])
+            assert sorted(codes) == ["200", "503", "503"], codes
+            for s in socks:
+                s.close()
+
+            def free():
+                n = 0
+                while slots.acquire(blocking=False):
+                    n += 1
+                for _ in range(n):
+                    slots.release()
+                return n
+
+            deadline = time.monotonic() + 5
+            while free() < 3 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert free() == 3, "a slot never came back"
+        finally:
+            hop.stop()
+            proxy.stop()
+
+    def case_a_slot_is_given_back_exactly_once(self, certdir, monkeypatch):
+        """BoundedSemaphore raises only past its initial value, so a second
+        give while another tunnel still holds a slot would silently grow the
+        cap. The pump closes a pair once, but nothing here relies on that."""
+        from cswap_pin import proxy as pin_proxy
+
+        hop = _StallingHop(delay=0.0, target=("127.0.0.1", 9))
+        proxy, slots = self._pin(certdir, monkeypatch, hop, cap=2)
+        closed = threading.Event()
+
+        def closes_twice(a, b, on_close=None, kind="bridge", loop=None):
+            on_close()
+            on_close()
+            closed.set()
+
+        monkeypatch.setattr(pin_proxy, "_pump_detached", closes_twice)
+        assert slots.acquire(blocking=False), "premise: another tunnel's slot"
+        socks = []
+        try:
+            socks, codes = self._open(proxy, ["bulk.example.test"])
+            assert codes == ["200"] and closed.wait(5), codes
+            assert slots.acquire(blocking=False), "the slot was not given back"
+            assert not slots.acquire(blocking=False), (
+                "a second give grew the cap past the other tunnel's slot")
+        finally:
+            for s in socks:
+                s.close()
+            hop.stop()
+            proxy.stop()
+
+
+class TestPinTimeHopTrust:
+    """T1612: `cswap pin N` makes ONE CONNECT to the API host through the
+    recorded hop, with the trust the daemon will use, and names the fix when
+    the hop re-signs with a CA nobody gave it.
+
+    A NON-LOOPBACK hop is what the daemon verifies through (`_upstream_ctx`);
+    a loopback one gets CERT_NONE, see
+    `case_relays_through_untrusted_loopback_mitm`. These cases empty
+    `_LOOPBACK` so a 127.0.0.1 fake stands in for a remote hop.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    @staticmethod
+    def _mitm(tmp_path, signer=None):
+        """A CONNECT hop in front of an origin whose leaf `signer` signed: a
+        foreign CA (a MITM) by default, or the pin's own (a plain tunnel to
+        an origin the daemon trusts)."""
+        if signer is None:
+            signer = tmp_path / "foreign"
+            signer.mkdir()
+            ensure_ca(signer, "api.anthropic.com")
+        upstream = _FakeUpstream(signer)
+        return signer, upstream, _LoopbackConnectProxy(("127.0.0.1", upstream.port))
+
+    def _verdict(self, certdir, tmp_path, monkeypatch, *, ca=None,
+                 remote=True, signer=None):
+        from cswap_pin import proxy
+
+        monkeypatch.delenv("NODE_EXTRA_CA_CERTS", raising=False)
+        if remote:
+            monkeypatch.setattr(proxy, "_LOOPBACK", frozenset())
+        signer, upstream, hop = self._mitm(tmp_path, signer)
+        try:
+            proxy.write_upstream_hint(
+                certdir, f"http://127.0.0.1:{hop.port}",
+                str(signer / "ca.pem") if ca else None)
+            return proxy.hop_trust_problem(certdir), hop.port
+        finally:
+            hop.stop()
+            upstream.stop()
+
+    def case_a_mitm_hop_without_its_ca_names_the_fix(
+        self, certdir, tmp_path, monkeypatch
+    ):
+        msg, port = self._verdict(certdir, tmp_path, monkeypatch)
+        assert msg and "NODE_EXTRA_CA_CERTS" in msg, msg
+        assert f"127.0.0.1:{port}" in msg, msg
+
+    def case_a_mitm_hop_with_its_ca_is_clean(self, certdir, tmp_path, monkeypatch):
+        msg, _ = self._verdict(certdir, tmp_path, monkeypatch, ca=True)
+        assert msg is None, msg
+
+    def case_a_plain_connect_proxy_is_clean(self, certdir, tmp_path, monkeypatch):
+        # The origin's own certificate comes through untouched, and it is one
+        # the daemon's context trusts.
+        msg, _ = self._verdict(certdir, tmp_path, monkeypatch, signer=certdir)
+        assert msg is None, msg
+
+    def case_a_loopback_mitm_is_clean_because_the_daemon_does_not_verify_it(
+        self, certdir, tmp_path, monkeypatch
+    ):
+        msg, _ = self._verdict(certdir, tmp_path, monkeypatch, remote=False)
+        assert msg is None, msg
+
+    def case_no_proxy_is_no_check(self, certdir, monkeypatch):
+        from cswap_pin import proxy
+
+        def _no_dial(*a, **k):
+            raise AssertionError("dialled with no proxy recorded")
+
+        monkeypatch.setattr(proxy, "_dial_chain", _no_dial)
+        assert proxy.hop_trust_problem(certdir) is None
+
+    def case_a_hop_that_does_not_answer_is_reported_not_blamed_on_trust(
+        self, certdir, monkeypatch
+    ):
+        from cswap_pin import proxy
+
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        dead = probe.getsockname()[1]
+        probe.close()
+        monkeypatch.setattr(proxy, "_LOOPBACK", frozenset())
+        proxy.write_upstream_hint(certdir, f"http://127.0.0.1:{dead}")
+        msg = proxy.hop_trust_problem(certdir)
+        assert msg and f"127.0.0.1:{dead}" in msg, msg
+        assert "NODE_EXTRA_CA_CERTS" not in msg, msg
+
+    @staticmethod
+    def _slow_hop(chunk, every):
+        """A hop that answers a CONNECT with `chunk` every `every` seconds,
+        never a blank line, for at most 6 s (so a probe with no overall
+        deadline still returns, late)."""
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        done = threading.Event()
+
+        def serve():
+            conn, _ = _accept_head(srv)
+            with conn:
+                end = time.monotonic() + 6
+                while time.monotonic() < end and not done.wait(every):
+                    try:
+                        conn.sendall(chunk)
+                    except OSError:
+                        return
+
+        thr = threading.Thread(target=serve, daemon=True)
+        thr.start()
+        return srv, done, thr
+
+    def _timed(self, certdir, monkeypatch, chunk, every, budget):
+        from cswap_pin import proxy
+
+        monkeypatch.setattr(proxy, "_LOOPBACK", frozenset())
+        # raising=False: a misspelt name still fails, on the 10 s default.
+        monkeypatch.setattr(proxy, "_HOP_PROBE_BUDGET_S", budget, raising=False)
+        srv, done, thr = self._slow_hop(chunk, every)
+        port = srv.getsockname()[1]
+        try:
+            _stray(port)
+            proxy.write_upstream_hint(certdir, f"http://127.0.0.1:{port}")
+            t0 = time.monotonic()
+            msg = proxy.hop_trust_problem(certdir)
+            took = time.monotonic() - t0
+        finally:
+            done.set()
+            thr.join(timeout=8)
+            srv.close()
+        assert msg and f"127.0.0.1:{port}" in msg, msg
+        assert "NODE_EXTRA_CA_CERTS" not in msg, msg
+        return took
+
+    def case_a_hop_that_trickles_its_reply_is_cut_at_the_deadline(
+        self, certdir, monkeypatch
+    ):
+        """One byte every 0.3 s never trips the 6 s per-read timeout, so only
+        an overall deadline stops `cswap pin` (and the TUI's repair on mount)
+        waiting on it."""
+        took = self._timed(certdir, monkeypatch, b"x", 0.3, budget=1.5)
+        assert took < 1.5 + 1.0, took
+
+    def case_a_hop_that_floods_its_reply_is_cut_at_the_cap(
+        self, certdir, monkeypatch
+    ):
+        took = self._timed(certdir, monkeypatch, b"x" * 65536, 0.01, budget=30)
+        assert took < 2.0, took
+
+    def case_a_running_daemon_trusts_a_ca_recorded_after_it_started(
+        self, certdir, tmp_path, monkeypatch
+    ):
+        """THE FIX TEXT MUST WORK ON A REUSED DAEMON. Re-running `cswap pin`
+        with the CA exported records it in upstream.json, and `ensure_proxy`
+        then reuses the daemon already serving, whose own environment never
+        had it. So the origin leg has to read the recorded CA per connection,
+        as the hop's own TLS (`_dial_chain`) already does."""
+        from cswap_pin import proxy
+        from cswap_pin.proxy import PinProxy
+
+        monkeypatch.delenv("NODE_EXTRA_CA_CERTS", raising=False)
+        monkeypatch.setattr(proxy, "_LOOPBACK", frozenset())
+        foreign, upstream, hop = self._mitm(tmp_path)
+        proxy.write_upstream_hint(
+            certdir, f"http://127.0.0.1:{hop.port}", str(foreign / "ca.pem"))
+        daemon = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", upstream.port),
+            rediscover_chain=True,
+        )
+        daemon.start()
+        try:
+            status = _request_through_proxy(
+                daemon.port, certdir / "ca.pem", "/v1/messages", bearer="t")
+        finally:
+            daemon.stop()
+            hop.stop()
+            upstream.stop()
+        assert status == 200
 
 
 class TestPortReclamationAcrossRespawn:
@@ -2462,6 +3571,93 @@ class TestLongPollSurvives:
             srv.close()
 
 
+def _http_hop(status, body=b""):
+    """A loopback hop answering every HTTP request with `status` and `body`.
+
+    Returns ``(server, url, served)``. `served` counts requests that sent
+    bytes, NOT bare connects: `_ambient_proxy`'s `_port_is_serving` opens one
+    and closes it without a word, which is not a probe of the hop.
+    """
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(4)
+    served = []
+
+    def serve():
+        while True:
+            try:
+                c, _ = srv.accept()
+            except OSError:
+                return
+            try:
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    d = c.recv(4096)
+                    if not d:
+                        break
+                    buf += d
+                if buf:
+                    served.append(1)  # before the reply: the client may race it
+                    c.sendall(
+                        b"HTTP/1.1 " + status + b"\r\nContent-Length: "
+                        + str(len(body)).encode() + b"\r\n\r\n" + body
+                    )
+            except OSError:
+                pass
+            finally:
+                c.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.getsockname()[1]}", served
+
+
+def _port_is_serving_10s(host, port):
+    """`proxy._port_is_serving` with a 10 s connect budget (T2741)."""
+    try:
+        with socket.create_connection((host, port), timeout=10):
+            return True
+    except OSError:
+        return False
+
+
+def _launch_from(shell_proxy, tmp_path, monkeypatch):
+    """``(ensure_proxy_once, certdir)``: the real call site, one launch whose
+    shell exports `shell_proxy`, with everything past the hint block stubbed."""
+    import functools
+
+    import cswap_pin.proxy as pp
+
+    certdir = tmp_path / "pin-proxy"
+    certdir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HTTPS_PROXY", shell_proxy)
+    for name, fake in (
+        ("load_pin", lambda _bd: ("a@b.c", "")),
+        ("_carry_history_pointers", lambda _cd: None),
+        ("daemon_fingerprint", lambda *_a: "FP"),
+        ("ensure_ca", lambda *_a: None),
+        ("publish_ca", lambda _p: None),
+        ("wire_global_config", lambda *_a: None),
+        ("_read_alive_port", lambda *_a, **_k: 41000),
+        ("_ASKED_NOHEALTH", set()),
+        ("_ANSWERED_HEALTH", set()),
+        # timeout=10: a server-thread reply, not the network (T1076).
+        ("_probe_next_hop", functools.partial(pp._probe_next_hop, timeout=10)),
+        # and 10 s, not 0.5 s, for the connect `_port_is_serving` makes: a
+        # stalled runner holds a loopback handshake past 0.5 s (T2741).
+        ("_port_is_serving", _port_is_serving_10s),
+    ):
+        monkeypatch.setattr(pp, name, fake)
+
+    class _SW:
+        backup_dir = tmp_path
+
+        def resolve_account(self, email):
+            return "1", email, None
+
+    return lambda: pp.ensure_proxy(_SW()), certdir
+
+
 class TestChainRediscovery:
     """The daemon outlives the launch that spawned it, and a cache proxy picks
     its port from a family and can restart. A chain bound once at spawn
@@ -2633,9 +3829,10 @@ class TestChainRediscovery:
         LAUNCH records one. One was missing anyway: `_probe_next_hop` ran at
         hint-writing time and nowhere else, and `--ensure` — what an rc hook
         calls before every `claude` — routes to `heal`, which never re-stamps
-        the hint. So the only chance to learn the outer hop was a launch that
-        happened while the inner one was answering. Miss it once and the
-        chain is single-hop for good. Measured, and it was the steady state:
+        a non-empty hint and fills an empty one (T2753). So the only chance
+        to learn the outer hop was a launch that happened while the inner one
+        was answering. Miss it once and the chain is single-hop for good.
+        Measured, and it was the steady state:
 
             upstream.json {"proxy": "http://127.0.0.1:9901", ...} no "next",
             written 2026-08-04 01:32, unchanged a day later, while 9901's
@@ -2854,9 +4051,8 @@ class TestChainRediscovery:
             dialled.append(address)
             raise OSError("the direct dial is the thing under test")
 
-        monkeypatch.setattr(
-            pin_proxy.socket, "create_connection", _create_connection
-        )
+        # `_happy_dial` is where every remote dial (hop and direct) goes.
+        monkeypatch.setattr(pin_proxy, "_happy_dial", _create_connection)
         proxy = PinProxy(
             certdir=certdir,
             pin_token_provider=lambda: None,
@@ -2992,7 +4188,7 @@ class TestChainRediscovery:
         sentinel = object()
         attempts = []
 
-        def _walk():
+        def _walk(target=None):
             attempts.append(1)
             return sentinel if len(attempts) >= 3 else None
 
@@ -3388,7 +4584,6 @@ class TestChainRediscovery:
                     c, _ = srv.accept()
                 except OSError:
                     return
-                seen.append(1)
                 try:
                     buf = b""
                     while b"\r\n\r\n" not in buf:
@@ -3396,6 +4591,9 @@ class TestChainRediscovery:
                         if not d:
                             break
                         buf += d
+                    if not buf:  # a stray sends nothing (T2954)
+                        continue
+                    seen.append(1)
                     c.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                 except OSError:
                     pass
@@ -3857,6 +5055,7 @@ class TestChainRediscovery:
         egress refused. It must now be answered 400 before any hop is asked.
         """
         refusing, refusing_port, seen = self._refusing_chain()
+        _stray(refusing_port)
         from cswap_pin.proxy import PinProxy, write_upstream_hint
 
         write_upstream_hint(certdir, f"http://127.0.0.1:{refusing_port}")
@@ -3945,6 +5144,7 @@ class TestChainRediscovery:
         this). That path also fell through to `egress REFUSED` with no hop
         reason above it.
         """
+        monkeypatch.setattr("cswap_pin.proxy._TUNNEL_EOF_WINDOW_MS", 2000)
         srv = socket.socket()
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(("127.0.0.1", 0))
@@ -3965,6 +5165,7 @@ class TestChainRediscovery:
                             break
                         seen += d
                     c.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    time.sleep(0.05)  # a chain thread descheduled here (T2951)
                 except OSError:
                     pass
                 finally:
@@ -4491,9 +5692,8 @@ class TestChainRediscovery:
             dialled.append(address)
             raise OSError("the direct dial is the thing under test")
 
-        monkeypatch.setattr(
-            pin_proxy.socket, "create_connection", _create_connection
-        )
+        # `_happy_dial` is where every remote dial (hop and direct) goes.
+        monkeypatch.setattr(pin_proxy, "_happy_dial", _create_connection)
         proxy = PinProxy(
             certdir=certdir,
             pin_token_provider=lambda: None,
@@ -4574,6 +5774,7 @@ class TestChainRediscovery:
                              pin_token_provider=lambda: "PINTOKEN",
                              rediscover_chain=True)
             proxy.start()
+            _stray(chain_port)
 
             def ask(url, host):
                 c = socket.create_connection(("127.0.0.1", proxy.port),
@@ -5125,19 +6326,13 @@ class TestChainRediscovery:
         def origin():
             try:
                 # First (plain) request, on its own fresh dial.
-                c1, _ = srv.accept()
-                data = b""
-                while b"\r\n\r\n" not in data:
-                    data += c1.recv(4096)
+                c1, _ = _accept_head(srv)
                 c1.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
                 c1.close()
 
                 # Second (upgrade) request -- CHANGE 1 dials fresh per
                 # request, so this is a NEW connection to the origin.
-                c2, _ = srv.accept()
-                data = b""
-                while b"\r\n\r\n" not in data:
-                    data += c2.recv(4096)
+                c2, _ = _accept_head(srv)
                 c2.sendall(
                     b"HTTP/1.1 101 Switching Protocols\r\n"
                     b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
@@ -5153,6 +6348,7 @@ class TestChainRediscovery:
         proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None)
         proxy.start()
         try:
+            _stray(oport)
             raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
             raw.sendall(
                 f"GET http://127.0.0.1:{oport}/first HTTP/1.1\r\n"
@@ -5219,10 +6415,7 @@ class TestChainRediscovery:
 
         def origin():
             try:
-                c, _ = srv.accept()
-                data = b""
-                while b"\r\n\r\n" not in data:
-                    data += c.recv(4096)
+                c, _ = _accept_head(srv)
                 reached_hold.set()
                 release.wait(10)
                 c.sendall(
@@ -5237,6 +6430,7 @@ class TestChainRediscovery:
         proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None)
         proxy.start()
         try:
+            _stray(oport)
             raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
             raw.sendall(
                 f"GET http://127.0.0.1:{oport}/ws HTTP/1.1\r\n"
@@ -5601,7 +6795,7 @@ class TestChainRediscovery:
         MITM path already made (round 4) — refused immediately, before
         `_wait_for_pin_token`'s own retry loop ever runs. Without this a
         stalled store cost `provider()` plus 3 retries, each blockable up to
-        `_MINT_LOCK_BOUND_S` (45s) on `refresh_lock`, on a thread-per-
+        `_MINT_LOCK_BOUND_S` on `refresh_lock`, on a thread-per-
         connection server with no cap — paid ONCE before this whole round,
         but every backoff respawn since the guard 503s the bridge worker
         instead of relaying. `provider.calls == 1` proves the retry loop
@@ -6213,7 +7407,6 @@ class TestChainRediscovery:
                     c, _ = srv.accept()
                 except OSError:
                     return
-                handled.append(1)
                 try:
                     buf = b""
                     while b"\r\n\r\n" not in buf:
@@ -6221,6 +7414,9 @@ class TestChainRediscovery:
                         if not d:
                             break
                         buf += d
+                    if not buf:  # a stray sends nothing (T2954)
+                        continue
+                    handled.append(1)
                     body = b"Error: invalid request"
                     c.sendall(
                         b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n"
@@ -6235,6 +7431,7 @@ class TestChainRediscovery:
         threading.Thread(target=serve, daemon=True).start()
         address = f"127.0.0.1:{srv.getsockname()[1]}"
         try:
+            _stray(srv.getsockname()[1])
             url = f"http://{address}"
             # A baseline record on disk, written BEFORE either probe, so the
             # read below sees only what the probes themselves did to it —
@@ -6288,7 +7485,6 @@ class TestChainRediscovery:
                     c, _ = srv.accept()
                 except OSError:
                     return
-                handled.append(1)
                 try:
                     buf = b""
                     while b"\r\n\r\n" not in buf:
@@ -6296,6 +7492,9 @@ class TestChainRediscovery:
                         if not d:
                             break
                         buf += d
+                    if not buf:  # a stray sends nothing (T2954)
+                        continue
+                    handled.append(1)
                     body = b"Internal Server Error"
                     c.sendall(
                         b"HTTP/1.1 500 Internal Server Error\r\n"
@@ -6310,6 +7509,7 @@ class TestChainRediscovery:
         threading.Thread(target=serve, daemon=True).start()
         address = f"127.0.0.1:{srv.getsockname()[1]}"
         try:
+            _stray(srv.getsockname()[1])
             url = f"http://{address}"
             # timeout=10: the assertion below waits on the server thread's
             # own reply, not the network.
@@ -6391,7 +7591,9 @@ class TestChainRediscovery:
 
         The discriminator is connections accepted, not the return value: the
         old code also returns None for a hop that never answers, so a bare
-        `is None` on the result would pass unchanged."""
+        `is None` on the result would pass unchanged. A connection counts when
+        it sends something or stays open past a short window; a stray (a
+        connect that closes at once, T2954) does not."""
         import cswap_pin.proxy as pp
 
         def health_server(next_hop):
@@ -6407,8 +7609,10 @@ class TestChainRediscovery:
                         c, _ = srv.accept()
                     except OSError:
                         return
-                    accepted.append(1)
                     try:
+                        if _is_stray(c):  # closes at once (T2954)
+                            continue
+                        accepted.append(1)
                         buf = b""
                         while b"\r\n\r\n" not in buf:
                             d = c.recv(4096)
@@ -6436,9 +7640,10 @@ class TestChainRediscovery:
         try:
             ambient_url = f"http://127.0.0.1:{ambient_srv.getsockname()[1]}"
             other_url = f"http://127.0.0.1:{other_srv.getsockname()[1]}"
+            _stray(ambient_srv.getsockname()[1])
 
             # The hop asked IS the launch's own ambient proxy: nothing wired
-            # this launch over it, so it is never even connected to.
+            # this launch over it, so it is never asked and never held open.
             nxt = pp._probe_next_hop(ambient_url, own_proxy=ambient_url)
             time.sleep(0.2)
             assert nxt is None
@@ -6453,6 +7658,14 @@ class TestChainRediscovery:
             nxt = pp._probe_next_hop(other_url, timeout=10, own_proxy=ambient_url)
             assert nxt == "http://127.0.0.1:2"
             assert other_accepted == [1], other_accepted
+
+            # The counter catches a connection that sends nothing but stays
+            # open (the stray above closed at once and was not counted).
+            with socket.create_connection(ambient_srv.getsockname(), timeout=5):
+                deadline = time.monotonic() + 5
+                while not ambient_accepted and time.monotonic() < deadline:
+                    time.sleep(0.02)
+            assert ambient_accepted == [1], ambient_accepted
         finally:
             ambient_srv.close()
             other_srv.close()
@@ -6482,8 +7695,14 @@ class TestChainRediscovery:
                     c, _ = srv.accept()
                 except OSError:
                     return
-                accepted.append(1)
-                c.close()
+                try:
+                    c.settimeout(0.5)  # a stray that holds must not park this
+                    if c.recv(4096):  # a stray sends nothing (T2954)
+                        accepted.append(1)
+                except OSError:
+                    pass
+                finally:
+                    c.close()
 
         threading.Thread(target=serve, daemon=True).start()
         try:
@@ -6503,6 +7722,7 @@ class TestChainRediscovery:
                 def resolve_account(self, email):
                     return "1", email, None
 
+            _stray(srv.getsockname()[1])
             got = pp.ensure_proxy(_SW())
             time.sleep(0.2)
             assert got == (41000, tmp_path / "pin-proxy" / "ca.pem")
@@ -6510,6 +7730,16 @@ class TestChainRediscovery:
                 "ensure_proxy asked its own shell's exported proxy for "
                 "/health"
             )
+
+            # A stray that holds open must not park the only serve thread: an
+            # ask behind it is still counted.
+            with socket.create_connection(srv.getsockname(), timeout=5), \
+                    socket.create_connection(srv.getsockname(), timeout=5) as ask:
+                ask.sendall(b"GET /health HTTP/1.1\r\n\r\n")
+                deadline = time.monotonic() + 5
+                while not accepted and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                assert accepted == [1], accepted
         finally:
             srv.close()
 
@@ -6688,6 +7918,253 @@ class TestChainRediscovery:
         finally:
             srv.close()
 
+    def case_ensure_proxy_re_records_a_chain_recorded_outer_first(
+        self, tmp_path, monkeypatch
+    ):
+        """The first pin ran from a shell exporting the OUTER egress proxy
+        (answers every /health with 400), so it is what upstream.json holds;
+        a re-pin from a shell exporting the INNER cache proxy (whose /health
+        names the outer one) used to keep it, record proxy=outer next=inner,
+        and send every pinned request past the cache proxy, silently. The
+        record must end up [inner, outer], and stay so on the next launch
+        from the same shell, which must not ask the outer hop again."""
+        import cswap_pin.proxy as pp
+
+        outer_srv, outer, outer_served = _http_hop(b"400 Bad Request")
+        body = json.dumps({"status": "ok", "https_proxy": outer}).encode()
+        inner_srv, inner, _ = _http_hop(b"200 OK", body)
+        try:
+            launch, certdir = _launch_from(inner, tmp_path, monkeypatch)
+            pp.write_upstream_hint(certdir, outer)
+            want = [
+                pp.parse_upstream_proxy(inner).address,
+                pp.parse_upstream_proxy(outer).address,
+            ]
+
+            launch()
+            assert [h.address for h in pp._chain_hops(certdir)] == want
+            assert outer_served == [1], "the outer hop is asked once, to learn it"
+
+            pp._ASKED_NOHEALTH.clear()  # a fresh process remembers nothing
+            launch()  # the next launch from the same shell
+            assert [h.address for h in pp._chain_hops(certdir)] == want
+            assert outer_served == [1], "the settled record asks no one again"
+        finally:
+            outer_srv.close()
+            inner_srv.close()
+
+    def case_ensure_proxy_re_records_a_chain_recorded_outer_first_over_a_learned_next(
+        self, tmp_path, monkeypatch
+    ):
+        """The same record, with the inner hop already in `next` (the shape a
+        launch from the inner shell leaves it in, one launch later). That
+        shell's export IS the recorded `next`, which the guard against a
+        child's inherited proxy must not mistake for a child's: the recorded
+        hop serves, so the shell's value cannot displace it, and the swap
+        must still run. Left outer-first, every pinned request skips the
+        cache proxy, and the programs Claude Code starts are handed its
+        address."""
+        import cswap_pin.proxy as pp
+
+        outer_srv, outer, _ = _http_hop(b"400 Bad Request")
+        body = json.dumps({"status": "ok", "https_proxy": outer}).encode()
+        inner_srv, inner, _ = _http_hop(b"200 OK", body)
+        try:
+            launch, certdir = _launch_from(inner, tmp_path, monkeypatch)
+            pp.write_upstream_hint(certdir, outer, next_hop=inner)
+
+            launch()
+            assert [h.address for h in pp._chain_hops(certdir)] == [
+                pp.parse_upstream_proxy(inner).address,
+                pp.parse_upstream_proxy(outer).address,
+            ]
+            assert (certdir / "shell-prefix.proxy").read_text() == outer + "\n"
+        finally:
+            outer_srv.close()
+            inner_srv.close()
+
+    def case_ensure_proxy_never_asks_the_shells_hop_while_the_recorded_one_answers(
+        self, tmp_path, monkeypatch
+    ):
+        """The design case stays quiet: the recorded hop answers /health 200
+        and names a third address, so there is no reversed record to find and
+        the shell's own exported hop is never asked anything."""
+        import cswap_pin.proxy as pp
+
+        body = json.dumps({"https_proxy": "http://192.0.2.1:3128"}).encode()
+        rec_srv, recorded, _ = _http_hop(b"200 OK", body)
+        shell_srv, shell, shell_served = _http_hop(b"400 Bad Request")
+        try:
+            launch, certdir = _launch_from(shell, tmp_path, monkeypatch)
+            pp.write_upstream_hint(certdir, recorded)
+
+            launch()
+            assert shell_served == [], "the shell's own hop was asked /health"
+            assert pp._read_upstream(certdir, "proxy") == recorded
+        finally:
+            rec_srv.close()
+            shell_srv.close()
+
+    def case_ensure_proxy_never_asks_the_shells_hop_of_a_recorded_hop_that_did_not_decline(
+        self, tmp_path, monkeypatch
+    ):
+        """The recorded hop answers 200 without an `https_proxy`: it is a
+        /health server with nothing behind it, not a hop that declared itself
+        a non-/health one, so the shell's hop (which WOULD name it) is never
+        asked and the record is not swapped."""
+        import cswap_pin.proxy as pp
+
+        rec_srv, recorded, _ = _http_hop(b"200 OK", b"{}")
+        body = json.dumps({"https_proxy": recorded}).encode()
+        shell_srv, shell, shell_served = _http_hop(b"200 OK", body)
+        try:
+            launch, certdir = _launch_from(shell, tmp_path, monkeypatch)
+            pp.write_upstream_hint(certdir, recorded)
+
+            launch()
+            assert shell_served == [], "the shell's own hop was asked /health"
+            assert pp._read_upstream(certdir, "proxy") == recorded
+        finally:
+            rec_srv.close()
+            shell_srv.close()
+
+    def case_ensure_proxy_keeps_the_record_when_the_shells_hop_does_not_name_it(
+        self, tmp_path, monkeypatch
+    ):
+        """The recorded hop declares itself non-/health (400) and the shell's
+        hop is asked, but it names a THIRD address: not a chain through the
+        recorded hop, so the record is not swapped."""
+        import cswap_pin.proxy as pp
+
+        rec_srv, recorded, _ = _http_hop(b"400 Bad Request")
+        body = json.dumps({"https_proxy": "http://192.0.2.1:3128"}).encode()
+        shell_srv, shell, shell_served = _http_hop(b"200 OK", body)
+        try:
+            launch, certdir = _launch_from(shell, tmp_path, monkeypatch)
+            pp.write_upstream_hint(certdir, recorded)
+
+            launch()
+            assert shell_served == [1], "the gate was never reached: no control"
+            assert pp._read_upstream(certdir, "proxy") == recorded
+        finally:
+            rec_srv.close()
+            shell_srv.close()
+
+
+class TestTheTitleSweepSaysWhyItDidNothing:
+    """The bridge-title sweep returned 0 in silence for a missing pinned token,
+    a failed listing and a PUT every one of which was refused, and the loop
+    swallowed whatever else it raised: titles stayed wrong with nothing in
+    `daemon.log` to say why. One `cloud bridge titles: <outcome>` line per
+    CHANGE of outcome, the same dedup as `_note_hop_unusable`, so a steady
+    fault costs one line and not one per five minutes."""
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def _daemon(self, monkeypatch, *, token="tok", listing=(), todo=(),
+                put_ok=lambda: True):
+        import cswap_pin.proxy as pp
+
+        d = pp.PinProxy.__new__(pp.PinProxy)
+        d._pin_token_provider = lambda: token
+        d._list_bridges = lambda t: None if listing is None else list(listing)
+        d.revive_archived_bridges = lambda sessions, t: 0
+        d._bridge_api = lambda m, p, t, **kw: {} if put_ok() else None
+        monkeypatch.setattr(pp, "adopt_renamed_sessions", lambda: None)
+        monkeypatch.setattr(pp, "live_bridge_names", lambda: {"cse_A": "alpha"})
+        monkeypatch.setattr(pp, "_titles_we_wrote", lambda certdir: {})
+        monkeypatch.setattr(pp, "invented_bridge_names", lambda: set())
+        monkeypatch.setattr(pp, "titles_to_restore", lambda *a, **k: list(todo))
+        monkeypatch.setattr(pp, "_record_title", lambda *a, **k: None)
+        return d
+
+    def _log(self, run) -> list[str]:
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            run()
+        return [re.sub(r"^\[\S+\] \S+ pid=\d+ ", "", l)
+                for l in buf.getvalue().splitlines()]
+
+    def _sweeps(self, d, n=2) -> list[str]:
+        return self._log(lambda: [d.sweep_titles_once() for _ in range(n)])
+
+    def case_no_pinned_token_is_said_once(self, monkeypatch):
+        d = self._daemon(monkeypatch, token=None)
+        assert self._sweeps(d) == ["cloud bridge titles: no-token"]
+
+    def case_a_failed_listing_is_said_once(self, monkeypatch):
+        d = self._daemon(monkeypatch, listing=None)
+        assert self._sweeps(d) == ["cloud bridge titles: list-failed"]
+
+    def case_every_put_refused_is_said_once(self, monkeypatch):
+        d = self._daemon(monkeypatch, listing=[{"id": "cse_A"}],
+                         todo=[("cse_A", "alpha")], put_ok=lambda: False)
+        assert self._sweeps(d) == ["cloud bridge titles: all-puts-refused"]
+
+    def case_an_exception_the_loop_swallows_is_said_once(self, monkeypatch):
+        import cswap_pin.proxy as pp
+
+        d = self._daemon(monkeypatch)
+        d._stop = False
+        d.sweep_policy_once = lambda: None
+        calls = []
+
+        def _sweep():
+            calls.append(1)
+            if len(calls) > 2:
+                d._stop = True
+                return 0
+            raise ValueError("boom")
+
+        d.sweep_titles_once = _sweep
+        monkeypatch.setattr(pp.PinProxy, "_TITLE_SWEEP_FIRST_S", 0.0)
+        monkeypatch.setattr(pp.PinProxy, "_TITLE_SWEEP_S", 0.0)
+        monkeypatch.setattr(pp, "live_bridge_names", lambda: {})
+        assert self._log(d._title_sweep_loop) == [
+            "cloud bridge titles: raised:ValueError"]
+        assert len(calls) == 3, "the loop did not keep running past the raise"
+
+    def case_one_put_landing_is_not_all_refused(self, monkeypatch):
+        answers = iter([True, False])
+        d = self._daemon(monkeypatch, listing=[{"id": "cse_A"}],
+                         todo=[("cse_A", "alpha"), ("cse_B", "beta")],
+                         put_ok=lambda: next(answers))
+        got = self._sweeps(d, 1)
+        assert len(got) == 1 and got[0].startswith(
+            "restored the session name on 1 bridge"), got
+
+    def case_a_different_failure_is_a_new_line(self, monkeypatch):
+        d = self._daemon(monkeypatch, token=None)
+        got = self._sweeps(d)
+        d._pin_token_provider = lambda: "tok"
+        d._list_bridges = lambda t: None
+        assert got + self._sweeps(d) == [
+            "cloud bridge titles: no-token", "cloud bridge titles: list-failed"]
+
+    def case_recovery_from_a_failure_says_ok_once(self, monkeypatch):
+        import cswap_pin.proxy as pp
+
+        d = self._daemon(monkeypatch, listing=None)
+        assert self._sweeps(d) == ["cloud bridge titles: list-failed"]
+        d._list_bridges = lambda t: [{"id": "cse_A"}]   # nothing to rename
+        assert self._sweeps(d, 3) == ["cloud bridge titles: ok"]
+        # the same fault again after the recovery is a new line, and so is
+        # the recovery, this time through "no live names"
+        d._list_bridges = lambda t: None
+        monkeypatch.setattr(pp, "live_bridge_names", lambda: {})
+        got = self._sweeps(d)
+        d._list_bridges = lambda t: [{"id": "cse_A"}]
+        assert got + self._sweeps(d) == [
+            "cloud bridge titles: list-failed", "cloud bridge titles: ok"]
+
+    def case_success_after_success_adds_no_titles_line(self, monkeypatch):
+        d = self._daemon(monkeypatch, listing=[{"id": "cse_A"}],
+                         todo=[("cse_A", "alpha")])
+        got = self._sweeps(d)
+        # the existing restored line is unchanged, and nothing joins it
+        assert len(got) == 2 and all(
+            l.startswith("restored the session name on 1 bridge") for l in got), got
 
 
 class TestAbsoluteFormPassthrough:
@@ -6712,10 +8189,7 @@ class TestAbsoluteFormPassthrough:
 
         def origin():
             try:
-                c, _ = srv.accept()
-                data = b""
-                while b"\r\n\r\n" not in data:
-                    data += c.recv(4096)
+                c, data = _accept_head(srv)
                 origin_seen["req"] = data.decode("latin1").splitlines()[0]
                 c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
                 c.close()
@@ -6726,6 +8200,7 @@ class TestAbsoluteFormPassthrough:
         proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None)
         proxy.start()
         try:
+            _stray(oport)
             raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
             raw.sendall(
                 f"GET http://127.0.0.1:{oport}/releases/latest HTTP/1.1\r\n"
@@ -7144,6 +8619,60 @@ class TestHealthEndpoint:
             f"{_os.getpid()}"
         )
 
+    def case_health_carries_the_live_nofile_limits(self, certdir, monkeypatch):
+        """`nofile_soft` / `nofile_hard` are RLIMIT_NOFILE read at REQUEST time:
+        a rollout verifies the daemon's fd limit from outside with it (no
+        psutil, `launchctl procinfo` needs root). A number is a finite limit,
+        "unlimited" is RLIM_INFINITY (the word daemon.log's `nofile before`
+        line uses), and null is ONLY a limit that could not be read: an
+        unlimited hard limit must not read as "could not read"."""
+        import http.client
+        import json as _json
+        import resource
+        import sys
+
+        from cswap_pin.proxy import PinProxy
+
+        def _payload(proxy):
+            conn = http.client.HTTPConnection("127.0.0.1", proxy.port, timeout=5)
+            conn.request("GET", "/health")
+            return _json.loads(conn.getresponse().read())
+
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", 1),
+        )
+        proxy.start()
+        try:
+            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            got = _payload(proxy)
+            assert got["nofile_soft"] == (
+                "unlimited" if soft == resource.RLIM_INFINITY else soft)
+            assert got["nofile_hard"] == (
+                "unlimited" if hard == resource.RLIM_INFINITY else hard)
+
+            def _unreadable(which):
+                raise OSError("getrlimit refused")
+
+            # Read per request, not remembered from start: the control a
+            # cached field fails.
+            for fake, want in (
+                (lambda w: (777, 4096), (777, 4096)),
+                (lambda w: (777, resource.RLIM_INFINITY), (777, "unlimited")),
+                (_unreadable, (None, None)),
+            ):
+                monkeypatch.setattr(resource, "getrlimit", fake)
+                got = _payload(proxy)
+                assert (got["nofile_soft"], got["nofile_hard"]) == want
+            # No `resource` module at all (non-POSIX): null, and /health,
+            # the liveness probe, still answers.
+            monkeypatch.setitem(sys.modules, "resource", None)
+            got = _payload(proxy)
+            assert (got["nofile_soft"], got["nofile_hard"]) == (None, None)
+        finally:
+            proxy.stop()
+
     def case_a_hop_that_self_heals_leaves_a_record(self, certdir):
         """A fall-through to a LATER hop, in a tense a later probe can read.
 
@@ -7463,6 +8992,95 @@ class TestKeepAlive:
         assert up.paths == sent, f"upstream saw {up.paths}"
         # pinned routes swapped, inference untouched — even when pipelined
         assert up.auths == ["Bearer PINTOKEN", "Bearer DISK", "Bearer DISK"]
+
+    def _closes_once_draining(self, certdir, proxy, path, status, body):
+        """ONE ESTABLISHED KEEP-ALIVE SOCKET, SERVING THEN HANDING OVER.
+
+        A draining daemon keeps answering on the sockets it holds, so a client
+        reaches the successor only when its pool opens a fresh one. The close
+        is announced in the head of the reply it completes and follows the
+        full body: a client never reuses a socket whose last reply said close,
+        so nothing races. Closing an idle socket instead would race the
+        client's next request onto it, and Node does not retry that reset."""
+        import cswap_pin.proxy as pp
+
+        proxy.start()
+        tls = _kept_socket(proxy.port, certdir / "ca.pem")
+        try:
+            # SERVING: the reply keeps the socket, so a second request rides it
+            head, got = _reply_on(tls, path)
+            assert head.startswith(status) and got == body, head
+            assert "connection: close" not in head.lower(), head
+            done = pp.announce_draining(certdir, os.getpid())
+            try:
+                head, got = _reply_on(tls, path)
+            finally:
+                done()
+            assert head.startswith(status), head
+            assert got == body, "the reply was cut short by the close"
+            assert "connection: close" in head.lower(), head
+            assert _server_closed(tls), "the socket outlived its last reply"
+        finally:
+            tls.close()
+            proxy.stop()
+
+    def case_a_departing_daemon_closes_a_relayed_reply(self, certdir):
+        import cswap_pin.proxy as pp
+
+        up = _KeepAliveUpstream(certdir)
+        try:
+            self._closes_once_draining(
+                certdir,
+                pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
+                            upstream=("127.0.0.1", up.port)),
+                "/v1/messages", "HTTP/1.1 200", b"{}")
+        finally:
+            up.stop()
+
+    def case_a_departing_daemon_closes_after_its_own_refusal_too(self, certdir):
+        """THE PIN'S OWN 503, written without the relay, kept the socket."""
+        import cswap_pin.proxy as pp
+
+        def stalled():
+            return None
+        stalled.mint_stalled = lambda: True
+        self._closes_once_draining(
+            certdir,
+            pp.PinProxy(certdir=certdir, pin_token_provider=stalled,
+                        upstream=("127.0.0.1", _free_port())),
+            "/v1/code/sessions", "HTTP/1.1 503", b"")
+
+    def case_a_departing_daemon_closes_after_a_dead_chain_503(self, certdir):
+        import cswap_pin.proxy as pp
+
+        dead = socket.socket()
+        dead.bind(("127.0.0.1", 0))
+        pp.write_upstream_hint(certdir, f"http://127.0.0.1:{dead.getsockname()[1]}")
+        dead.close()
+        self._closes_once_draining(
+            certdir,
+            pp.PinProxy(certdir=certdir, pin_token_provider=lambda: None,
+                        upstream=("127.0.0.1", _free_port()),
+                        rediscover_chain=True),
+            "/v1/messages", "HTTP/1.1 503", b"")
+
+    def case_a_departing_daemon_closes_after_an_artifact_403(self, certdir):
+        import cswap_pin.proxy as pp
+
+        for draining in (False, True):
+            a, b = socket.socketpair()
+            done = pp.announce_draining(certdir, os.getpid()) \
+                if draining else None
+            try:
+                kept = pp.PinProxy._artifact_403(a, close=False)
+                head = b.recv(4096).decode("latin1").lower()
+            finally:
+                a.close()
+                b.close()
+                if done:
+                    done()
+            assert kept is not draining, (draining, head)
+            assert ("connection: close" in head) is draining, head
 
 
 class _WebSocketUpstream:
@@ -7836,6 +9454,21 @@ class TestAStaleUpstreamIsRedialled:
             proxy.stop()
             up.stop()
 
+    def case_a_5xx_retires_the_upstream_it_came_over(self, certdir):
+        up = _FirstConnection502Upstream(certdir, hold=5.0)
+        proxy = self._proxy(certdir, up)
+        try:
+            _stray(up.port)
+            conn = self._keepalive(proxy.port, certdir / "ca.pem")
+            got = [self._ask(conn)[0], self._ask(conn)[0]]
+            assert got == [502, 200], (
+                f"the request after a 5xx rode the same broken upstream: {got}")
+            assert up.accepted == 2, "the pin did not dial a fresh upstream"
+            conn.close()
+        finally:
+            proxy.stop()
+            up.stop()
+
     def case_an_upstream_idle_past_the_budget_is_dialled_fresh(
             self, certdir, monkeypatch):
         from cswap_pin import proxy as pp
@@ -7992,20 +9625,23 @@ class TestBlindTunnelFallsBackWhenChainRefuses:
         reached = threading.Event()
 
         def serve_peer():
-            try:
-                c, _ = peer.accept()
-            except OSError:
-                return
-            reached.set()
-            try:
-                data = c.recv(64)
-                if data:
+            while True:
+                try:
+                    c, _ = peer.accept()
+                except OSError:
+                    return
+                try:
+                    if not c.recv(64):  # a stray sends nothing (T2954)
+                        continue
+                    reached.set()
                     c.sendall(b"PONG")
-            finally:
-                c.close()
+                finally:
+                    c.close()
 
         threading.Thread(target=serve_peer, daemon=True).start()
+        _stray(peer_port)
 
+        dialled = _record_dials(monkeypatch)
         monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
         log = tmp_path / "trace.log"
         prev = pp._TRACE
@@ -8031,8 +9667,8 @@ class TestBlindTunnelFallsBackWhenChainRefuses:
                     f"a refusing chain must answer 503, never dial direct: "
                     f"{resp[:80]!r}"
                 )
-                assert not reached.is_set(), (
-                    "a refusing chain reached the ingress host directly"
+                assert ("127.0.0.1", peer_port) not in dialled, (
+                    "a refusing chain dialled the ingress host directly"
                 )
 
                 # CONTROL: the opt-in restores the old fall-through.
@@ -8066,6 +9702,7 @@ class TestBlindTunnelFallsBackWhenChainRefuses:
             pp._TRACE = prev
 
         assert reached.is_set(), "CONTROL FAILED: the ingress host was never dialled"
+        assert ("127.0.0.1", peer_port) in dialled, "CONTROL FAILED: dial unrecorded"
         assert "chain refused" in log.read_text(), log.read_text()
 
 
@@ -8156,6 +9793,91 @@ def test_a_hot_stamp_left_by_a_plain_test_does_not_blind_the_first_run_cases_dea
         pp._log_lifecycle = real_log
         with pp._hop_trouble_lock:
             pp._hop_trouble_at = 0.0
+
+
+def _serving_accept_loop(pp):
+    """A `PinProxy._accept_loop` thread blocked in accept() with `_stop` unset.
+
+    A synthetic PinProxy (no `__init__`) plus a listener that signals once the
+    loop is inside accept(), so a caller that sets `_stop` and walks away is
+    certain the thread is still alive afterwards.
+    """
+    entered = threading.Event()
+
+    class _Listener(socket.socket):
+        def accept(self):
+            entered.set()
+            return super().accept()
+
+    srv = pp.PinProxy.__new__(pp.PinProxy)
+    srv._stop = False
+    srv._srv = _Listener()
+    srv._srv.bind(("127.0.0.1", 0))
+    srv._srv.listen(1)
+    t = threading.Thread(target=srv._accept_loop, daemon=True)
+    t.start()
+    assert entered.wait(2), "the accept loop never reached accept()"
+    return srv, t
+
+
+def test_a_case_that_leaves_a_proxy_accept_loop_serving_fails_and_the_loop_is_stopped(
+        request, tmp_path_factory, monkeypatch):
+    """T2715: an accept loop left running pops `_ADOPTED_BACKLOG` (a module
+    global) out from under the next case, which is how
+    `case_adopting_a_socket_does_not_drop_the_client_already_queued_on_it`
+    read `kept == []` on macOS CI. `run_cases` must fail the case that leaked
+    it, and stop the loop so the case after it starts clean. A case that
+    set `_stop` on its own loop (still winding down) is not blamed."""
+    import cswap_pin.proxy as pp
+
+    monkeypatch.setattr(pp, "_ADOPTED_BACKLOG", [])
+    made = []
+
+    def serving_loop():
+        made.append(_serving_accept_loop(pp))
+        return made[-1]
+
+    class _Holder:
+        def case_leaves_one_serving(self):
+            serving_loop()
+
+        def case_stops_its_own(self):
+            srv, _ = serving_loop()
+            srv._stop = True
+
+    try:
+        with pytest.raises(AssertionError) as exc:
+            run_cases(_Holder(), request, tmp_path_factory)
+        msg = str(exc.value)
+        assert "case_leaves_one_serving" in msg, msg
+        assert "case_stops_its_own" not in msg, msg
+        assert not any(t.is_alive() for _, t in made), (
+            "the leaked accept loop was left running for the next case")
+    finally:
+        for srv, _ in made:
+            srv._stop = True
+            srv._srv.close()
+
+
+def test_a_proxy_accept_loop_serving_before_run_cases_is_stopped_and_not_blamed(
+        request, tmp_path_factory, monkeypatch):
+    """T2715: a loop that predates the case (leaked by a plain test; on macOS
+    `_close_sockets_the_test_left_open` cannot close a listener) must be
+    stopped before the first case runs, and that case must not be blamed."""
+    import cswap_pin.proxy as pp
+
+    monkeypatch.setattr(pp, "_ADOPTED_BACKLOG", [])
+    srv, t = _serving_accept_loop(pp)
+
+    class _Holder:
+        def case_starts_clean(self):
+            assert not t.is_alive(), "a loop from before the case was still serving"
+
+    try:
+        run_cases(_Holder(), request, tmp_path_factory)
+    finally:
+        srv._stop = True
+        srv._srv.close()
 
 
 class TestDrainReportsWhatItCut:
@@ -10562,16 +12284,12 @@ class TestDrainReportsWhatItCut:
         reads empty here is exactly as unearned a CLEAR as the cheap
         branch's.
         """
-        import os
         import threading
 
         import cswap_pin.proxy as pp
 
         lines = []
         real_log = pp._log_lifecycle
-        real_pids = pp._pin_daemon_pids
-        real_draining = pp.is_draining
-        real_held = pp.draining_bridges
         pp._log_lifecycle = lines.append
         try:
             srv = pp.PinProxy.__new__(pp.PinProxy)
@@ -10593,9 +12311,8 @@ class TestDrainReportsWhatItCut:
                 "/v1/code/sessions/cse_B/worker/messages", now=200.0)
             srv._connected_bridges = {"cse_A", "cse_B"}
 
-            pp._pin_daemon_pids = lambda _c: [os.getpid(), 4242]
-            pp.is_draining = lambda _c, pid: pid == 4242
-            pp.draining_bridges = lambda _c, pid: ({"cse_A"}, True)
+            pp.draining_marker_path(certdir, 4242).write_text(
+                f"{time.time()}\n0\n0\n0.0\n1\ncse_A")
 
             monkeypatch.setattr(pp.time, "monotonic", lambda: 205.0)
             srv._report_deaf_bridges()
@@ -10605,9 +12322,6 @@ class TestDrainReportsWhatItCut:
                 f"not: {lines}")
         finally:
             pp._log_lifecycle = real_log
-            pp._pin_daemon_pids = real_pids
-            pp.is_draining = real_draining
-            pp.draining_bridges = real_held
 
     def case_both_counts_come_from_ONE_snapshot(self):
         """A NUMERATOR LARGER THAN ITS DENOMINATOR, measured in the wild:
@@ -11203,6 +12917,57 @@ class TestDrainReportsWhatItCut:
             "timed around the relay instead: an SSE stream that lived for "
             "hours would be reported as a stall of that length")
 
+    def case_a_slow_request_names_the_stage_its_pin_time_went_to(
+            self, certdir, monkeypatch):
+        """T2945. "8451ms of it inside the pin" on a heartbeat could not say
+        whether the seconds were the identity probe, the `refresh_lock` wait,
+        the store read or the refresh. A REAL round trip with the lock held
+        by another thread for 0.5s, because the wiring is three places (the
+        stage dict is reset where the window opens, copied where it closes,
+        and handed to the line at the status hook) and no one of them can
+        be read to tie the other two."""
+        import json as _json
+        import re
+
+        from cswap_pin import proxy as pp
+
+        lines: list[str] = []
+        monkeypatch.setattr(pp, "_log_lifecycle",
+                            lambda msg, *a, **k: lines.append(msg))
+        monkeypatch.setattr(pp, "slow_report_ms", lambda _certdir: 200.0)
+        live = _json.dumps({"claudeAiOauth": {
+            "accessToken": "pin-live-token", "expiresAt": 4102444800000,
+            "refreshToken": "rt"}})
+
+        class _Switcher:
+            backup_dir = certdir
+            def current_account_number(self): return "1"
+            def read_account_credentials(self, n, e): return live
+            def resolve_account(self, i): return ("2", "pin@example.com", "org")
+
+        pp.save_pin(certdir, "pin@example.com", "org")
+        provider = pp.make_pin_token_provider(_Switcher(), "2", "pin@example.com")
+        provider.refresh_lock.acquire()
+        release = threading.Timer(0.5, provider.refresh_lock.release)
+        release.start()
+        upstream = _FakeUpstream(certdir)
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=provider,
+                            upstream=("127.0.0.1", upstream.port))
+        proxy.start()
+        try:
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem",
+                "/v1/code/sessions/SID123/bridge", bearer="client-own-token")
+            assert status == 200
+        finally:
+            release.join()
+            proxy.stop()
+            upstream.stop()
+        slow = [m for m in lines if "of it inside the pin" in m]
+        assert len(slow) == 1, lines
+        held = re.search(r"inside the pin \(lock (\d+)ms", slow[0])
+        assert held and int(held.group(1)) >= 400, slow[0]
+
     def case_nothing_deaf_locally_costs_no_process_spawn(self, certdir):
         """THE HOT PATH. `_report_deaf_bridges` runs on every bridge CREATE,
         and the union I added made it shell out to `ps -ww -axo` there —
@@ -11219,14 +12984,16 @@ class TestDrainReportsWhatItCut:
 
         calls = []
         real_log = pp._log_lifecycle
-        real_pids = pp._pin_daemon_pids
+        real_draining = pp.is_draining
         pp._log_lifecycle = lambda *_a: None
 
-        def counting(certdir_arg):
+        def counting(certdir_arg, pid):
             calls.append(1)
-            return real_pids(certdir_arg)
+            return real_draining(certdir_arg, pid)
 
-        pp._pin_daemon_pids = counting
+        pp.is_draining = counting
+        # A predecessor to walk, or the count below is zero for want of one.
+        pp.draining_marker_path(certdir, 4242).write_text("")
         try:
             srv = pp.PinProxy.__new__(pp.PinProxy)
             srv._reset_bridge_traffic()
@@ -11245,12 +13012,12 @@ class TestDrainReportsWhatItCut:
 
             srv._report_deaf_bridges()
             assert calls == [], (
-                "it enumerated daemons with `ps` although nothing was deaf "
+                "it walked the predecessors although nothing was deaf "
                 "locally — that runs on every bridge create, in the request "
                 "handler")
         finally:
             pp._log_lifecycle = real_log
-            pp._pin_daemon_pids = real_pids
+            pp.is_draining = real_draining
 
     def case_a_draining_predecessor_hides_the_streams_from_this_one(
             self, certdir, monkeypatch):
@@ -11281,7 +13048,6 @@ class TestDrainReportsWhatItCut:
         denominator, only quieter. So a predecessor that CAN say what it
         holds is asked, and only one that predates the record is refused.
         """
-        import os
         import threading
 
         import cswap_pin.proxy as pp
@@ -11292,8 +13058,6 @@ class TestDrainReportsWhatItCut:
                             lambda: real_mono() + skew[0])
         lines = []
         real_log = pp._log_lifecycle
-        real_pids = pp._pin_daemon_pids
-        real_draining = pp.is_draining
         pp._log_lifecycle = lines.append
         try:
             srv = pp.PinProxy.__new__(pp.PinProxy)
@@ -11307,9 +13071,10 @@ class TestDrainReportsWhatItCut:
             srv._connected_bridges = {"cse_LIVE"}
 
             # A PREDECESSOR IS STILL DRAINING, so the stream for cse_LIVE may
-            # be held by it. This process cannot see it either way.
-            pp._pin_daemon_pids = lambda _c: [os.getpid(), 4242]
-            pp.is_draining = lambda _c, pid: pid == 4242
+            # be held by it. This process cannot see it either way, and its
+            # marker stops at five lines: it predates the held-bridge record.
+            pp.draining_marker_path(certdir, 4242).write_text(
+                f"{time.time()}\n0\n0\n0.0\n1")
             srv._report_deaf_bridges()
             assert lines, (
                 "it went silent; a reader cannot tell a suppressed report "
@@ -11349,7 +13114,6 @@ class TestDrainReportsWhatItCut:
             # PAST THE GRACE (T1592): the predecessor has just left, and a
             # bridge it held is shielded for `_DEAF_STARTUP_GRACE_S` from the
             # report that saw it go (see the next case).
-            pp._pin_daemon_pids = lambda _c: [os.getpid()]
             pp.draining_marker_path(certdir, 4242).unlink()
             srv._report_deaf_bridges()
             skew[0] += pp._DEAF_STARTUP_GRACE_S + 1
@@ -11362,8 +13126,70 @@ class TestDrainReportsWhatItCut:
             assert "only a NEW PROCESS" not in lines[-1], lines[-1]
         finally:
             pp._log_lifecycle = real_log
-            pp._pin_daemon_pids = real_pids
-            pp.is_draining = real_draining
+
+    def _posting_bridge_beside_a_drainer_ps_cannot_see(
+            self, certdir, monkeypatch, *, marker_age=0.0):
+        """T2975: a pin relocated into a container pid namespace shares
+        `$HOME` and its certdir with the host drainers, not their pids, so
+        its `ps` names no predecessor. Returns (daemon, log lines): cse_B
+        posts here with no stream, and a `.draining-4242` marker
+        ``marker_age`` seconds old names it on line 6."""
+        import os
+
+        import cswap_pin.proxy as pp
+
+        lines = []
+        monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
+        monkeypatch.setattr(pp, "_pin_daemon_pids", lambda _c: [os.getpid()])
+        srv = pp.PinProxy.__new__(pp.PinProxy)
+        srv._reset_bridge_traffic()
+        srv._live_lock = threading.Lock()
+        srv._stream_conns = set()
+        srv._open_conns = set()
+        srv._certdir = certdir
+        srv._note_bridge_traffic("/v1/code/sessions/cse_B/worker/messages")
+        srv._connected_bridges = {"cse_B"}
+        marker = pp.draining_marker_path(certdir, 4242)
+        marker.write_text(f"{time.time()}\n0\n0\n0.0\n1\ncse_B")
+        then = time.time() - marker_age
+        os.utime(marker, (then, then))
+        return srv, lines
+
+    def case_a_drainer_in_another_pid_namespace_still_holds_its_bridge(
+            self, certdir, monkeypatch):
+        """T2975 (lmd42): `_pin_daemon_pids` is a `ps` view of the CALLER's
+        pid namespace, so the relocated pin logged "22 of 22 bridge(s) post
+        but hold no inbound stream" while host drainers held 19 of them and
+        said so on their markers. The marker is certdir-scoped and crosses
+        the namespace; the predecessor set is read from it."""
+        import cswap_pin.proxy as pp
+
+        srv, lines = self._posting_bridge_beside_a_drainer_ps_cannot_see(
+            certdir, monkeypatch)
+        srv._report_deaf_bridges()
+        assert lines and lines[-1].startswith(pp.DEAF_REPORT_CLEAR), (
+            "a bridge a fresh marker says a drainer holds was called deaf "
+            f"because that drainer's pid is not in this namespace: {lines!r}")
+
+    def case_a_marker_nothing_beats_or_a_half_written_one_holds_nothing(
+            self, certdir, monkeypatch):
+        """THE CONTROL for the case above: reading the markers must not turn
+        into "any file under `.draining-` hides a bridge". A SIGKILLed
+        drainer's marker expires after `_DRAINING_MARKER_TTL` (5973e5d), and
+        the beat's `.draining-<pid>.<pid>.cswap-tmp` is neither a marker nor
+        a pid, so it is skipped rather than raised on or believed."""
+        import cswap_pin.proxy as pp
+
+        srv, lines = self._posting_bridge_beside_a_drainer_ps_cannot_see(
+            certdir, monkeypatch, marker_age=pp._DRAINING_MARKER_TTL + 1)
+        pp.draining_marker_path(certdir, 4343).with_name(
+            ".draining-4343.4343.cswap-tmp").write_text(
+            f"{time.time()}\n0\n0\n0.0\n1\ncse_B")
+        srv._report_deaf_bridges()
+        assert lines and pp.DEAF_REPORT_MARK in lines[-1] \
+            and "cse_B" in lines[-1], (
+            "a silent marker and a beat's temp file hid a deaf bridge: "
+            f"{lines!r}")
 
     def case_a_predecessor_that_has_just_exited_does_not_leave_its_bridge_deaf(
             self, certdir, monkeypatch):
@@ -11381,7 +13207,6 @@ class TestDrainReportsWhatItCut:
         the bridge, and does not clear it either (nothing was judged).
         (b) a report after the grace with still no stream marks it: the
         shield is a dwell, not an amnesty (1f8bcbe, e489cba)."""
-        import os
         import threading
 
         import cswap_pin.proxy as pp
@@ -11392,11 +13217,8 @@ class TestDrainReportsWhatItCut:
                             lambda: real_mono() + skew[0])
         lines = []
         monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
-        pids = [os.getpid(), 4242]
-        monkeypatch.setattr(pp, "_pin_daemon_pids", lambda _c: list(pids))
-        monkeypatch.setattr(pp, "is_draining", lambda _c, pid: pid == 4242)
-        monkeypatch.setattr(pp, "draining_bridges",
-                            lambda _c, _pid: ({"cse_HELD"}, True))
+        marker = pp.draining_marker_path(certdir, 4242)
+        marker.write_text(f"{time.time()}\n0\n0\n0.0\n1\ncse_HELD")
         srv = pp.PinProxy.__new__(pp.PinProxy)
         srv._reset_bridge_traffic()
         srv._live_lock = threading.Lock()
@@ -11411,7 +13233,7 @@ class TestDrainReportsWhatItCut:
             f"the draining predecessor's stream was not counted: {lines!r}")
 
         # THE PREDECESSOR EXITS: its marker is gone, its bridges leave.
-        pids.remove(4242)
+        marker.unlink()
         skew[0] += 5.0
         before = list(lines)
         srv._report_deaf_bridges()
@@ -11446,9 +13268,7 @@ class TestDrainReportsWhatItCut:
 
         lines = []
         real_log = pp._log_lifecycle
-        real_pids = pp._pin_daemon_pids
         pp._log_lifecycle = lines.append
-        pp._pin_daemon_pids = lambda _c: [os.getpid()]
         try:
             srv = pp.PinProxy.__new__(pp.PinProxy)
             srv._reset_bridge_traffic()
@@ -11501,7 +13321,6 @@ class TestDrainReportsWhatItCut:
                 f"draining, must still get the ordinary MARK: {lines[-1]!r}")
         finally:
             pp._log_lifecycle = real_log
-            pp._pin_daemon_pids = real_pids
 
     def case_a_drain_that_aborts_does_not_silence_the_bridge_forever(
             self, certdir):
@@ -11525,9 +13344,7 @@ class TestDrainReportsWhatItCut:
 
         lines = []
         real_log = pp._log_lifecycle
-        real_pids = pp._pin_daemon_pids
         pp._log_lifecycle = lines.append
-        pp._pin_daemon_pids = lambda _c: [os.getpid()]
         try:
             srv = pp.PinProxy.__new__(pp.PinProxy)
             srv._reset_bridge_traffic()
@@ -11583,7 +13400,6 @@ class TestDrainReportsWhatItCut:
                 "stale-BLIND case must not defeat the dedupe generally")
         finally:
             pp._log_lifecycle = real_log
-            pp._pin_daemon_pids = real_pids
 
     def case_a_deaf_verdict_inside_a_refusal_window_is_blind_not_a_mark(
             self, monkeypatch):
@@ -12921,7 +14737,9 @@ class TestDrainReportsWhatItCut:
         # Reaching them needs a real chain, so read it out of the source.
         import inspect
 
-        src = inspect.getsource(pp.PinProxy._blind_tunnel)
+        # The dial lives in `_dial_tunnel`, shared with the Chrome bridge MITM.
+        src = (inspect.getsource(pp.PinProxy._blind_tunnel)
+               + inspect.getsource(pp.PinProxy._dial_tunnel))
         assert "_TRACE.write" not in src, (
             "a tunnel line still writes straight to the import-time global, "
             "so that line is invisible to a trace armed during an incident")
@@ -12961,7 +14779,8 @@ class TestDrainReportsWhatItCut:
         # the convention this file uses for the exit paths.
         import inspect
 
-        src = inspect.getsource(pp.PinProxy.await_inflight)
+        src = (inspect.getsource(pp.PinProxy.await_inflight)
+               + inspect.getsource(pp.PinProxy._wait_for_tunnels))
         beats = src.count("beat_draining(")
         passes = src.count("streams=")
         assert beats > 0 and passes == beats, (
@@ -13040,7 +14859,7 @@ class TestDrainReportsWhatItCut:
         # discriminator the reply wait uses.
         import inspect
 
-        src = inspect.getsource(pp.PinProxy.await_inflight)
+        src = inspect.getsource(pp.PinProxy._wait_for_tunnels)
         assert "while (_PUMP.live_pairs()" in src, (
             "the drain does not wait for live tunnels, so a recycle drops "
             "every Remote Control channel this daemon is pumping")
@@ -13049,10 +14868,20 @@ class TestDrainReportsWhatItCut:
             "the tunnel wait has no exit: a tunnel whose peer wedged holds "
             "this process open for ever, which is the never-ending drain the "
             "removed wall clock used to bound")
-        assert 'budget == float("inf")' in src[:i], (
-            "the tunnel wait is not confined to the uncapped arm. The signal "
-            "arm has a supervisor counting to `_DRAIN_SECONDS + 2`, so waiting "
-            "past it buys a harder kill; the held arm holds the port dark")
+        # WHO CALLS IT: the uncapped arm, and a capped one only once a
+        # successor is on the port (T3100). Anywhere else the signal arm has a
+        # supervisor counting to `_DRAIN_SECONDS + 2`, so waiting past it buys
+        # a harder kill, and the held arm holds the port dark.
+        drain = inspect.getsource(pp.PinProxy.await_inflight)
+        calls = [m.start() for m in re.finditer(r"_wait_for_tunnels\(", drain)]
+        assert len(calls) == 2, (
+            f"{len(calls)} call(s) of the tunnel wait in the drain, wanted the "
+            "uncapped arm and the superseded capped one")
+        assert 'budget == float("inf")' in drain[:calls[0]][-200:], (
+            "the tunnel wait is not confined to the uncapped arm")
+        assert "not _superseded_on_the_port(" in drain[calls[0]:calls[1]], (
+            "a capped drain waits on tunnels with no successor serving the "
+            "port, past a supervisor counting to `_DRAIN_SECONDS + 2`")
 
         # AND THE PUMP CAN BE ISOLATED, or this suite measures leftovers. The
         # macOS runner is single-process, so without a per-case reset one
@@ -13068,7 +14897,7 @@ class TestDrainReportsWhatItCut:
         # construction for exactly the tunnel it exists to protect. Measured on
         # pmac 2026-08-31: `drained clean in 2240.2s`, holding the two bridges
         # of the greencard and canada_pr sessions, and unbounded in principle.
-        assert "tunnel_deadline" not in src, (
+        assert "tunnel_deadline" not in src + drain, (
             "a wall clock is back on the tunnel wait. A bridge inbound stream "
             "is never silent because the server keepalives it, and while this "
             "process holds that stream THE SESSION IS RECEIVING THROUGH IT. "
@@ -13158,8 +14987,259 @@ class TestDrainReportsWhatItCut:
             "a non-bridge tunnel was released by the bridge deadline: %r"
             % (_Chatty.released,))
 
+    def case_a_released_blind_tunnel_leaves_no_client_socket_behind(
+            self, certdir):
+        """THE DRAIN LET THE TUNNEL GO AND KEPT ITS CLIENT SOCKET.
+
+        `release_pairs` popped each pair and shut both sides down, but neither
+        closed them nor ran the pair's `on_close`, and for a blind CONNECT
+        `on_close` is the only thing that takes the client's socket out of
+        `_open_conns`. After the peer closed, the daemon sat on a dead fd in
+        state CLOSE until `_close_open_connections`, which the uncapped arm
+        reaches only after the owed-reply wait, on no clock. Measured: 20 of 20
+        client fds held. A stub of the pump cannot see this, so the tunnel and
+        the pump are real.
+
+        AND THE CUT STAYS CLEAN, because this is the handover path: what the
+        daemon had already delivered still reaches the client, then a FIN, not
+        a reset.
+        """
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import _PUMP
+
+        _PUMP.reset_for_tests()
+        peer = socket.socket()
+        peer.bind(("127.0.0.1", 0))
+        # Not 1: macOS drops a SYN once a backlog-1 queue holds the stray (T2964).
+        peer.listen(4)
+        port = peer.getsockname()[1]
+        _stray(port)
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
+                            upstream=("127.0.0.1", 1))
+        proxy.start()
+        raw = far = None
+        try:
+            raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            raw.settimeout(5)
+            raw.sendall(f"CONNECT 127.0.0.1:{port} HTTP/1.1\r\n"
+                        f"Host: 127.0.0.1:{port}\r\n\r\n".encode())
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = raw.recv(4096)
+                assert chunk, "the tunnel never answered the CONNECT"
+                head += chunk
+            peer.settimeout(5)
+            far = _accept_held(peer)
+            deadline = time.monotonic() + 5
+            while _PUMP.live_pairs() != 1 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert _PUMP.live_pairs() == 1, "precondition: the pump drives it"
+            with proxy._live_lock:
+                (served,) = proxy._open_conns
+
+            # DELIVERED BEFORE THE RELEASE: peeked, so it is in the client's
+            # queue (the daemon wrote it) without the client having read it.
+            far.sendall(b"BEFORE")
+            assert raw.recv(6, socket.MSG_PEEK) == b"BEFORE", "precondition"
+
+            assert _PUMP.release_pairs() == 1
+            got = b""
+            while True:
+                chunk = raw.recv(4096)  # a reset raises here: the Rule 0 half
+                if not chunk:
+                    break
+                got += chunk
+            assert got == b"BEFORE", (
+                f"the release lost what was already delivered: {got!r}")
+            raw.close()
+
+            deadline = time.monotonic() + 5
+            while ((proxy.live_client_count() or served.fileno() != -1)
+                   and time.monotonic() < deadline):
+                time.sleep(0.02)
+            assert proxy.live_client_count() == 0, (
+                "the client closed and the daemon still counts its connection: "
+                "the released tunnel's socket stays in `_open_conns`")
+            assert served not in proxy._open_conns
+            assert served.fileno() == -1, (
+                "the daemon still holds the accepted fd after the peer closed")
+        finally:
+            proxy.stop()
+            for s_ in (raw, far, peer):
+                if s_ is not None:
+                    s_.close()
+
+    def case_a_released_pair_runs_its_teardown_once_and_only_for_its_kind(self):
+        """`add` files each socket under the SAME `on_close`, so a release that
+        walks sockets rather than pairs runs it twice. The 101 path's teardown
+        also takes the closer, which a release names as the drain."""
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import _PUMP
+
+        _PUMP.reset_for_tests()
+        a, b = socket.socketpair()
+        c, d = socket.socketpair()
+        ended, other = [], []
+
+        def bridge_done(closed_by=None):
+            ended.append(closed_by)
+
+        bridge_done._wants_closer = True
+        try:
+            _PUMP.add(a, b, bridge_done, kind="bridge")
+            _PUMP.add(c, d, lambda: other.append(1))
+            assert _PUMP.release_pairs("bridge") == 1
+            assert ended == [pp._RELEASED_BY_DRAIN], (
+                f"the bridge teardown ran as {ended!r}")
+            assert a.fileno() == b.fileno() == -1, "the pair was left open"
+            assert other == [] and c.fileno() != -1, (
+                "a release of one kind closed the other")
+            assert _PUMP.release_pairs() == 1
+            assert other == [1]
+        finally:
+            for s_ in (a, b, c, d):
+                s_.close()
+
+    def case_a_release_landing_in_the_read_gap_runs_on_close_once(
+            self, monkeypatch):
+        """The run loop reads `entry` under the lock and drops it before
+        `_drain_ready`. A release landing in that gap closes the pair, and the
+        loop then reads EOF off the closed socket and closed it AGAIN: `on_close`
+        twice, which is a bridge's end logged twice and a debt given back twice.
+        The seam is `_drain_ready`, so the release lands where the race is."""
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import _PUMP
+
+        _PUMP.reset_for_tests()
+        feed, a = socket.socketpair()
+        b, sink = socket.socketpair()
+        feed2, c = socket.socketpair()
+        d, sink2 = socket.socketpair()
+        ended = []
+
+        def on_close(closed_by=None):
+            ended.append(closed_by)
+
+        on_close._wants_closer = True
+        real, landed = pp._drain_ready, threading.Event()
+
+        def landing(src):
+            if not landed.is_set():
+                _PUMP.release_pairs()
+                landed.set()          # AFTER, or the next `add` beats the release
+            return real(src)
+
+        monkeypatch.setattr(pp, "_drain_ready", landing)
+        try:
+            _PUMP.add(a, b, on_close)
+            feed.send(b"x")
+            assert landed.wait(5), "precondition: the loop never read the pair"
+            # THE LOOP IS SINGLE-THREADED: once a byte crosses a second pair it
+            # has finished the pass that closed the first, so `ended` is final.
+            _PUMP.add(c, d, lambda: None)
+            feed2.send(b"y")
+            sink2.settimeout(5)
+            assert sink2.recv(1) == b"y", "precondition: the loop moved on"
+            assert len(ended) == 1, (
+                f"`on_close` ran {len(ended)} times for one pair: {ended!r}")
+        finally:
+            # RELEASE BEFORE THE RESET: `reset_for_tests` forgets the pair but
+            # leaves its sockets' selector keys, and a later test whose new
+            # socket reuses a closed fd number then has `add` swallow the
+            # KeyError and close its pair, so the tunnel never opens.
+            _PUMP.release_pairs()
+            _PUMP.reset_for_tests()
+            for s_ in (feed, a, b, sink, feed2, c, d, sink2):
+                s_.close()
+
+    def case_a_bridge_the_drain_releases_is_named_the_drain(
+            self, certdir, monkeypatch):
+        """`release_pairs` gave `on_close` no `closed_by`, so a 101 bridge cut
+        by a drain logged "closed by the unknown": the one line that says who
+        ended a Remote Control stream, blank exactly when the daemon did it."""
+        import cswap_pin.proxy as pp
+
+        lines: list[str] = []
+        monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
+        pp._PUMP.reset_for_tests()
+        up = _WebSocketUpstream(certdir)     # holds the tunnel until we write
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
+                            upstream=("127.0.0.1", up.port))
+        proxy.start()
+        tls = None
+        try:
+            status, tls = _upgrade_via_proxy(
+                proxy.port, certdir / "ca.pem",
+                "/v1/code/sessions/cse_x/worker/events/stream", bearer="DISK")
+            assert b"101" in status, status
+            deadline = time.monotonic() + 5
+            while (pp._PUMP.live_pairs("bridge") != 1
+                   and time.monotonic() < deadline):
+                time.sleep(0.02)
+            assert pp._PUMP.release_pairs("bridge") == 1
+            deadline = time.monotonic() + 5
+            while (not any("inbound stream for cse_x" in ln for ln in lines)
+                   and time.monotonic() < deadline):
+                time.sleep(0.02)
+            ended = [ln for ln in lines if "inbound stream for cse_x" in ln]
+            assert ended, lines
+            assert "closed by the drain" in ended[0], ended[0]
+        finally:
+            if tls is not None:
+                tls.close()
+            proxy.stop()
+            up.stop()
+
+    def case_a_released_pair_with_unread_bytes_ends_its_peers_read(self):
+        """WHAT THE PEER SEES when the released socket held unread inbound
+        bytes, measured and not assumed. No pump thread runs, so nothing reads
+        what the peer sent and it is unread by construction.
+
+        Asserted: the peer's read ENDS, as b"" (Linux) or as
+        ConnectionResetError (macOS), the two outcomes `release_pairs` records.
+        A reset is accepted on macOS only: on Linux it means the release closed
+        without the SHUT_WR."""
+        import select
+        import sys
+        from cswap_pin.proxy import _PumpLoop
+
+        def tcp_pair():
+            lsn = socket.socket()
+            lsn.bind(("127.0.0.1", 0))
+            lsn.listen(1)
+            peer = socket.create_connection(lsn.getsockname(), timeout=5)
+            served, _ = lsn.accept()
+            lsn.close()
+            return served, peer
+
+        loop = _PumpLoop()
+        loop._thread = threading.current_thread()    # `add` starts no thread
+        s, peer = tcp_pair()
+        u, far = tcp_pair()
+        try:
+            peer.sendall(b"unread")
+            assert select.select([s], [], [], 5)[0], "precondition"
+            assert s.recv(6, socket.MSG_PEEK) == b"unread", "precondition"
+            loop.add(s, u, lambda: None, kind="bridge")
+            assert loop.release_pairs("bridge") == 1
+            assert s.fileno() == -1, "the pair was left open"
+            peer.settimeout(5)
+            try:
+                assert peer.recv(4096) == b"", "the peer read data"
+            except ConnectionResetError:
+                # macOS reports the RST after the FIN; on Linux the same reset
+                # is a bare close with no SHUT_WR.
+                assert sys.platform == "darwin", (
+                    "the peer was reset: the release closed without the "
+                    "SHUT_WR that gives it a FIN first")
+        finally:
+            for s_ in (s, u, peer, far, loop._wake_r, loop._wake_w):
+                s_.close()
+            loop._sel.close()
+
     def case_a_drain_does_not_cut_the_subscription(self, certdir):
-        """The channel a session cannot reopen for itself must survive a recycle.
+        """A held-open subscription must survive a recycle: the drain does not
+        cut it (only `release_idle_streams` ends a content-free one).
 
         A drain used to close every held-open `/worker/events/stream` on the
         grounds that it never completes, so waiting for it waits for ever. The
@@ -13238,8 +15318,8 @@ class TestDrainReportsWhatItCut:
                     got = None            # still open — nothing cut it
                 assert got is None, (
                     "the drain closed a held-open subscription. That is the "
-                    "channel claude.ai pushes through, and the session cannot "
-                    "reopen it for itself")
+                    "channel claude.ai pushes through, and only "
+                    "`release_idle_streams` may end a content-free one")
             finally:
                 for s_ in (e, f):
                     try:
@@ -13396,12 +15476,13 @@ class TestDrainReportsWhatItCut:
                                      until we are gone, so every second here is
                                      a second with nothing serving the port.
                                      Cutting is the lesser evil
-                                     -> `_HELD_DRAIN_SECONDS`. TWO call sites
-                                     share it: no holder pid to ask at all,
-                                     and a holder that survived the ask but
-                                     whose successor never published within
-                                     the wait -- both leave the supervisor to
-                                     start the next one the slow way.
+                                     -> `_HELD_DRAIN_SECONDS`. ONE call
+                                     site: no holder pid to ask at all, which
+                                     leaves the supervisor to start the next
+                                     one the slow way. (A holder that survived
+                                     the ask but whose successor had not
+                                     published within the wait was the second;
+                                     the daemon now keeps serving there, T3107.)
 
         AND `_DRAIN_SECONDS` COULD NOT SIMPLY BE RAISED, which is why this is a
         third constant rather than a bigger one: it is also the supervisor's
@@ -13434,14 +15515,23 @@ class TestDrainReportsWhatItCut:
         assert named, (
             "no `await_inflight(<CONSTANT>)` call found at all — the scan is "
             "broken, and a broken scan passes every assertion below it")
+        # FIVE HAND OVER: the code watchdog's held branch twice (its own ask,
+        # and a port a successor already serves), its orphan branch once a new
+        # holder's successor serves (T3132), its unheld branch, and the
+        # caller-side relocation (`_hand_over_to_the_caller`, T1936), whose
+        # successor is serving before it drains exactly as the held branch's.
+        # ONE EXITS so a holder can start the successor the slow way (no holder
+        # pid to ask): the ask whose wait ran out keeps serving instead (T3107).
         assert sorted(named) == [
             "_HANDOVER_DRAIN_SECONDS", "_HANDOVER_DRAIN_SECONDS",
-            "_HELD_DRAIN_SECONDS", "_HELD_DRAIN_SECONDS",
+            "_HANDOVER_DRAIN_SECONDS", "_HANDOVER_DRAIN_SECONDS",
+            "_HANDOVER_DRAIN_SECONDS", "_HELD_DRAIN_SECONDS",
         ], (
-            "the exit paths no longer drain on the ceilings that fit them. Two "
-            "hand over to a successor that is already serving (free to wait) "
-            "and two exit so a holder can start the successor the slow way "
-            "(every second is an unserved port). Got: " + ", ".join(sorted(named))
+            "the exit paths no longer drain on the ceilings that fit them. "
+            "Five hand over to a successor that is already serving (free to "
+            "wait) and one exits so a holder can start the successor the slow "
+            "way (every second is an unserved port). Got: "
+            + ", ".join(sorted(named))
         )
 
         # AND THE NUMBERS THEMSELVES, or the names above are decoration.
@@ -13521,7 +15611,7 @@ class TestDrainReportsWhatItCut:
 
             proxy._local.conn = conn
             proxy._local.release = lambda: None
-            proxy._blind_tunnel(target, conn)
+            proxy._capped_tunnel(target, conn)
             accepted.append(srv.accept()[0])
 
             assert proxy.inflight_requests() == 0, (
@@ -13785,7 +15875,7 @@ class TestTunnelIsOpen:
     The integration case above proves the FALLBACK happens; this proves the
     DETECTOR that is supposed to trigger it, and it can do so without a
     scheduler in the loop — a socket whose peer has already closed is EOF now,
-    not in 0.35 s.
+    not after a wait.
     """
 
     def test_all(self, request, tmp_path_factory):
@@ -13838,6 +15928,51 @@ class TestTunnelIsOpen:
             a.close(); b.close()
 
 
+    def case_an_idle_tunnel_is_reported_open_without_waiting(self):
+        """The healthy path costs nothing. Every chained blind tunnel (claude.ai,
+        the Remote Control websocket, a capped bulk tunnel) runs this probe once
+        before it carries a byte, and a wait inside it is paid by all of them
+        (T2157: a 0.35 s `select` timeout, 350.4 ms of a 351.7 ms open). Best
+        of five, so one descheduled run on a loaded box cannot fail it, while
+        the old wait made every run take >= 0.35 s."""
+        import cswap_pin.proxy as pp
+        a, b = socket.socketpair()
+        try:
+            runs = []
+            for _ in range(5):
+                t0 = time.monotonic()
+                assert pp.PinProxy._tunnel_is_open(a) is a
+                runs.append(time.monotonic() - t0)
+            best = min(runs)
+            assert best < 0.1, (
+                f"an idle tunnel took {best * 1000:.0f} ms to read as open — "
+                "the probe is waiting on the healthy path")
+        finally:
+            a.close(); b.close()
+
+    def case_an_idle_tunnel_past_fd_1024_is_reported_open(self):
+        """`select.select` raises ValueError for an fd >= FD_SETSIZE (1024), and
+        this probe reads ValueError as EOF, so a healthy tunnel dialled while
+        the pin held more than 1024 fds was refused as dead. The pin caps no
+        RLIMIT_NOFILE, so this is the state a hop stall's fd pile-up reaches."""
+        import fcntl
+        import cswap_pin.proxy as pp
+        a, b = socket.socketpair()
+        try:
+            high = socket.socket(
+                fileno=fcntl.fcntl(a.fileno(), fcntl.F_DUPFD, 1100))
+        except OSError as exc:
+            a.close(); b.close()
+            pytest.skip(f"RLIMIT_NOFILE forbids an fd past 1024: {exc}")
+        try:
+            assert high.fileno() >= 1024, high.fileno()
+            assert pp.PinProxy._tunnel_is_open(high) is high, (
+                "an idle tunnel on an fd past 1024 read as EOF — the readiness "
+                "check cannot take that fd")
+        finally:
+            high.close(); a.close(); b.close()
+
+
 class TestOptimisticConnectIsDetected:
     """A CONNECT 200 means the chain ACCEPTED the request, not that it reached
     the host. privoxy answers optimistically and dials afterwards, closing the
@@ -13868,6 +16003,7 @@ class TestOptimisticConnectIsDetected:
                             break
                         buf += d
                     c.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    time.sleep(0.05)   # a chain thread descheduled here (T2951)
                 except OSError:
                     pass
                 finally:
@@ -13892,6 +16028,8 @@ class TestOptimisticConnectIsDetected:
         """
         import cswap_pin.proxy as pp
 
+        # The pin's 5 ms EOF window is a named shortcut (T2157); wait for the FIN.
+        monkeypatch.setattr(pp, "_TUNNEL_EOF_WINDOW_MS", 2000)
         chain = self._optimistic_chain()
 
         peer = socket.socket()
@@ -13901,19 +16039,23 @@ class TestOptimisticConnectIsDetected:
         reached = threading.Event()
 
         def serve_peer():
-            try:
-                c, _ = peer.accept()
-            except OSError:
-                return
-            reached.set()
-            try:
-                if c.recv(64):
+            while True:
+                try:
+                    c, _ = peer.accept()
+                except OSError:
+                    return
+                try:
+                    if not c.recv(64):  # a stray sends nothing (T2954)
+                        continue
+                    reached.set()
                     c.sendall(b"PONG")
-            finally:
-                c.close()
+                finally:
+                    c.close()
 
         threading.Thread(target=serve_peer, daemon=True).start()
+        _stray(peer_port)
 
+        dialled = _record_dials(monkeypatch)
         monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
         log = tmp_path / "trace.log"
         prev = pp._TRACE
@@ -13938,8 +16080,8 @@ class TestOptimisticConnectIsDetected:
                     f"a dead-tunnel chain must answer 503, never dial direct: "
                     f"{resp[:80]!r}"
                 )
-                assert not reached.is_set(), (
-                    "an optimistic chain reached the host directly"
+                assert ("127.0.0.1", peer_port) not in dialled, (
+                    "an optimistic chain dialled the host directly"
                 )
 
                 # CONTROL: the opt-in restores the old re-dial.
@@ -13971,6 +16113,7 @@ class TestOptimisticConnectIsDetected:
             pp._TRACE = prev
 
         assert reached.is_set(), "CONTROL FAILED: the host was never dialled directly"
+        assert ("127.0.0.1", peer_port) in dialled, "CONTROL FAILED: dial unrecorded"
         # THE CONTRACT, NOT THE BRANCH THAT DELIVERED IT. This used to assert
         # `"already EOF" in log`, which names one internal path. Measured on
         # macOS CI 2026-08-18: the two behavioural assertions above BOTH passed
@@ -14111,14 +16254,29 @@ class TestTheKillGateIdentifiesItsTarget:
         )
         assert pids == [], "a daemon for another backup dir was selected"
 
+    def case_an_undecodable_ps_line_reads_as_no_daemon(self, tmp_path, monkeypatch):
+        # `text=True` raises UnicodeDecodeError (a ValueError) on a non-UTF-8
+        # argv; the watchdog's held branch calls this and must not die of it.
+        import subprocess as _sp
+
+        from cswap_pin import proxy as pp
+
+        def _boom(*a, **k):
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+        monkeypatch.setattr(_sp, "run", _boom)
+        assert pp._pin_daemon_pids(tmp_path) == []
+
 
 def test_mint_lock_bound_covers_the_real_in_lock_ceiling():
     """`_MINT_LOCK_BOUND_S` bounds a WAITER; the work the holder does inside
     the lock belongs to the HOST, not this module -- a cold keychain read,
     then (should the held token be expired) `consume_backup_grant`'s own
-    file lock, the switcher's file lock, a keychain re-read and the refresh
-    POST. Below their sum, a legitimate contended refresh gets cut off as
-    if it were stalled."""
+    file lock, the switcher's file lock, a keychain re-read, the refresh
+    POST, then the post-POST compare-and-swap under a third file lock with
+    a keychain read and write. Below their sum, a legitimate contended
+    refresh gets cut off as if it were stalled, and the daemon's wedge
+    must sit above the bound or a healthy slow refresh reads as a wedge."""
     import inspect
 
     from claude_swap import locking, macos_keychain, oauth
@@ -14130,11 +16288,18 @@ def test_mint_lock_bound_covers_the_real_in_lock_ceiling():
     post = inspect.signature(
         oauth.try_refresh_oauth_credentials).parameters["timeout_s"].default
 
-    ceiling = 2 * keychain + 2 * filelock + post
+    ceiling = 4 * keychain + 3 * filelock + post
     assert pp._MINT_LOCK_BOUND_S >= ceiling, (
         f"_MINT_LOCK_BOUND_S={pp._MINT_LOCK_BOUND_S} is below the host's own "
         f"in-lock ceiling {ceiling} (keychain={keychain}, filelock={filelock}, "
         f"post={post})")
+    assert pp._MINT_STALL_WEDGE_S > pp._MINT_LOCK_BOUND_S, (
+        pp._MINT_STALL_WEDGE_S, pp._MINT_LOCK_BOUND_S)
+
+    from claude_swap import pin as host_pin
+
+    assert host_pin._MINT_STALL_WEDGE_S == pp._MINT_STALL_WEDGE_S, (
+        host_pin._MINT_STALL_WEDGE_S, pp._MINT_STALL_WEDGE_S)
 
 
 class TestFailOpenIsNotSilent:
@@ -14407,6 +16572,77 @@ class TestFailOpenIsNotSilent:
                 assert _json.loads(body)["can_pin"] is expect
             finally:
                 p.stop()
+
+    def _health(self, p):
+        c = http.client.HTTPConnection("127.0.0.1", p.port, timeout=10)
+        try:
+            c.request("GET", "/health")
+            return json.loads(c.getresponse().read())
+        finally:
+            c.close()
+
+    def case_health_identity_verdict_is_per_generation(
+            self, certdir, monkeypatch):
+        """`pin_identity_mismatch` reads `null` until THIS generation has
+        checked its own bearer and `false` after one clean check. A handover
+        successor is a new PinProxy over a new provider (what `daemon_main`
+        builds), so it starts `null` again though its predecessor read
+        `false`: a reader treats `null` as unknown, never as clean.
+
+        Read from the HTTP /health JSON. No process is forked: both
+        generations are built here as `daemon_main` builds them, one after the
+        other over one certdir and one credential store."""
+        from cswap_pin import proxy as pp
+
+        probe = threading.Event()
+        monkeypatch.setattr(
+            pp, "pin_profile_for",
+            lambda token: probe.wait(10) and {"emailAddress": "pin@example.com"})
+        pp.save_pin(certdir, "pin@example.com", "org")
+        for generation in ("predecessor", "successor"):
+            provider = pp.make_pin_token_provider(
+                _refetch_switcher(certdir, lambda n: "pin-tok"),
+                "2", "pin@example.com")
+            probe.clear()
+            p = self._proxy(certdir, provider)
+            p.start()  # its start warm mints, and parks on the probe
+            try:
+                assert self._health(p)["pin_identity_mismatch"] is None, (
+                    f"{generation} before its first check")
+                probe.set()
+                assert provider() == "pin-tok"
+                assert self._health(p)["pin_identity_mismatch"] is False, (
+                    f"{generation} after one clean check")
+            finally:
+                probe.set()
+                p.stop()
+
+    def case_health_identity_verdict_stays_null_for_the_live_login(
+            self, certdir, monkeypatch):
+        """A pin that IS the logged-in account makes `provider()` answer None
+        before any bearer is read or probed: nothing is evaluated, so
+        `/health` says `null` (unknown), not `false` (checked and clean)."""
+        from cswap_pin import proxy as pp
+
+        probed = []
+        monkeypatch.setattr(
+            pp, "pin_profile_for", lambda token: probed.append(token))
+        pp.save_pin(certdir, "pin@example.com", "org")
+        switcher = _refetch_switcher(certdir, lambda n: "pin-tok")
+        switcher.current_account_number = lambda: "2"
+        # The roster agrees, so the live-login answer comes from
+        # `_pin_is_the_live_login`'s agreement branch, not its
+        # unreadable-roster fallback.
+        switcher._get_sequence_data = lambda: {"activeAccountNumber": "2"}
+        p = self._proxy(certdir, pp.make_pin_token_provider(
+            switcher, "2", "pin@example.com"))
+        p.start()
+        try:
+            assert p._pin_token_provider() is None
+            assert probed == [], "the live login's bearer was probed"
+            assert self._health(p)["pin_identity_mismatch"] is None
+        finally:
+            p.stop()
 
     def case_a_noop_pin_does_not_warn(self, certdir, monkeypatch):
         """Nothing-to-swap must not fire the keychain warning.
@@ -15071,6 +17307,964 @@ class TestFailOpenIsNotSilent:
             assert doc["mint_stalled"] is False, doc
         finally:
             p.stop()
+
+
+class TestThePinnedTokenIsRefreshedBeforeItsLivenessBuffer:
+    """`can_pin_cached` (so `/health`'s `can_pin`) read false from the moment
+    the cached token passed `expiresAt - 5 min` until the next `provider()`
+    call refreshed it. MEASURED 2026-10-05: a 25.022 s window, recurring every
+    7 h 55 m (the token's lifetime). One predicate decided both "refresh now"
+    and "report can_pin", so the report flipped before the refresh ran, and a
+    launch or `heal` that probed inside the window read a live daemon as
+    wedged. The 30 s watchdog tick now refreshes the pinned token while it
+    still has more than the liveness buffer left."""
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def _rig(self, certdir, monkeypatch, outcome="ok", minutes=7,
+             new_minutes=480):
+        """A real provider over a stub switcher whose slot holds a token with
+        `minutes` left (7: live under oauth's 5-minute buffer, due under the
+        pin's wider margin). The HOST's clock is faked (`oauth.datetime`), so
+        the host's own predicate decides liveness, not a copy of it. A refresh
+        hands back a token with `new_minutes` left. `rig.advance(s)` moves the
+        wall clock and the monotonic one together; `rig.at_call` holds the
+        transition lines already written when each refresh began."""
+        import datetime as _dt
+        import json as _json
+
+        from claude_swap.oauth import RefreshOutcome
+        from cswap_pin import proxy as pp
+
+        # R11: the suite must never dial api.anthropic.com.
+        monkeypatch.setattr(
+            pp, "pin_profile_for",
+            lambda token: {"emailAddress": "pin@example.com"})
+        rig = types.SimpleNamespace(
+            now=1_800_000_000.0, calls=[], during=[], reads=[], lines=[],
+            at_call=[], skew=0.0, on_read=None, on_consume=None,
+            account=("2", "pin@example.com"), live="1", outcome=outcome)
+
+        class _Host(_dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return _dt.datetime.fromtimestamp(rig.now, tz)
+
+        monkeypatch.setattr(pp.oauth, "datetime", _Host)
+        monkeypatch.setattr(pp, "_log_lifecycle", rig.lines.append)
+        # The real clock plus a skew, so a case that times itself still reads
+        # real elapsed time and a retry spacing can be stepped over.
+        real_monotonic = time.monotonic
+        monkeypatch.setattr(
+            pp.time, "monotonic", lambda: real_monotonic() + rig.skew)
+
+        def advance(seconds):
+            rig.now += seconds
+            rig.skew += seconds
+
+        rig.advance = advance
+
+        def blob(token, minutes):
+            return _json.dumps({"claudeAiOauth": {
+                "accessToken": token, "refreshToken": f"rt-{token}",
+                "expiresAt": int((rig.now + minutes * 60) * 1000)}})
+
+        rig.stored = blob("old", minutes)
+
+        class _Switcher:
+            backup_dir = certdir
+            def current_account_number(self): return rig.live
+            def resolve_account(self, i): return (*rig.account, "org")
+            def read_account_credentials(self, n, e):
+                rig.reads.append(1)
+                if rig.on_read:
+                    rig.on_read()
+                return rig.stored
+            def consume_backup_grant(self, n, e, snap):
+                rig.calls.append(snap)
+                if rig.on_consume:
+                    rig.on_consume()
+                rig.at_call.append(
+                    [ln for ln in rig.lines if ln.startswith("can_pin ")])
+                rig.during.append(rig.provider.can_pin_cached())
+                if rig.outcome == "ok":
+                    rig.stored = blob("new", new_minutes)
+                    return RefreshOutcome(rig.stored, None)
+                return RefreshOutcome(None, rig.outcome)
+
+        pp.save_pin(certdir, "pin@example.com", "org")
+        switcher = _Switcher()
+        # `successor()`: a new daemon's provider over the SAME store and clock.
+        rig.successor = lambda: pp.make_pin_token_provider(
+            switcher, "2", "pin@example.com")
+        rig.provider = rig.successor()
+        assert rig.provider() == "old", "the fixture's warm read did not mint"
+        assert rig.provider.can_pin_cached() is True
+        return rig
+
+    def _tick(self, rig, certdir, monkeypatch, self_heal):
+        """Exactly ONE watchdog tick against a server carrying the provider."""
+        from cswap_pin import proxy as pp
+
+        class _OneTick:
+            n = 0
+            def wait(self, _interval):
+                self.n += 1
+                return self.n > 1
+            def set(self):
+                pass
+
+        if self_heal:
+            monkeypatch.delenv(pp._SELF_HEAL_ENV, raising=False)
+        else:
+            monkeypatch.setenv(pp._SELF_HEAL_ENV, "off")
+        # Never reach a REAL holder's SIGHUP from a suite run under one.
+        monkeypatch.setattr(pp, "_retire_stale_holder", lambda *a, **k: False)
+        pp._watch_own_code(
+            types.SimpleNamespace(_pin_token_provider=rig.provider), "2",
+            "pin@example.com", certdir, _OneTick(), teardown=lambda r: None,
+            interval=0.0, _own_fingerprint=pp.daemon_fingerprint())
+
+    def _transitions(self, rig):
+        return [ln for ln in rig.lines if ln.startswith("can_pin ")]
+
+    def case_a_tick_refreshes_ahead_and_can_pin_never_reads_false(
+            self, certdir, monkeypatch):
+        """The fix. SELF-HEAL OFF for one pass and ON for the other: the
+        refresh sits before the off switch, so it runs either way (the switch
+        stops REPLACEMENTS, and a refresh replaces nothing)."""
+        for self_heal in (False, True):
+            rig = self._rig(certdir, monkeypatch)
+            samples = [rig.provider.can_pin_cached()]
+            self._tick(rig, certdir, monkeypatch, self_heal)
+            assert len(rig.calls) == 1, (
+                f"self_heal={self_heal}: the tick did not refresh a token "
+                f"with 7 min left ({len(rig.calls)} refreshes)")
+            reads = len(rig.reads)
+            # THE ROTATED BLOB IS WHAT IS CACHED: a bare read of the held
+            # copy, with no store read, hands back the new token.
+            assert rig.provider() == "new"
+            assert len(rig.reads) == reads, "the rotation was not cached"
+            samples += rig.during
+            # Past the point where the OLD token would have read dead.
+            for minutes in (1, 3, 6):
+                rig.now += minutes * 60
+                samples.append(rig.provider.can_pin_cached())
+            assert samples == [True] * len(samples), (
+                f"self_heal={self_heal}: can_pin read false across the "
+                f"refresh: {samples}")
+            assert self._transitions(rig) == [], self._transitions(rig)
+            # THE NEGATIVE CONTROL: a token with 8 hours on it is not due, so
+            # a later tick (past the retry spacing, which is not what is under
+            # test here) spends no grant. A tick that refreshed every time is
+            # a POST every 30 s, each one burning a one-time grant.
+            rig.advance(200)
+            reads = len(rig.reads)
+            self._tick(rig, certdir, monkeypatch, self_heal)
+            assert len(rig.calls) == 1, (
+                f"self_heal={self_heal}: a second tick refreshed a token "
+                f"with hours left ({len(rig.calls)} refreshes)")
+            assert len(rig.reads) == reads, (
+                f"self_heal={self_heal}: a tick on a token not due read the "
+                f"store")
+
+    def case_a_token_outside_the_margin_is_not_refreshed(
+            self, certdir, monkeypatch):
+        """15 minutes left is above the 10-minute margin: no grant is spent."""
+        rig = self._rig(certdir, monkeypatch, minutes=15)
+        reads = len(rig.reads)
+        self._tick(rig, certdir, monkeypatch, False)
+        assert rig.calls == [], rig.calls
+        assert len(rig.reads) == reads, "a tick on a token not due read the store"
+
+    def case_another_processs_rotation_is_adopted_before_a_grant_is_spent(
+            self, certdir, monkeypatch):
+        """The held copy is due, but the store already holds a rotation made
+        elsewhere (cswap's own freshen, the usage collector): the tick adopts
+        it and POSTs nothing, since the grant that made it is spent."""
+        rig = self._rig(certdir, monkeypatch)
+        rig.stored = json.dumps({"claudeAiOauth": {
+            "accessToken": "elsewhere", "refreshToken": "rt-elsewhere",
+            "expiresAt": int((rig.now + 480 * 60) * 1000)}})
+        self._tick(rig, certdir, monkeypatch, False)
+        assert rig.calls == [], rig.calls
+        assert rig.provider() == "elsewhere"
+
+    def case_the_margin_covers_one_tick_and_the_longest_refresh(self):
+        """A margin shorter than tick + refresh would let the token enter the
+        liveness buffer while the refresh was still running."""
+        from cswap_pin import proxy as pp
+
+        need_s = (pp.oauth.OAUTH_EXPIRY_BUFFER_MS / 1000
+                  + pp._CODE_WATCH_INTERVAL_S + pp._MINT_LOCK_BOUND_S)
+        assert pp._FRESHEN_MARGIN_MS / 1000 > need_s, (
+            pp._FRESHEN_MARGIN_MS, need_s)
+
+    def case_the_transition_line_fires_on_both_edges_and_only_there(
+            self, certdir, monkeypatch):
+        """THE CONTROL for the silence the fix leaves: with no refresh, the
+        token crossing into the liveness buffer writes one true->false line,
+        and the refresh one false->true. Edge, not level: repeated reads in
+        one state write nothing."""
+        rig = self._rig(certdir, monkeypatch)
+        assert self._transitions(rig) == []
+        rig.now += 3 * 60                      # 4 min left: inside the buffer
+        assert rig.provider.can_pin_cached() is False
+        assert rig.provider.can_pin_cached() is False
+        assert len(self._transitions(rig)) == 1, self._transitions(rig)
+        assert "True -> False" in self._transitions(rig)[0]
+        assert rig.provider() == "new"         # the ordinary, late refresh
+        assert rig.provider.can_pin_cached() is True
+        assert rig.provider.can_pin_cached() is True
+        lines = self._transitions(rig)
+        assert len(lines) == 2 and "False -> True" in lines[1], lines
+
+    def case_a_failed_refresh_inside_the_margin_does_not_hide_a_dead_token(
+            self, certdir, monkeypatch):
+        """True while the held token is live, because it IS live; false the
+        moment it is not. The refresh failing earlier must not flip either
+        way, and must not leave a blind mint on `/health`. A transient failure
+        keeps the token past the liveness buffer (the next case), but never
+        into the hold margin: a dead token is not hidden."""
+        from cswap_pin import proxy as pp
+
+        rig = self._rig(certdir, monkeypatch, outcome="transient")
+        self._tick(rig, certdir, monkeypatch, False)
+        assert len(rig.calls) == 1, "the tick never tried the refresh"
+        assert rig.provider.can_pin_cached() is True
+        assert not rig.provider.blind_reason, rig.provider.blind_reason
+        assert rig.provider() == "old", "a live token was refused"
+        assert self._transitions(rig) == []
+        rig.now += 150                         # 4.5 min left: buffer reached
+        assert rig.provider.can_pin_cached() is True   # held, not hidden
+        assert self._transitions(rig) == []
+        rig.now += 4.5 * 60 - pp._HOLD_MARGIN_MS / 1000 + 5    # inside the hold margin
+        assert rig.provider.can_pin_cached() is False
+        assert len(self._transitions(rig)) == 1, self._transitions(rig)
+        rig.now += 120                         # expired
+        assert rig.provider.can_pin_cached() is False
+        assert rig.provider() is None, "an expired token was served"
+
+    def case_a_transient_refresh_failure_in_the_buffer_keeps_the_held_token(
+            self, certdir, monkeypatch):
+        """THE FIELD CASE (2026-10-31, 12:14:46Z and 12:15:47Z): the refresh
+        POST fails transiently once the token is inside cswap's 5-minute
+        buffer, and the token is still valid for minutes. It is served, not
+        thrown away: the provider returns it with no `blind_reason`, `can_pin`
+        reads true to `/health` and a launch, and the watchdog replaces
+        nothing, since a successor re-runs the same POST and fails the same
+        way. The failure stays in the log, and the next tick tries again."""
+        from cswap_pin import proxy as pp
+
+        rig = self._rig(certdir, monkeypatch, outcome="transient")
+        self._tick(rig, certdir, monkeypatch, True)    # 7 min: early refresh fails
+        rig.advance(150)                       # 4.5 min left: inside the buffer
+        assert rig.provider.can_pin_cached() is True
+        self._tick(rig, certdir, monkeypatch, True)
+        assert len(rig.calls) == 2, "the tick did not try the refresh again"
+        assert rig.provider() == "old"
+        assert rig.provider.blind_reason == ""
+        assert rig.provider.can_pin_cached() is True
+        assert pp._can_mint(rig.provider) is True
+        assert not [ln for ln in rig.lines if "replacing ourselves" in ln]
+        assert not pp._blind_recycle_path(certdir).exists()
+        assert len([ln for ln in rig.lines
+                    if "refresh transient for slot 2" in ln]) == 1, rig.lines
+        assert self._transitions(rig) == [], self._transitions(rig)
+
+    def case_a_held_token_is_served_without_a_post_and_the_tick_ends_the_hold(
+            self, certdir, monkeypatch):
+        """Requests in the hold do not each re-run the failing POST (peer-host
+        log: 0.15 to 0.3 s apart, which feeds a 429, and each request waits on
+        it). Only the tick retries, within its spacing; a success ends the
+        hold."""
+        rig = self._rig(certdir, monkeypatch, outcome="transient")
+        self._tick(rig, certdir, monkeypatch, False)   # 7 min: fails, quietly
+        rig.advance(150)                       # 4.5 min left: in the hold
+        assert [rig.provider() for _ in range(5)] == ["old"] * 5
+        assert len(rig.calls) == 1, "a pinned request POSTed during the hold"
+        self._tick(rig, certdir, monkeypatch, False)   # past the spacing
+        assert len(rig.calls) == 2, "the tick did not retry inside the buffer"
+        self._tick(rig, certdir, monkeypatch, False)   # inside the spacing
+        assert [rig.provider() for _ in range(5)] == ["old"] * 5
+        assert len(rig.calls) == 2, rig.calls
+        rig.outcome = "ok"
+        rig.advance(125)                       # 2.4 min left, spacing over
+        self._tick(rig, certdir, monkeypatch, False)
+        assert len(rig.calls) == 3, "the tick did not retry once more"
+        assert rig.provider() == "new"
+        assert rig.provider.can_pin_cached() is True
+        assert rig.provider.blind_reason == ""
+        assert len(rig.calls) == 3, rig.calls
+
+    def case_a_transient_refresh_failure_inside_the_hold_margin_is_blind(
+            self, certdir, monkeypatch):
+        """THE CONTROL: with less than the hold margin left the next tick may
+        be too late to replace, so the failure reads as it always did: no
+        token, the reason, `can_pin` false, and the blind replace."""
+        from cswap_pin import proxy as pp
+
+        rig = self._rig(certdir, monkeypatch, outcome="transient")
+        self._tick(rig, certdir, monkeypatch, False)
+        rig.advance(7 * 60 - pp._HOLD_MARGIN_MS / 1000 + 5)
+        assert rig.provider.can_pin_cached() is False
+        assert pp._can_mint(rig.provider) is False
+        assert rig.provider.blind_reason == (
+            "refresh transient for slot 2 (pin@example.com)")
+        self._tick(rig, certdir, monkeypatch, True)
+        assert pp._blind_recycle_path(certdir).exists(), "no blind replace"
+        assert [ln for ln in rig.lines if "replacing ourselves" in ln]
+
+    def case_a_failure_that_is_not_transient_in_the_buffer_is_not_held(
+            self, certdir, monkeypatch):
+        """Only a transient failure holds: a dead lineage leaves the token
+        unserved, with its reason, as before."""
+        for outcome in ("invalid_grant", "no_refresh_token"):
+            rig = self._rig(certdir, monkeypatch, outcome=outcome)
+            rig.advance(150)                   # 4.5 min left: inside the buffer
+            assert rig.provider() is None, outcome
+            assert rig.provider.blind_reason == (
+                f"refresh {outcome} for slot 2 (pin@example.com)"), outcome
+            assert rig.provider.can_pin_cached() is False, outcome
+
+    def case_a_transient_failure_belongs_to_the_blob_it_failed_on(
+            self, certdir, monkeypatch):
+        """Another process rotates the slot after the early refresh failed.
+        The daemon adopts the new blob without a refresh of its own, and when
+        that one reaches the buffer nothing has failed on it: not held."""
+        rig = self._rig(certdir, monkeypatch, outcome="transient")
+        self._tick(rig, certdir, monkeypatch, False)   # "old" fails, quietly
+        rig.advance(150)
+        rig.stored = json.dumps({"claudeAiOauth": {
+            "accessToken": "elsewhere", "refreshToken": "rt-elsewhere",
+            "expiresAt": int((rig.now + 480 * 60) * 1000)}})
+        assert rig.provider() == "elsewhere"
+        assert len(rig.calls) == 1, "the adopted blob was refreshed"
+        rig.advance((480 - 4.5) * 60)          # inside the buffer, above the margin
+        assert rig.provider.can_pin_cached() is False
+
+    def case_the_tick_logs_the_edge_itself_before_it_refreshes(
+            self, certdir, monkeypatch):
+        """No `/health` reader at all: a token already inside the liveness
+        buffer when the tick runs gets its `True -> False` line from the
+        tick's own read, written BEFORE the refresh begins (`at_call` is
+        snapshotted ahead of the stub's own read), and `False -> True` on the
+        next read after it."""
+        rig = self._rig(certdir, monkeypatch)
+        rig.now += 3 * 60                      # 4 min left: inside the buffer
+        self._tick(rig, certdir, monkeypatch, True)
+        assert len(rig.calls) == 1, "the tick did not refresh"
+        assert len(rig.at_call[0]) == 1 and "True -> False" in rig.at_call[0][0], (
+            rig.at_call)
+        assert rig.provider.can_pin_cached() is True
+        lines = self._transitions(rig)
+        assert len(lines) == 2 and "False -> True" in lines[1], lines
+
+    def case_a_token_past_the_buffer_is_refreshed_once_per_tick(
+            self, certdir, monkeypatch):
+        """The early refresh is for a token that is still LIVE. Past the
+        buffer it is `_can_mint`'s to refresh (self-heal on: one POST a tick,
+        as before the early refresh existed) and nobody's with self-heal off.
+        The tick's `freshen()` used to reach the on-demand branch, which the
+        retry spacing does not hold, so a dead lineage cost a second POST (on)
+        or a POST a tick where there was none (off). It reads no store, and no
+        request went out, so a busy slot is no unpinned request."""
+        from cswap_pin import proxy as pp
+
+        for self_heal, posts in ((True, 1), (False, 0)):
+            for outcome in ("invalid_grant", "consume-busy"):
+                rig = self._rig(certdir, monkeypatch, outcome=outcome)
+                rig.now += 3 * 60              # 4 min left: inside the buffer
+                # The recycle a blind tick starts is not under test.
+                pp.note_blind_recycle(certdir, time.time())
+                reads = len(rig.reads)
+                self._tick(rig, certdir, monkeypatch, self_heal)
+                assert len(rig.calls) == posts, (
+                    f"self_heal={self_heal} {outcome}: {len(rig.calls)} "
+                    f"refreshes in one tick, want {posts}")
+                if not self_heal:
+                    assert len(rig.reads) == reads, "the tick read the store"
+                    assert rig.provider.pin_is_noop() is False
+                    assert not [ln for ln in rig.lines
+                                if "went out unpinned" in ln], rig.lines
+
+    def case_a_failing_early_refresh_is_tried_once_per_retry_spacing(
+            self, certdir, monkeypatch):
+        """A refresh token that died inside the margin: one quiet POST in the
+        first 120 s of ticks 30 s apart, the next one after it. The on-demand
+        path (a request, `_can_mint`) is not held to this."""
+        from cswap_pin import proxy as pp
+
+        rig = self._rig(certdir, monkeypatch, outcome="transient", minutes=9)
+        for _ in range(4):                     # t = 0, 30, 60, 90
+            self._tick(rig, certdir, monkeypatch, False)
+            rig.advance(pp._CODE_WATCH_INTERVAL_S)
+        assert len(rig.calls) == 1, len(rig.calls)
+        self._tick(rig, certdir, monkeypatch, False)       # t = 120
+        assert len(rig.calls) == 2, len(rig.calls)
+        # NOT THROTTLED: a request's own `provider()` on a dead token refreshes.
+        rig.advance(360)                       # 1 min left: inside the hold margin
+        assert rig.provider() is None
+        assert len(rig.calls) == 3, len(rig.calls)
+
+    def case_a_token_still_inside_the_margin_after_a_refresh_is_left_alone(
+            self, certdir, monkeypatch):
+        """A short-lived token (8 min, so the NEW token is inside the margin
+        too): the next tick 30 s later does not refresh it again, and the one
+        after the retry spacing does."""
+        from cswap_pin import proxy as pp
+
+        rig = self._rig(certdir, monkeypatch, new_minutes=8)
+        self._tick(rig, certdir, monkeypatch, False)
+        assert len(rig.calls) == 1
+        rig.advance(pp._CODE_WATCH_INTERVAL_S)
+        self._tick(rig, certdir, monkeypatch, False)
+        assert len(rig.calls) == 1, len(rig.calls)
+        rig.advance(pp._FRESHEN_RETRY_S)
+        self._tick(rig, certdir, monkeypatch, False)
+        assert len(rig.calls) == 2, len(rig.calls)
+
+    def case_a_busy_slot_on_the_proactive_path_is_not_an_unpinned_request(
+            self, certdir, monkeypatch):
+        """`consume-busy` returns before any POST (no grant is spent), and
+        here no request went out unpinned either, so neither the deferral
+        flag nor the warning that says one did may be set."""
+        rig = self._rig(certdir, monkeypatch, outcome="consume-busy")
+        self._tick(rig, certdir, monkeypatch, False)
+        assert len(rig.calls) == 1
+        assert rig.provider.pin_is_noop() is False
+        assert not [ln for ln in rig.lines if "went out unpinned" in ln]
+        assert rig.provider.can_pin_cached() is True
+
+    def case_a_live_due_copy_is_not_replaced_by_a_store_read_that_is_not_live(
+            self, certdir, monkeypatch):
+        """The held copy is live and due and the store is OLDER than it (an
+        expired blob, or one inside the liveness buffer). Adopting that read
+        left the tick with no live token, so it ran the ON-DEMAND refresh: a
+        deferral and an 'unpinned' line with no request out, a `blind_reason`,
+        and `can_pin_cached` false across a window the held token covers. The
+        early refresh runs on the held copy and leaves it in place."""
+        for outcome, stored_minutes in (("transient", -10), ("consume-busy", 2)):
+            label = f"{outcome}, store with {stored_minutes} min"
+            rig = self._rig(certdir, monkeypatch, outcome=outcome)
+            # A blob of its own, so `rig.calls` says which copy was refreshed.
+            rig.stored = json.dumps({"claudeAiOauth": {
+                "accessToken": "stale", "refreshToken": "rt-stale",
+                "expiresAt": int((rig.now + stored_minutes * 60) * 1000)}})
+            self._tick(rig, certdir, monkeypatch, False)
+            assert len(rig.calls) == 1, f"{label}: {len(rig.calls)} refreshes"
+            assert "rt-old" in rig.calls[0] and "rt-stale" not in rig.calls[0], (
+                f"{label}: the refresh ran on the store's blob, not the held "
+                f"copy: {rig.calls[0]}")
+            assert rig.provider.can_pin_cached() is True, label
+            assert rig.provider.pin_is_noop() is False, label
+            assert rig.provider.blind_reason == "", (
+                f"{label}: {rig.provider.blind_reason}")
+            assert not [ln for ln in rig.lines if "went out unpinned" in ln], (
+                label, rig.lines)
+            # THE HELD COPY IS STILL THE CACHED ONE: a bare read answers from
+            # it, where a replaced entry would go back to the (dead) store.
+            reads = len(rig.reads)
+            assert rig.provider() == "old", label
+            assert len(rig.reads) == reads, f"{label}: the cache was replaced"
+
+    def case_a_failing_freshen_writes_no_failure_reason(
+            self, certdir, monkeypatch):
+        """`blind_reason` is shared: the request path reads it after its own
+        `provider()` returned None, and `runtime_health` fails `pin-applied`
+        on any. The "rotated token is foreign" row guards the mute: the
+        finding itself still reaches `identity_mismatch`, and the tick writes
+        no reason for it. The two quiet-arm rows (`transient`,
+        `consume-busy`) are retained guards of behavior that already held:
+        the quiet refresh never wrote one."""
+        from cswap_pin import proxy as pp
+
+        for label, outcome, foreign in (
+                ("refresh transient", "transient", False),
+                ("refresh busy", "consume-busy", False),
+                ("rotated token is foreign", "ok", True)):
+            rig = self._rig(certdir, monkeypatch, outcome=outcome)
+            if foreign:
+                monkeypatch.setattr(pp, "pin_profile_for", lambda token: {
+                    "emailAddress": ("other@example.com" if token == "new"
+                                     else "pin@example.com")})
+            self._tick(rig, certdir, monkeypatch, False)
+            assert len(rig.calls) == 1, f"{label}: {len(rig.calls)} refreshes"
+            assert bool(rig.provider.identity_mismatch) is foreign, label
+            assert rig.provider.blind_reason == "", (
+                f"{label}: the tick wrote {rig.provider.blind_reason!r}")
+
+    def case_a_tick_leaves_the_foreign_reason_a_request_wrote(
+            self, certdir, monkeypatch):
+        """A request that meets a foreign bearer writes the reason AND
+        `identity_mismatch`. The tick's clears (the entry one, the store
+        read's) must not erase it: with self-heal off nothing re-asks, and
+        `/health` read `blind_reason` empty beside a standing mismatch, so
+        `pin-applied` passed on a foreign pin. Repaired, the next tick clears."""
+        foreign = {"email": "other@example.com", "uuid": None}
+        for label, minutes, outcome in (("not due", 15, "ok"),
+                                        ("due, refresh fails", 7, "transient")):
+            rig = self._rig(certdir, monkeypatch, minutes=minutes,
+                            outcome=outcome)
+            # `_rig`'s warm mint settled "old" as ok and a settled verdict is
+            # never re-probed, so say it the way the 12h beat does.
+            rig.provider.note_verdict("old", "foreign", foreign)
+            assert rig.provider() is None, label
+            written = rig.provider.blind_reason
+            assert "other@example.com" in written, (label, written)
+            assert rig.provider.identity_mismatch, label
+            self._tick(rig, certdir, monkeypatch, False)
+            assert rig.provider.blind_reason == written, (
+                f"{label}: the tick left {rig.provider.blind_reason!r}")
+            assert rig.provider.identity_mismatch, label
+            rig.provider.note_verdict("old", "ok")
+            self._tick(rig, certdir, monkeypatch, False)
+            assert rig.provider.blind_reason == "", (
+                f"{label}: {rig.provider.blind_reason!r}")
+
+    def _health(self, proxy):
+        c = http.client.HTTPConnection("127.0.0.1", proxy.port, timeout=10)
+        try:
+            c.request("GET", "/health")
+            return json.loads(c.getresponse().read())
+        finally:
+            c.close()
+
+    def _bridge_post(self, proxy):
+        """The status line a bridge create gets: the absolute-form POST a
+        `claude remote-control` sends, whose refusal is the 503 the field saw."""
+        c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+        try:
+            c.sendall(b"POST https://api.anthropic.com/v1/environments/bridge"
+                      b" HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                      b"Authorization: Bearer ACTIVE\r\n\r\n")
+            return c.recv(4096).split(b"\r\n")[0]
+        finally:
+            c.close()
+
+    def case_health_keeps_the_reason_across_a_doomed_refresh(
+            self, certdir, monkeypatch):
+        """FIELD, 2026-10-15: bridge POSTs got `503 refresh invalid_grant`
+        while `/health` read `blind_reason: null`. The request path cleared the
+        reason on an EXPIRED held token, then ran a refresh that fails again,
+        so the field flapped on every pinned request: empty for the whole
+        refresh (the window a `/health` probe sees, `can_pin` forced true by
+        the held lock), set again when it failed. The reason is cleared by a
+        live token in hand or a refresh that works, and by nothing else."""
+        from cswap_pin import proxy as pp
+
+        rig = self._rig(certdir, monkeypatch, outcome="invalid_grant")
+        rig.advance(600)                       # the held token is dead
+        hold, entered, release = (threading.Event() for _ in range(3))
+
+        def on_consume():
+            if hold.is_set():
+                entered.set()
+                release.wait(10)
+
+        rig.on_consume = on_consume
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=rig.provider,
+                            upstream=("127.0.0.1", 1))
+        proxy.start()                          # its warm is the first doomed refresh
+        try:
+            deadline = time.monotonic() + 10
+            while (rig.provider.refresh_lock.locked()
+                   or not rig.provider.blind_reason):
+                assert time.monotonic() < deadline, "the start warm never settled"
+                time.sleep(0.01)
+            first = self._health(proxy)
+            reason = first["blind_reason"]
+            assert first["can_pin"] is False and "invalid_grant" in reason, first
+            # A BRIDGE CREATE's refresh, held open.
+            hold.set()
+            posted = []
+            request = threading.Thread(
+                target=lambda: posted.append(self._bridge_post(proxy)),
+                daemon=True)
+            request.start()
+            assert entered.wait(10), "the request never began its refresh"
+            during = self._health(proxy)
+            release.set()
+            request.join(10)
+            assert posted == [b"HTTP/1.1 503 Service Unavailable"], posted
+            assert during["mint_stalled"] is True, during   # the window was real
+            assert during["can_pin"] is True, during        # by design: not a dead daemon
+            assert during["blind_reason"] == reason, (
+                f"/health lost the reason while the refresh ran: {during}")
+            after = self._health(proxy)
+            assert after["can_pin"] is False and after["blind_reason"] == reason, after
+        finally:
+            release.set()
+            proxy.stop()
+
+    def case_a_refresh_that_works_or_a_live_store_read_clears_the_reason(
+            self, certdir, monkeypatch):
+        """The other half: a reason left by a failure goes when the request
+        path ends up with a live token, whether it refreshed one or the store
+        already held a rotation made elsewhere."""
+        for label, elsewhere in (("refresh", False), ("store rotation", True)):
+            rig = self._rig(certdir, monkeypatch)
+            rig.advance(600)                   # the held token is dead
+            if elsewhere:
+                rig.stored = json.dumps({"claudeAiOauth": {
+                    "accessToken": "elsewhere", "refreshToken": "rt-elsewhere",
+                    "expiresAt": int((rig.now + 480 * 60) * 1000)}})
+            rig.provider.blind_reason = "refresh invalid_grant for slot 2 (x)"
+            assert rig.provider() == ("elsewhere" if elsewhere else "new"), label
+            assert len(rig.calls) == (0 if elsewhere else 1), (label, rig.calls)
+            assert rig.provider.blind_reason == "", (
+                f"{label}: {rig.provider.blind_reason!r}")
+
+    def _predecessor_leaves_a_reason(self, rig, certdir):
+        """A daemon whose refresh meets `invalid_grant`, run until the tick has
+        recorded the reason it holds, then ended: the generation a handover
+        replaces. Returns the reason."""
+        from cswap_pin import proxy as pp
+
+        rig.advance(600)                       # the held token is dead
+        daemon = pp.PinProxy(certdir=certdir, pin_token_provider=rig.provider,
+                             upstream=("127.0.0.1", 1))
+        daemon.start()                         # its warm is the doomed refresh
+        try:
+            deadline = time.monotonic() + 10
+            while (rig.provider.refresh_lock.locked()
+                   or not rig.provider.blind_reason):
+                assert time.monotonic() < deadline, "the warm never settled"
+                time.sleep(0.01)
+            # The tick that records it is the daemon's own; a miss shows as the
+            # successor's reading below, not here.
+            deadline = time.monotonic() + 3
+            while (not (certdir / "blind-reason.json").exists()
+                   and time.monotonic() < deadline):
+                time.sleep(0.05)
+        finally:
+            daemon.stop()
+        return rig.provider.blind_reason
+
+    def case_a_successor_reads_the_predecessors_reason_from_its_first_health(
+            self, certdir, monkeypatch):
+        """A handover's activation probe looks while the successor's warm holds
+        the mint lock: `can_pin` is forced true there (by design: a stall is not
+        a dead daemon), so `blind_reason` is the only field that can still say
+        the slot's lineage is dead, and a fresh process starts with it empty.
+        The reason crosses the handover, scoped to the slot it names, and the
+        warm refresh then re-derives it."""
+        from cswap_pin import proxy as pp
+
+        rig = self._rig(certdir, monkeypatch, outcome="invalid_grant")
+        reason = self._predecessor_leaves_a_reason(rig, certdir)
+        assert "invalid_grant" in reason and "slot 2" in reason, reason
+        entered, release = threading.Event(), threading.Event()
+
+        def on_consume():
+            entered.set()
+            release.wait(10)
+
+        rig.on_consume = on_consume
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=rig.successor(),
+                            upstream=("127.0.0.1", 1))
+        proxy.start()
+        try:
+            first = self._health(proxy)        # the very first answer
+            assert first["blind_reason"] == reason, first
+            assert entered.wait(10), "the successor's warm never began its refresh"
+            during = self._health(proxy)
+            assert during["mint_stalled"] is True, during   # the window was real
+            assert during["can_pin"] is True, during
+            assert during["blind_reason"] == reason, during
+            release.set()
+            deadline = time.monotonic() + 10
+            while proxy._pin_token_provider.refresh_lock.locked():
+                assert time.monotonic() < deadline, "the warm never settled"
+                time.sleep(0.01)
+            after = self._health(proxy)
+            assert after["can_pin"] is False and after["blind_reason"] == reason, after
+        finally:
+            release.set()
+            proxy.stop()
+
+    def case_a_carried_reason_goes_with_its_slot_or_a_live_token(
+            self, certdir, monkeypatch):
+        """The record is a memo of a failure, so it must not outlive what it
+        describes: another slot pinned now, or a live token for this one (a
+        re-login while no daemon ran), and the successor says nothing, and the
+        file is gone."""
+        from cswap_pin import proxy as pp
+
+        rig = self._rig(certdir, monkeypatch, outcome="invalid_grant")
+        reason = self._predecessor_leaves_a_reason(rig, certdir)
+        carry = certdir / "blind-reason.json"
+        assert carry.exists(), "the predecessor recorded nothing"
+        # ANOTHER SLOT IS PINNED NOW. The seed happens at construction, so
+        # nothing has to be served to see it refuse.
+        rig.account = ("3", "other@example.com")
+        other = rig.successor()
+        pp.PinProxy(certdir=certdir, pin_token_provider=other,
+                    upstream=("127.0.0.1", 1))
+        assert getattr(other, "blind_reason", "") == "", other.blind_reason
+        assert not carry.exists(), "a reason for slot 2 outlived the pin on slot 3"
+        # NOTHING LEFT TO MINT: the pin became the login (`provider()` returns
+        # before any read, so it must clear too), or a re-login left a live
+        # token. Both are met by the warm; the record goes with the reason.
+        record = json.dumps(
+            {"slot": "2", "mail": "pin@example.com", "reason": reason})
+        relogin = json.dumps({"claudeAiOauth": {
+            "accessToken": "relogin", "refreshToken": "rt-relogin",
+            "expiresAt": int((rig.now + 480 * 60) * 1000)}})
+        rig.account = ("2", "pin@example.com")
+        for label, live, stored in (("the pin is the login", "2", rig.stored),
+                                    ("a live token", "1", relogin)):
+            rig.live, rig.stored = live, stored
+            carry.write_text(record)
+            proxy = pp.PinProxy(certdir=certdir,
+                                pin_token_provider=rig.successor(),
+                                upstream=("127.0.0.1", 1))
+            held = proxy._pin_token_provider
+            assert getattr(held, "blind_reason", "") == reason, label
+            proxy.start()
+            try:
+                deadline = time.monotonic() + 10
+                while carry.exists() or held.refresh_lock.locked():
+                    assert time.monotonic() < deadline, (
+                        f"{label}: the record outlived the reason: "
+                        f"{carry.exists()}")
+                    time.sleep(0.05)
+                health = self._health(proxy)
+                assert health["blind_reason"] is None, (label, health)
+                assert health["can_pin"] is True, (label, health)
+            finally:
+                proxy.stop()
+
+    def case_a_tick_that_repairs_the_identity_does_not_keep_the_reason(
+            self, certdir, monkeypatch):
+        """The guard reads the mismatch, so the one thing that can make the
+        reason sticky is a repair no tick can see. The tick's own
+        `_identity_ok` is one: the refresh hands back a token that answers as
+        the pin, which resets the mismatch (after that tick's entry clear, so
+        the NEXT tick is the one that clears)."""
+        rig = self._rig(certdir, monkeypatch)
+        rig.provider.note_verdict(
+            "old", "foreign", {"email": "other@example.com", "uuid": None})
+        assert rig.provider() is None and rig.provider.blind_reason
+        self._tick(rig, certdir, monkeypatch, False)
+        assert len(rig.calls) == 1, rig.calls
+        assert rig.provider.identity_mismatch is False
+        self._tick(rig, certdir, monkeypatch, False)
+        assert rig.provider.blind_reason == "", rig.provider.blind_reason
+
+    def case_a_reason_whose_record_was_not_written_is_written_by_a_later_tick(
+            self, certdir, monkeypatch):
+        """The tick skips a reason it has already carried, so it may call a
+        reason carried only once the record is on disk: a failed target
+        lookup or a failed write must leave the next tick to retry, and a
+        failed write must not leave its temp file behind."""
+        from cswap_pin import proxy as pp
+
+        rig = self._rig(certdir, monkeypatch)
+        reason = rig.provider.blind_reason = "refresh invalid_grant for slot 2 (x)"
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=rig.provider,
+                            upstream=("127.0.0.1", 1))
+        carry = certdir / "blind-reason.json"
+        real_target, real_replace = rig.provider.current_target, pp.os.replace
+
+        def no_target():
+            monkeypatch.setattr(rig.provider, "current_target", real_target)
+            raise RuntimeError("the roster is unreadable")
+
+        def no_replace(*args, **kwargs):
+            monkeypatch.setattr(pp.os, "replace", real_replace)
+            raise OSError("no space left")
+
+        monkeypatch.setattr(rig.provider, "current_target", no_target)
+        monkeypatch.setattr(pp.os, "replace", no_replace)
+        try:
+            with pytest.raises(RuntimeError):
+                proxy._carry_blind_tick()
+            assert not carry.exists()
+            proxy._carry_blind_tick()          # the write fails; no raise
+            assert pp.os.replace is real_replace, "the write fault never fired"
+            assert not carry.exists()
+            assert list(certdir.glob("blind-reason.json.*.tmp")) == []
+            proxy._carry_blind_tick()          # both faults spent; it lands
+            assert json.loads(carry.read_text()) == {
+                "slot": "2", "mail": "pin@example.com", "reason": reason}
+            assert list(certdir.glob("blind-reason.json.*.tmp")) == []
+        finally:
+            proxy.stop()
+
+    def case_a_temp_file_left_by_a_dead_writer_is_removed_by_the_next_write(
+            self, certdir, monkeypatch):
+        """A death between the temp write and the rename never runs the
+        except, and the temp's name carries the dead pid, so only a later
+        write, to set the record or to remove it, can sweep it."""
+        from cswap_pin import proxy as pp
+
+        rig = self._rig(certdir, monkeypatch)
+        reason = rig.provider.blind_reason = "refresh invalid_grant for slot 2 (x)"
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=rig.provider,
+                            upstream=("127.0.0.1", 1))
+        carry, stale = certdir / "blind-reason.json", certdir / "blind-reason.json.99999.tmp"
+        try:
+            stale.write_text("{")
+            proxy._carry_blind_tick()
+            assert json.loads(carry.read_text())["reason"] == reason
+            assert not stale.exists()
+            stale.write_text("{")
+            rig.provider.blind_reason = ""
+            proxy._carry_blind_tick()
+            assert not carry.exists()
+            assert not stale.exists()
+        finally:
+            proxy.stop()
+
+    def case_a_store_blob_that_crosses_the_buffer_is_judged_once(
+            self, certdir, monkeypatch):
+        """The store read's liveness was asked twice (the guard, then the
+        token), so a blob live at the first look and past the buffer at the
+        second was written over the held copy with no token in hand: the tick
+        ended on a dead copy and `can_pin_cached` read false. `is_oauth_token_
+        expired` stands in for the clock crossing between the two looks."""
+        from cswap_pin import proxy as pp
+
+        rig = self._rig(certdir, monkeypatch)
+        expires = int((rig.now + 6 * 60) * 1000)
+        rig.stored = json.dumps({"claudeAiOauth": {
+            "accessToken": "edge", "refreshToken": "rt-edge",
+            "expiresAt": expires}})
+        real, looks = pp.oauth.is_oauth_token_expired, []
+
+        def expired(at):
+            if at == expires:
+                looks.append(1)
+                if len(looks) > 1:
+                    return True
+            return real(at)
+
+        monkeypatch.setattr(pp.oauth, "is_oauth_token_expired", expired)
+        self._tick(rig, certdir, monkeypatch, False)
+        assert len(rig.calls) == 1, (
+            f"the tick had no live token in hand ({len(looks)} looks at the "
+            f"store blob, {len(rig.calls)} refreshes)")
+        assert rig.provider.can_pin_cached() is True
+
+    def case_a_freshen_with_a_live_token_still_clears_a_stale_blind_reason(
+            self, certdir, monkeypatch):
+        """With self-heal off nothing else clears a reason an idle daemon
+        holds, and `runtime_health` reads it as a failed `pin-applied`. The
+        tick that holds a live token clears it, due or not."""
+        for minutes in (7, 15):
+            rig = self._rig(certdir, monkeypatch, minutes=minutes)
+            rig.provider.blind_reason = "stale"
+            self._tick(rig, certdir, monkeypatch, False)
+            assert len(rig.calls) == (1 if minutes == 7 else 0), (
+                minutes, rig.calls)
+            assert rig.provider.blind_reason == "", (
+                f"{minutes} min left: {rig.provider.blind_reason!r}")
+
+    def case_a_tick_that_cannot_take_the_lock_writes_no_stall_reason(
+            self, certdir, monkeypatch):
+        """A request takes the lock between the tick's peek and its acquire.
+        The stall is the holder's to report (its own call, `/health`'s
+        `mint_stalled`); the tick, which only optimises, writes no reason."""
+        from cswap_pin import proxy as pp
+
+        rig = self._rig(certdir, monkeypatch)
+        monkeypatch.setattr(pp, "_MINT_LOCK_BOUND_S", 0.2)
+        release = threading.Event()
+        holder = threading.Thread(
+            target=lambda: (rig.provider.refresh_lock.acquire(),
+                            release.wait(5), rig.provider.refresh_lock.release()),
+            daemon=True)
+        holder.start()
+        while not rig.provider.refresh_lock.locked():
+            time.sleep(0.001)
+        try:
+            assert rig.provider.freshen() is None
+        finally:
+            release.set()
+            holder.join(timeout=2.0)
+        assert rig.provider.mint_stalled() is True, "the stall was not reached"
+        assert rig.calls == [], rig.calls
+        assert rig.provider.blind_reason == "", rig.provider.blind_reason
+
+    def case_a_token_that_dies_while_the_tick_waits_is_left_to_the_request_path(
+            self, certdir, monkeypatch):
+        """The due tick sees a token 5.5 min from expiry (live), then waits
+        on the lock and the store read, and the wall clock crosses into the
+        5-minute buffer meanwhile (the read stands in for that wait, with a
+        store that is not live). The tick returns quietly: no on-demand
+        refresh, so no deferral, no 'unpinned' line, and it leaves the reason
+        a request wrote during that wait (its refresh failed) as it was: a
+        tick with no live token in hand clears nothing."""
+        failure = "refresh transient for slot 2 (pin@example.com)"
+        for label, stored in (("no store", None), ("expired store", "dead")):
+            rig = self._rig(certdir, monkeypatch, outcome="consume-busy",
+                            minutes=5.5)
+            rig.stored = stored and json.dumps({"claudeAiOauth": {
+                "accessToken": "dead", "refreshToken": "rt-dead",
+                "expiresAt": int((rig.now - 600) * 1000)}})
+            rig.on_read = lambda: (
+                rig.advance(60),
+                setattr(rig.provider, "blind_reason", failure))
+            self._tick(rig, certdir, monkeypatch, False)
+            assert len(rig.reads) == 2, f"{label}: the wait did not happen"
+            assert rig.calls == [], f"{label}: a refresh ran: {rig.calls}"
+            assert rig.provider.pin_is_noop() is False, label
+            assert not [ln for ln in rig.lines if "went out unpinned" in ln], (
+                label, rig.lines)
+            assert rig.provider.blind_reason == failure, (
+                f"{label}: {rig.provider.blind_reason!r}")
+
+    def case_a_held_refresh_lock_is_not_waited_on(self, certdir, monkeypatch):
+        """`/health` and the watchdog never queue behind a stalled store
+        (cd3eb0a); the proactive refresh must not either."""
+        from cswap_pin import proxy as pp
+
+        rig = self._rig(certdir, monkeypatch)
+        # A bound the tick would visibly serve out if it queued: a held lock
+        # without the peek costs the whole bound, then reads as a stall.
+        monkeypatch.setattr(pp, "_MINT_LOCK_BOUND_S", 0.5)
+        release = threading.Event()
+        holder = threading.Thread(
+            target=lambda: (rig.provider.refresh_lock.acquire(),
+                            release.wait(5), rig.provider.refresh_lock.release()),
+            daemon=True)
+        holder.start()
+        while not rig.provider.refresh_lock.locked():
+            time.sleep(0.001)
+        try:
+            started = time.monotonic()
+            self._tick(rig, certdir, monkeypatch, False)
+            waited = time.monotonic() - started
+        finally:
+            release.set()
+            holder.join(timeout=2.0)
+        assert waited < 0.25, f"the tick queued behind the lock for {waited:.2f}s"
+        assert rig.calls == []
+
+    def case_the_tick_leaves_a_requests_deferral_mark_alone(
+            self, certdir, monkeypatch):
+        """A request's `consume-busy` mark (`_deferred`, read only by
+        `pin_is_noop`) lasted until the NEXT request, because the tick never
+        called the provider. The tick's early return for a token already past
+        the buffer sat below the provider's own `_deferred.discard(1)`, so
+        with self-heal OFF (nothing else re-adds the mark) a request that was
+        only deferred read `can_pin: false` from the next tick on, and the
+        edge log wrote a `True -> False` the real state never had."""
+        rig = self._rig(certdir, monkeypatch, outcome="consume-busy")
+        rig.advance(3 * 60)                    # 4 min left: past the buffer
+        assert rig.provider() is None          # the request: deferred, not failed
+        assert len(rig.calls) == 1, rig.calls
+        assert rig.provider.pin_is_noop() is True, "the deferral left no mark"
+        assert rig.provider.can_pin_cached() is True
+        edges = self._transitions(rig)
+        self._tick(rig, certdir, monkeypatch, False)
+        assert len(rig.calls) == 1, "the tick spent a grant on a past-buffer token"
+        assert rig.provider.pin_is_noop() is True, (
+            "the tick cleared a request's deferral mark")
+        assert rig.provider.can_pin_cached() is True
+        assert self._transitions(rig) == edges, self._transitions(rig)
 
 
 class TestTheRequestPathNeverOpensTheTraceFile:
@@ -16136,6 +19330,313 @@ class TestAMisroutedSwapCannotKillASession:
             f"a non-pinned route must never retry on refusal: {up.auths_seen}")
 
 
+class TestThePolicyQuestionIsNeverAnsweredAsAnotherAccount:
+    """CC 2.1.286 TEARS DOWN EVERY CONNECTED REMOTE CONTROL BRIDGE when its
+    org-policy verdict turns to an explicit `allow_remote_control` deny, and a
+    FAILED fetch of `/api/claude_code/policy_limits` keeps CC on its cached
+    verdict or the document on disk, so a request this daemon cannot answer as
+    the pin must not be answered as the ACTIVE account: that account's org may
+    deny. A failed or deferred mint, and a pinned token that is still refused
+    after the refetch, answer a local 503 on this ONE route. A pin that is
+    cleared, or that IS the live login, has nothing to swap and keeps relaying
+    on the session's own bearer."""
+
+    POLICY = "/api/claude_code/policy_limits"
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def _provider(self, certdir, monkeypatch, token=lambda n: "",
+                  pinned=True, active="1", busy=False):
+        """A REAL provider over a store whose n-th read answers `token(n)`
+        ("" is an unreadable credential, "expired" an expired one).
+        `pinned=False` is a CLEARED pin; `active="2"` makes the pinned slot
+        the live login; `busy` makes the refresh gate answer `consume-busy`
+        (a deferral)."""
+        import cswap_pin.proxy as pp
+
+        monkeypatch.setattr(
+            pp, "pin_profile_for",
+            lambda token: {"emailAddress": "pin@example.com"})
+        reads = []
+
+        class _Sw:
+            backup_dir = certdir
+
+            def current_account_number(self):
+                return active
+
+            def _get_sequence_data(self):
+                return {"activeAccountNumber": active}
+
+            def read_account_credentials(self, n, e):
+                reads.append(n)
+                t = token(len(reads))
+                if not t:
+                    return ""
+                return json.dumps({"claudeAiOauth": {
+                    "accessToken": t, "refreshToken": "rt",
+                    "expiresAt": 1 if t == "expired" else 4102444800000}})
+
+            def resolve_account(self, i):
+                return ("2", "pin@example.com", "org")
+
+        if busy:
+            from claude_swap.oauth import RefreshOutcome
+            _Sw.consume_backup_grant = lambda self, n, e, snap: \
+                RefreshOutcome(None, "consume-busy")
+        if pinned:
+            pp.save_pin(certdir, "pin@example.com", "org")
+        return pp.make_pin_token_provider(_Sw(), "2", "pin@example.com")
+
+    def _ask(self, certdir, provider, path=None, lines=None,
+             reject=("pin-token",), reject_status=403):
+        """One GET of `path` (the policy route by default) with the session's
+        own bearer through a real daemon; `(status, bearers the upstream
+        saw)`. `lines` collects the lifecycle log."""
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import PinProxy
+
+        upstream = _FakeUpstream(certdir, reject_bearer=set(reject),
+                                 reject_status=reject_status)
+        proxy = PinProxy(certdir=certdir, pin_token_provider=provider,
+                         upstream=("127.0.0.1", upstream.port))
+        real_log = pp._log_lifecycle
+        if lines is not None:
+            pp._log_lifecycle = lines.append
+        proxy.start()
+        try:
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem", path or self.POLICY,
+                bearer="session-bearer", method="GET", body=None)
+            return status, list(upstream.auths_seen)
+        finally:
+            proxy.stop()
+            upstream.stop()
+            pp._log_lifecycle = real_log
+
+    def case_a_failed_mint_answers_503_in_every_form_of_the_route(
+            self, certdir, monkeypatch):
+        """Nothing may leave on the session's bearer, bare, with a query, or
+        with a trailing slash (`is_pinned_route`'s own normalisation). THE
+        CONTROL, same daemon state: another pinned route still falls open."""
+        for path in (self.POLICY, self.POLICY + "?x=1", self.POLICY + "/"):
+            lines = []
+            status, seen = self._ask(
+                certdir, self._provider(certdir, monkeypatch), path, lines)
+            assert status == 503 and seen == [], (
+                f"{path}: a failed mint was relayed as the active account: "
+                f"{status} {seen}")
+            assert any(f"GET {path} refused (503)" in ln
+                       and "org-policy" in ln for ln in lines), lines
+        status, seen = self._ask(
+            certdir, self._provider(certdir, monkeypatch),
+            "/api/oauth/validate")
+        assert status == 200 and seen == ["Bearer session-bearer"], (
+            f"another route must still fail open: {status} {seen}")
+
+    def case_a_deferred_mint_answers_503(self, certdir, monkeypatch):
+        """`consume-busy` (another process holds the slot) yields no token
+        and `pin_is_noop()` reads True, but the answer would still be the
+        ACTIVE account's verdict on a pin that is neither cleared nor the
+        live login."""
+        provider = self._provider(
+            certdir, monkeypatch, lambda n: "expired", busy=True)
+        status, seen = self._ask(certdir, provider)
+        assert provider.pin_is_noop() is True  # the deferral was real
+        assert status == 503 and seen == [], (status, seen)
+
+    def case_a_cleared_pin_and_the_live_login_still_relay(
+            self, certdir, monkeypatch):
+        """Nothing to swap, so the session's own bearer IS the right one."""
+        for name, kw in (("cleared", {"pinned": False}),
+                         ("live login", {"active": "2"})):
+            status, seen = self._ask(
+                certdir, self._provider(certdir, monkeypatch, **kw))
+            assert status == 200 and seen == ["Bearer session-bearer"], (
+                f"{name}: {status} {seen}")
+
+    def case_a_minted_token_still_swaps(self, certdir, monkeypatch):
+        """THE CONTROL: the pin answers as the pin."""
+        status, seen = self._ask(
+            certdir,
+            self._provider(certdir, monkeypatch, lambda n: "pin-token"),
+            reject=())
+        assert status == 200 and seen == ["Bearer pin-token"], (status, seen)
+
+    def case_a_pin_token_still_refused_after_the_refetch_answers_503(
+            self, certdir, monkeypatch):
+        """The take-back must not resend the policy question as the active
+        account: `dead` (no rotation) and `rotated` (a refetch that is
+        refused too). THE CONTROL, same daemon: another pinned route still
+        resends on the session's own bearer and logs `fell-back`."""
+        for name, token, expect in (
+                ("dead", lambda n: "pin-token", ["Bearer pin-token"]),
+                ("rotated", lambda n: "pin-token" if n == 1 else "fresh",
+                 ["Bearer pin-token", "Bearer fresh"])):
+            provider = self._provider(certdir, monkeypatch, token)
+            lines = []
+            status, seen = self._ask(
+                certdir, provider, lines=lines, reject=("pin-token", "fresh"))
+            assert status == 503 and seen == expect, (
+                f"{name}: the refused pin token was resent as another "
+                f"account: {status} {seen}")
+            assert any(f"GET {self.POLICY} refused (503)" in ln
+                       for ln in lines), (name, lines)
+            assert not any("fell-back" in ln and "policy_limits" in ln
+                           for ln in lines), (name, lines)
+            # ONCE: the refusal is one event, and the take-back used to log it
+            # twice (`swap refused ... not resent` and `refused (503)`).
+            assert len([ln for ln in lines if "policy_limits" in ln
+                        and "retried-fresh" not in ln]) == 1, (name, lines)
+            lines.clear()
+            status, seen = self._ask(
+                certdir, provider, "/api/oauth/validate", lines,
+                reject=("pin-token", "fresh"))
+            assert status == 200 and seen[-1] == "Bearer session-bearer", (
+                name, status, seen)
+            assert ("swap refused (403) on GET /api/oauth/validate: "
+                    "fell-back") in lines, (name, lines)
+
+    def _ask_absolute(self, certdir, provider, path=None, lines=None,
+                      reject=("pin-token",)):
+        """The absolute-form twin of `_ask` (`claude remote-control`'s own
+        form): one GET of `path` with the session's own bearer through a real
+        daemon and a recording hop that refuses every bearer in `reject`;
+        `(the reply's first bytes, the requests the hop saw)`."""
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        chain = _RecordingChain(
+            lambda req: (b"HTTP/1.1 403 X\r\nContent-Length: 0\r\n\r\n"
+                         if any(f"Bearer {b}".encode() in req for b in reject)
+                         else b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"))
+        real_log = pp._log_lifecycle
+        if lines is not None:
+            pp._log_lifecycle = lines.append
+        proxy = None
+        try:
+            write_upstream_hint(certdir, f"http://127.0.0.1:{chain.port}")
+            proxy = PinProxy(certdir=certdir, pin_token_provider=provider,
+                             rediscover_chain=True)
+            proxy.start()
+            c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            try:
+                c.sendall(
+                    f"GET https://api.anthropic.com{path or self.POLICY} "
+                    "HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                    "Authorization: Bearer session-bearer\r\n\r\n"
+                    .encode("latin1"))
+                got = c.recv(256)
+            finally:
+                c.close()
+            return got, list(chain.seen)
+        finally:
+            if proxy:
+                proxy.stop()
+            chain.stop()
+            pp._log_lifecycle = real_log
+
+    def case_an_absolute_form_failed_or_deferred_mint_answers_503(
+            self, certdir, monkeypatch):
+        """The MITM rule, on the path `claude remote-control` uses: nothing
+        may leave on the session's bearer, bare, with a query or with a
+        trailing slash, for a failed mint or a deferred one. THE CONTROL,
+        same daemon state: another pinned route still falls open."""
+        for path in (self.POLICY, self.POLICY + "?x=1", self.POLICY + "/"):
+            lines = []
+            got, seen = self._ask_absolute(
+                certdir, self._provider(certdir, monkeypatch), path, lines)
+            assert got.startswith(b"HTTP/1.1 503") and seen == [], (
+                f"{path}: a failed mint was relayed as the active account: "
+                f"{got[:40]!r} {seen}")
+            assert any(f"GET {path} refused (503)" in ln
+                       and "org-policy" in ln for ln in lines), lines
+        got, seen = self._ask_absolute(
+            certdir, self._provider(certdir, monkeypatch, lambda n: "expired",
+                                    busy=True))
+        assert got.startswith(b"HTTP/1.1 503") and seen == [], (
+            f"a deferred mint was relayed: {got[:40]!r} {seen}")
+        got, seen = self._ask_absolute(
+            certdir, self._provider(certdir, monkeypatch),
+            "/api/oauth/validate")
+        assert got.startswith(b"HTTP/1.1 200") and len(seen) == 1 \
+            and b"Bearer session-bearer" in seen[0], (
+            f"another route must still fail open: {got[:40]!r} {seen}")
+
+    def case_an_absolute_form_pin_token_refused_answers_503_without_a_resend(
+            self, certdir, monkeypatch):
+        """The take-back's last send is the session's own bearer, which
+        answers the policy question as the ACTIVE account: `dead` (no
+        rotation) and `rotated` (a refetch refused too). Only pin bearers
+        may reach the hop and the refusal is one log line. THE CONTROL, same
+        daemon: another pinned route still resends and logs `fell-back`."""
+        for name, token, expect in (
+                ("dead", lambda n: "pin-token", [b"Bearer pin-token"]),
+                ("rotated", lambda n: "pin-token" if n == 1 else "fresh",
+                 [b"Bearer pin-token", b"Bearer fresh"])):
+            provider = self._provider(certdir, monkeypatch, token)
+            lines = []
+            got, seen = self._ask_absolute(
+                certdir, provider, lines=lines, reject=("pin-token", "fresh"))
+            assert got.startswith(b"HTTP/1.1 503"), (name, got[:40])
+            assert len(seen) == len(expect) and all(
+                e in r for e, r in zip(expect, seen)) and not any(
+                b"session-bearer" in r for r in seen), (
+                f"{name}: the refused pin token was resent as another "
+                f"account: {seen}")
+            assert len([ln for ln in lines if "policy_limits" in ln
+                        and "retried-fresh" not in ln]) == 1, (name, lines)
+            lines.clear()
+            got, seen = self._ask_absolute(
+                certdir, provider, "/api/oauth/validate", lines,
+                reject=("pin-token", "fresh"))
+            assert got.startswith(b"HTTP/1.1 200") and (
+                b"Bearer session-bearer" in seen[-1]), (name, got[:40], seen)
+            assert ("swap refused (403) on GET /api/oauth/validate: "
+                    "fell-back") in lines, (name, lines)
+
+    def case_an_absolute_form_cleared_pin_and_live_login_still_relay(
+            self, certdir, monkeypatch):
+        """THE CONTROL: nothing to swap, so the session's own bearer is the
+        right one on this path too."""
+        for name, kw in (("cleared", {"pinned": False}),
+                         ("live login", {"active": "2"})):
+            got, seen = self._ask_absolute(
+                certdir, self._provider(certdir, monkeypatch, **kw))
+            assert got.startswith(b"HTTP/1.1 200") and len(seen) == 1 \
+                and b"Bearer session-bearer" in seen[0], (name, got[:40], seen)
+
+    def case_a_policy_503_does_not_silence_a_following_blind_mint_line(
+            self, certdir):
+        """`_refuse_stalled_mint`'s line is rate-limited, and the blind-mint
+        one it writes for a bridge create is load-bearing (a respawning
+        worker would otherwise log one per respawn). An hourly policy 503
+        burst shares none of that budget: its own slot, still limited."""
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import PinProxy
+
+        class Tls:
+            def sendall(self, _b):
+                pass
+
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None)
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        try:
+            proxy._refuse_stalled_mint(Tls(), "GET", self.POLICY, "policy")
+            proxy._refuse_stalled_mint(
+                Tls(), "POST", "/v1/environments/bridge", "blind")
+            proxy._refuse_stalled_mint(Tls(), "GET", self.POLICY, "policy")
+            proxy._refuse_stalled_mint(
+                Tls(), "POST", "/v1/environments/bridge", "blind")
+        finally:
+            pp._log_lifecycle = real_log
+        assert lines == [
+            f"GET {self.POLICY} refused (503): policy",
+            "POST /v1/environments/bridge refused (503): blind"], lines
+
+
 class TestEverySmallCaseHolder:
     """Every small case-holder in this file, as ONE pytest test.
 
@@ -16188,7 +19689,8 @@ class TestAHandoverMidDrainDropsTheClock:
     change mid-wait, which is here.
     """
 
-    def _drain(self, tmp_path, monkeypatch, *, superseded, moving_for=3):
+    def _drain(self, tmp_path, monkeypatch, *, superseded, moving_for=3,
+               owed=None):
         import cswap_pin.proxy as pp
         certdir = tmp_path / "pin-proxy"
         certdir.mkdir(parents=True, exist_ok=True)
@@ -16200,10 +19702,12 @@ class TestAHandoverMidDrainDropsTheClock:
             seen["n"] += 1
             return seen["n"] <= moving_for
 
-        monkeypatch.setattr(proxy, "_owed_still_moving", moving)
+        monkeypatch.setattr(proxy, "_owed_still_moving", owed or moving)
         monkeypatch.setattr(pp, "_superseded_on_the_port",
                             lambda _c: superseded)
-        monkeypatch.setattr(pp.time, "sleep", lambda _s: None)
+        real_sleep, drain = pp.time.sleep, threading.get_ident()
+        monkeypatch.setattr(pp.time, "sleep", lambda s: (
+            real_sleep(s) if threading.get_ident() != drain else None))
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             proxy.await_inflight(5.0)
@@ -16213,6 +19717,8 @@ class TestAHandoverMidDrainDropsTheClock:
             self, tmp_path, monkeypatch):
         out = self._drain(tmp_path, monkeypatch, superseded=True)
         assert "dropping the wall clock" in out, out
+        # THE SUMMARY NAMES THE REGIME IT ENDED IN, not the one it began in.
+        assert "no wall-clock cap" in out and "5s budget" not in out, out
 
     def test_CONTROL_no_successor_means_the_clock_still_binds(
             self, tmp_path, monkeypatch):
@@ -16220,6 +19726,7 @@ class TestAHandoverMidDrainDropsTheClock:
         nothing serving the port, hurrying is correct and the cap stays."""
         out = self._drain(tmp_path, monkeypatch, superseded=False)
         assert "dropping the wall clock" not in out, out
+        assert "a 5s budget" in out, out
 
     def test_CONTROL_the_promotion_happens_at_most_once(
             self, tmp_path, monkeypatch):
@@ -16229,6 +19736,401 @@ class TestAHandoverMidDrainDropsTheClock:
         out = self._drain(tmp_path, monkeypatch, superseded=True,
                           moving_for=25)
         assert out.count("dropping the wall clock") == 1, out
+
+    def test_CONTROL_another_threads_sleep_is_not_swallowed(
+            self, tmp_path, monkeypatch):
+        """T3183: `time.sleep` is the process's, so `_drain`'s no-op stub
+        also swallowed a leaked thread's sleep and let it busy-spin. A sleep
+        on any thread but the drain's goes to the sleep that was in place."""
+        elsewhere, spawned = [], []
+        monkeypatch.setattr(time, "sleep", elsewhere.append)
+
+        def owed(_started):
+            if not spawned:
+                spawned.append(True)
+                other = threading.Thread(target=time.sleep, args=(1e6,))
+                other.start()
+                other.join()
+            return False
+        self._drain(tmp_path, monkeypatch, superseded=False, owed=owed)
+        assert 1e6 in elsewhere, elsewhere
+
+    class _Tunnels:
+        """A pump with one live pair that ends once the tunnel wait has asked
+        about its silence ``life`` times, as a peer closing would. Only that
+        wait asks, so ``polls == 0`` means it never ran."""
+
+        def __init__(self, life=20):
+            self.life, self.polls, self.released = life, 0, 0
+
+        def live_pairs(self, kind=None):
+            return 1 if self.polls < self.life and not self.released else 0
+
+        def quiet_for(self):
+            self.polls += 1
+            return 0.0
+
+        def release_pairs(self, kind=None):
+            live = self.live_pairs()
+            self.released += live
+            return live
+
+    def _drain_a_tunnel(self, tmp_path, monkeypatch, *, superseded, moving_for):
+        import cswap_pin.proxy as pp
+        pump = self._Tunnels()
+        monkeypatch.setattr(pp, "_PUMP", pump)
+        return self._drain(tmp_path, monkeypatch, superseded=superseded,
+                           moving_for=moving_for), pump
+
+    def test_a_promoted_drain_waits_for_the_tunnels_it_would_have_released(
+            self, tmp_path, monkeypatch):
+        """T3100: a TERM drains CAPPED, a successor takes the port inside it,
+        and the replies owed are then waited on with no clock. The tunnels are
+        not replies owed, so the owed loop never waited on them: the drain
+        ended and `release_pairs` cut every Remote Control channel, which
+        Claude Code does not rebuild."""
+        out, pump = self._drain_a_tunnel(
+            tmp_path, monkeypatch, superseded=True, moving_for=3)
+        assert "dropping the wall clock" in out, out
+        assert pump.polls >= pump.life and pump.released == 0, (
+            f"released {pump.released} live tunnel(s) after {pump.polls} of "
+            f"{pump.life} checks of a peer still moving: {out}")
+
+    def test_a_successor_already_on_the_port_waits_for_the_tunnels_too(
+            self, tmp_path, monkeypatch):
+        """The same, when nothing is owed: the owed loop breaks on that BEFORE
+        its superseded check, so the drain is never promoted at all, and a TERM
+        that finds a successor already published still cut the tunnels."""
+        out, pump = self._drain_a_tunnel(
+            tmp_path, monkeypatch, superseded=True, moving_for=0)
+        assert pump.polls >= pump.life and pump.released == 0, (
+            f"released {pump.released} live tunnel(s) with a successor "
+            f"serving: {out}")
+        # A CHANGE OF REGIME IS SAID WHEREVER IT HAPPENS, once, and the
+        # summary names the ceiling that applied at the end.
+        assert out.count("dropping the wall clock") == 1, out
+        assert "no wall-clock cap" in out and "5s budget" not in out, out
+
+    def test_CONTROL_with_no_successor_the_tunnels_are_released_at_the_end(
+            self, tmp_path, monkeypatch):
+        """What keeps the two above from being "always wait": nothing serves
+        the port, the capped arm is holding it dark, and a supervisor counts
+        to `_DRAIN_SECONDS + 2` - the tunnels go as they always did."""
+        import cswap_pin.proxy as pp
+        # T3131: an unheld drain with a tunnel gives a launch `_SPAWN_WAIT_S`
+        # before it asks whether a holder exists, so this one needs a clock.
+        # `_drain` stubs the sleep, so each look at the owed replies moves it
+        # half a second.
+        real, spent = pp.time.monotonic, [0.0]
+        monkeypatch.setattr(pp.time, "monotonic", lambda: real() + spent[0])
+        monkeypatch.setattr(pp, "_holder_owns", lambda *a, **k: False)
+
+        def nothing_owed(_started):
+            spent[0] += 0.5
+            return False
+        pump = self._Tunnels()
+        monkeypatch.setattr(pp, "_PUMP", pump)
+        out = self._drain(tmp_path, monkeypatch, superseded=False,
+                          owed=nothing_owed)
+        assert pump.polls == 0 and pump.released == 1, (
+            f"polls={pump.polls} released={pump.released}: {out}")
+
+    def _drain_for_a_successor(self, tmp_path, monkeypatch, *, holder,
+                               port=lambda t: False,
+                               publishes=float("inf"), held=False, live=20,
+                               read_fails=lambda t: False, emfile=False):
+        """An UNHELD signal drain with live tunnels and nothing owed, on a clock
+        each sleep advances, with the launch's side played as it happens: its
+        `_spawn_daemon` gives up at `_SPAWN_WAIT_S`, where the REAL
+        `_clear_handover_mark` runs. ``holder`` says, from the clock, whether a
+        `--hold-port` process for this certdir exists (`_holder_owns`).
+        ``port`` says what a loopback connect to ANY port meets: True accepts,
+        False is refused, None times out as a loaded host's does. The
+        successor publishes its record at ``publishes``, and
+        `_superseded_on_the_port` reads it for real. ``read_fails`` says, from
+        the clock, that the read itself could not tell (a `ps` that timed out):
+        `_holder_owns` then answers what its caller chose for "cannot tell",
+        its ``unknown``. ``emfile`` leaves `_holder_owns` REAL and fails every
+        `/proc/<pid>/cmdline` read with EMFILE, as a daemon out of descriptors
+        gets. Returns (clock, pump,
+        log, the clock times `_holder_owns` was read at)."""
+        import cswap_pin.proxy as pp
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True, exist_ok=True)
+        pp.write_daemon_state(certdir, 1234, os.getpid(), "fp", handover=True)
+        pump = self._Tunnels(life=live)
+        monkeypatch.setattr(pp, "_PUMP", pump)
+        monkeypatch.setattr(pp, "held_by_a_holder", lambda *a, **k: held)
+        real, clock, done, reads = pp.time.monotonic, [0.0], set(), []
+        monkeypatch.setattr(pp.time, "monotonic", lambda: real() + clock[0])
+        real_sleep, drain = pp.time.sleep, threading.get_ident()
+
+        def sleep(s):
+            if threading.get_ident() != drain:  # not this clock's sleep
+                return real_sleep(s)
+            clock[0] += s
+            if clock[0] >= pp._SPAWN_WAIT_S and "gave up" not in done:
+                done.add("gave up")
+                pp._clear_handover_mark(certdir)
+            if clock[0] >= publishes and "published" not in done:
+                done.add("published")
+                # A LIVE pid that is not this one: the real predicate reads it.
+                pp.write_daemon_state(certdir, 1234, os.getppid(), "fp2")
+        monkeypatch.setattr(pp.time, "sleep", sleep)
+
+        def connect(addr, timeout=None, *a, **k):
+            met = port(clock[0])
+            if met is None:
+                raise TimeoutError("timed out")
+            if not met:
+                raise ConnectionRefusedError(111, "refused")
+            return contextlib.nullcontext()
+        monkeypatch.setattr(pp.socket, "create_connection", connect)
+
+        def owns(cd, unknown=False):
+            assert cd == certdir, cd
+            reads.append(clock[0])
+            return unknown if read_fails(clock[0]) else holder(clock[0])
+        if emfile:
+            real_read = pp.Path.read_bytes
+
+            def read_bytes(self):
+                if self.name == "cmdline":
+                    raise OSError(errno.EMFILE, "Too many open files")
+                return real_read(self)
+            monkeypatch.setattr(pp.Path, "read_bytes", read_bytes)
+        else:
+            monkeypatch.setattr(pp, "_holder_owns", owns)
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
+                            upstream=("127.0.0.1", 1))
+        proxy.port = 1234
+        monkeypatch.setattr(proxy, "_owed_still_moving", lambda _s: False)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            proxy.await_inflight(pp.teardown_drain_budget(
+                "signal SIGTERM", held))
+        return clock[0], pump, err.getvalue(), reads
+
+    def test_an_unheld_drain_waits_out_a_successor_slower_than_the_launchs_wait(
+            self, tmp_path, monkeypatch):
+        """T3131: a launch recycling an UNHELD daemon TERMs it before any
+        successor exists, and the drain owed nothing, so its first look broke
+        on "nothing owed" and `release_pairs` cut every Remote Control channel
+        before `_spawn_daemon` had started a holder. The drain now waits while
+        a `--hold-port` process for its certdir exists, which is true from the
+        holder's exec, before it imports this module or binds anything, and
+        needs no launch to keep it so. The mark the launch writes is no such
+        signal: `_spawn_daemon` gives up at `_SPAWN_WAIT_S` and clears it while
+        the holder is still booting, and a successor was measured at 56-85 s
+        on a loaded host. The holder exists from 0.2 s, its port REFUSES until
+        20 s (the import, the bind), the launch clears the mark at 10 s (the
+        real `_clear_handover_mark`), and the successor publishes at 60 s, past
+        both that and the drain's 30 s cap; `_superseded_on_the_port` is the
+        real one."""
+        import cswap_pin.proxy as pp
+        clock, pump, out, reads = self._drain_for_a_successor(
+            tmp_path, monkeypatch, holder=lambda t: t >= 0.2,
+            port=lambda t: None if t >= 20.0 else False, publishes=60.0)
+        assert pump.polls >= pump.life and pump.released == 0, (
+            f"released {pump.released} live tunnel(s) after {clock:.1f}s "
+            f"with a successor's holder running: {out}")
+        assert clock >= 60.0 and "dropping the wall clock" in out, (clock, out)
+        assert reads, "the drain never asked whether a holder exists"
+
+    def test_a_holder_whose_port_times_out_every_probe_is_still_waited_on(
+            self, tmp_path, monkeypatch):
+        """T3131 review: a booting holder's `listen` backlog has no acceptor
+        for the 56-85 s the daemon takes to start, while live sessions keep
+        dialling it, so a connect can time out at any probe. The file's own
+        rule (`_port_refuses`, T2534/T2554) is that a timeout is a live peer
+        and only a refusal means nobody; the drain asks no port at all, and the
+        holder's existence decides."""
+        clock, pump, out, _ = self._drain_for_a_successor(
+            tmp_path, monkeypatch, holder=lambda t: t >= 0.2,
+            port=lambda t: None, publishes=60.0)
+        assert pump.polls >= pump.life and pump.released == 0, (
+            f"released {pump.released} live tunnel(s) after {clock:.1f}s "
+            f"while the holder's port timed out: {out}")
+        assert clock >= 60.0, (clock, out)
+
+    def test_a_holder_read_that_fails_does_not_end_the_wait(
+            self, tmp_path, monkeypatch):
+        """T3131 review: `_holder_owns` answered False for "cannot tell" (a
+        macOS `ps` that hit its 5 s bound or could not fork, which a loaded
+        host does: the file records multi-second stalls), and in the drain a
+        False ends the wait at once and `release_pairs` cuts every tunnel
+        while the successor's holder runs. The holder exists from 0.2 s, the
+        reads between 12 s and 40 s fail, and the successor publishes at 60 s:
+        a read that fails is not an answer that nobody is coming."""
+        clock, pump, out, _ = self._drain_for_a_successor(
+            tmp_path, monkeypatch, holder=lambda t: t >= 0.2,
+            read_fails=lambda t: 12.0 <= t < 40.0, publishes=60.0)
+        assert pump.polls >= pump.life and pump.released == 0, (
+            f"released {pump.released} live tunnel(s) after {clock:.1f}s "
+            f"because a holder read could not tell: {out}")
+        assert clock >= 60.0, (clock, out)
+
+    def test_CONTROL_a_read_that_always_fails_is_waited_on_to_the_bound_only(
+            self, tmp_path, monkeypatch):
+        """Reading "cannot tell" as a holder is bounded like any other holder:
+        a `ps` that never answers, with no successor ever coming, holds the
+        tunnels to `_RELOCATE_WAIT_S` and then they go as they always did."""
+        import cswap_pin.proxy as pp
+        clock, pump, out, _ = self._drain_for_a_successor(
+            tmp_path, monkeypatch, holder=lambda t: False,
+            read_fails=lambda t: True)
+        assert pump.polls == 0 and pump.released == 1, (pump.polls, out)
+        assert (pp._RELOCATE_WAIT_S - 1.0 <= clock
+                < pp._RELOCATE_WAIT_S + 1.0), clock
+
+    def test_a_daemon_out_of_descriptors_does_not_cut_before_the_bound(
+            self, tmp_path, monkeypatch):
+        """T3131 review: with no descriptor to open /proc/<pid>/cmdline, every
+        read of the real `_holder_owns` failed, each was skipped, and the scan
+        answered "no holder": the drain ended its wait at the end of the grace
+        and cut every tunnel while the successor's holder ran. Nothing read is
+        not a reading of nobody, so it waits like any holder, to the bound."""
+        import cswap_pin.proxy as pp
+        if not os.path.isdir("/proc"):
+            pytest.skip("the /proc scan is Linux's")
+        clock, pump, out, _ = self._drain_for_a_successor(
+            tmp_path, monkeypatch, holder=lambda t: False, emfile=True)
+        assert pump.polls == 0 and pump.released == 1, (pump.polls, out)
+        assert (pp._RELOCATE_WAIT_S - 1.0 <= clock
+                < pp._RELOCATE_WAIT_S + 1.0), (
+            f"the tunnels went at {clock:.1f}s, not at the bound: {out}")
+
+    def test_CONTROL_no_holder_releases_the_tunnels_when_the_grace_ends(
+            self, tmp_path, monkeypatch):
+        """What the wait is NOT: the first `_SPAWN_WAIT_S` cover the moments
+        between the drain's announce and the launch's Popen, when no holder can
+        exist yet, and then a holder decides. None ever (the spawn failed, a
+        bare TERM) releases at the end of the grace: not at 0.0, which cut a
+        tunnel before the holder could start, and not at 180 s."""
+        import cswap_pin.proxy as pp
+        clock, pump, out, _ = self._drain_for_a_successor(
+            tmp_path, monkeypatch, holder=lambda t: False)
+        assert pump.polls == 0 and pump.released == 1, (pump.polls, out)
+        assert pp._SPAWN_WAIT_S <= clock < pp._SPAWN_WAIT_S + 1.0, clock
+
+    def test_CONTROL_a_port_that_answers_without_a_holder_is_no_successor(
+            self, tmp_path, monkeypatch):
+        """The detach arm of `release_listener`: a daemon on an inherited
+        listener (a macOS orphan whose holder was killed) keeps its own fd, or
+        a standby's dup of it, listening after its release, so the old port
+        answers for as long as the process lives with nobody accepting. A
+        port that answers is not a successor coming; only a holder is. The
+        tunnels go at the end of the grace, not at 180 s."""
+        import cswap_pin.proxy as pp
+        clock, pump, out, _ = self._drain_for_a_successor(
+            tmp_path, monkeypatch, holder=lambda t: False,
+            port=lambda t: True)
+        assert pump.polls == 0 and pump.released == 1, (pump.polls, out)
+        assert pp._SPAWN_WAIT_S <= clock < pp._SPAWN_WAIT_S + 1.0, clock
+
+    def test_CONTROL_a_holder_that_dies_releases_the_tunnels(
+            self, tmp_path, monkeypatch):
+        """The holder died with the successor not yet published: the wait ends
+        at the next read, a `_DRAINING_BEAT_SECONDS` apart, not at the bound."""
+        import cswap_pin.proxy as pp
+        clock, pump, out, _ = self._drain_for_a_successor(
+            tmp_path, monkeypatch, holder=lambda t: t < 30.0)
+        assert pump.polls == 0 and pump.released == 1, (pump.polls, out)
+        assert 30.0 <= clock < 30.0 + pp._DRAINING_BEAT_SECONDS + 1.0, clock
+
+    def test_CONTROL_a_holder_that_never_gets_a_successor_up_is_waited_on_to_a_bound(
+            self, tmp_path, monkeypatch):
+        """The wait is bounded by `_RELOCATE_WAIT_S`, the longest a successor
+        was measured to take (56-85 s, T1935) with margin: a holder that never
+        gets a successor up does not hold the tunnels for ever, and past the
+        bound they go as they always did. And the read costs a /proc scan (a
+        5 s `ps` on macOS), so it is one per `_DRAINING_BEAT_SECONDS`, not one
+        per 50 ms pass of the loop."""
+        import cswap_pin.proxy as pp
+        clock, pump, out, reads = self._drain_for_a_successor(
+            tmp_path, monkeypatch, holder=lambda t: True)
+        assert pump.polls == 0 and pump.released == 1, (pump.polls, out)
+        assert (pp._RELOCATE_WAIT_S - 1.0 <= clock
+                < pp._RELOCATE_WAIT_S + 1.0), clock
+        assert len(reads) <= pp._RELOCATE_WAIT_S / pp._DRAINING_BEAT_SECONDS + 1, (
+            f"{len(reads)} reads in {clock:.0f}s")
+
+    def test_CONTROL_another_threads_sleep_does_not_move_the_clock(
+            self, tmp_path, monkeypatch):
+        """T3181: `time.sleep` is the process's, so a leaked thread sleeping
+        while a drain here ran moved the clock (CI read 194099 s). A sleep on
+        any thread but the drain's goes to the sleep that was in place."""
+        import cswap_pin.proxy as pp
+        elsewhere, spawned = [], []
+        monkeypatch.setattr(time, "sleep", elsewhere.append)
+
+        def holder(_t):
+            if not spawned:
+                spawned.append(True)
+                other = threading.Thread(target=time.sleep, args=(1e6,))
+                other.start()
+                other.join()
+            return True
+        clock, *_ = self._drain_for_a_successor(
+            tmp_path, monkeypatch, holder=holder)
+        assert clock < pp._RELOCATE_WAIT_S + 1.0, clock
+        assert 1e6 in elsewhere, elsewhere
+
+    def test_CONTROL_no_live_tunnel_or_a_held_daemon_waits_for_nothing(
+            self, tmp_path, monkeypatch):
+        """What keeps the wait from being "every signal drain waits": a drain
+        with no tunnel to cut, and a HELD one (the holder puts the successor on
+        its own socket, T3107's arm), end at the first look as before, however
+        the holder reads."""
+        for i, (kw, want_released) in enumerate((
+                ({"live": 0}, 0), ({"held": True}, 1))):
+            clock, pump, out, reads = self._drain_for_a_successor(
+                tmp_path / str(i), monkeypatch, holder=lambda t: True, **kw)
+            assert pump.released == want_released and clock < 1.0, (
+                kw, clock, pump.released, out)
+            assert reads == [], (kw, reads)
+
+    def test_a_tunnel_gone_quiet_still_leaves_a_superseded_drain(
+            self, tmp_path, monkeypatch):
+        """The wait is the uncapped arm's own, silence exit included: a wedged
+        peer is released rather than holding the process open for ever."""
+        import cswap_pin.proxy as pp
+        pump = self._Tunnels()
+        pump.quiet_for = lambda: pp._DRAINING_MARKER_TTL + 1.0
+        monkeypatch.setattr(pp, "_PUMP", pump)
+        out = self._drain(tmp_path, monkeypatch, superseded=True, moving_for=0)
+        assert "quiet for" in out and pump.released == 1, out
+
+    def test_a_reply_that_starts_during_the_tunnel_wait_finishes(
+            self, tmp_path, monkeypatch):
+        """T3100: a superseded capped drain waits on the tunnels after the owed
+        loop, and that wait can last hours. A reply that starts inside it is
+        owed from then on (a connection stays open through a drain), but the
+        owed loop was not entered again, so the release that follows the wait
+        cut it. It is waited on again, on no clock: the clock here runs 10 s
+        per look at the tunnels, far past the 5 s budget, by the time the
+        reply is looked at."""
+        import cswap_pin.proxy as pp
+        pump = self._Tunnels()
+        monkeypatch.setattr(pp, "_PUMP", pump)
+        real = pp.time.monotonic
+        monkeypatch.setattr(pp.time, "monotonic",
+                            lambda: real() + 10.0 * pump.polls)
+        looks = []
+
+        def owed(_started):
+            """Nothing is owed until the tunnel wait has run; then a reply
+            that began during it is owed for three looks, and the next
+            finds it done."""
+            looks.append(pump.polls)
+            return pump.polls > 0 and sum(map(bool, looks)) <= 3
+
+        self._drain(tmp_path, monkeypatch, superseded=True, owed=owed)
+        after = [p for p in looks if p > 0]
+        assert len(after) == 4 and pump.released == 0, (
+            f"{len(after)} look(s) at the reply after the tunnel wait, "
+            f"released {pump.released}: a reply that began during the wait "
+            "was cut, or the clock was not dropped")
 
 
 class TestARequestThatArrivesMidDrainIsNotBornStale:
@@ -16590,6 +20492,27 @@ class TestASpuriousStream404DoesNotEndTheSession:
         assert got.startswith(b"HTTP/1.1 200"), got[:40]
 
 
+def _no_5h_headers(seven="0.96") -> bytes:
+    """The rate-limit headers of a /v1/messages 200 for an account whose 5h
+    limit Anthropic removed (measured 2026-10-31, account 8): a 7d reading and
+    NO `5h-utilization`, `5h-reset`, `5h-status` or `grace-5h-utilization`."""
+    return (
+        b"anthropic-ratelimit-unified-representative-claim: seven_day\r\n"
+        b"anthropic-ratelimit-unified-status: allowed_warning\r\n"
+        b"anthropic-ratelimit-unified-reset: 1793944800\r\n"
+        b"anthropic-ratelimit-unified-7d-utilization: %s\r\n"
+        b"anthropic-ratelimit-unified-7d-reset: 1793944800\r\n"
+        b"anthropic-ratelimit-unified-7d-status: allowed_warning\r\n"
+        b"anthropic-ratelimit-unified-7d-surpassed-threshold: 0.75\r\n"
+        b"anthropic-ratelimit-unified-fallback: available\r\n"
+        b"anthropic-ratelimit-unified-fallback-percentage: 0.5\r\n"
+        b"anthropic-ratelimit-unified-overage-status: rejected\r\n"
+        b"anthropic-ratelimit-unified-overage-disabled-reason: "
+        b"org_level_disabled\r\n"
+        b"anthropic-ratelimit-unified-upgrade-paths: overage\r\n"
+        % str(seven).encode())
+
+
 class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
     """A 429 on /v1/messages sleeps the client for the WHOLE reset window of
     the account it walled; a credential swap underneath that sleep does not
@@ -16606,11 +20529,13 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
     RESET_HEADER = b"anthropic-ratelimit-unified-reset: 9999999999"
     RESET_HEADER_2 = b"anthropic-ratelimit-unified-reset: 8888888888"
     RETRY_AFTER = b"retry-after: 3600"
+    CLAIM = b"anthropic-ratelimit-unified-representative-claim: "
     UNIFIED_STATUS = b"anthropic-ratelimit-unified-status: allowed_warning"
     SHOULD_RETRY = b"x-should-retry: true"
     LIVE = "live-account-token"
     HEADROOM = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 20.0}}
     NO_HEADROOM = {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 20.0}}
+    EOF_GRACE = 5  # seconds `_relay` waits for the drain's EOF
 
     @staticmethod
     def _no_real_wait(monkeypatch):
@@ -16639,7 +20564,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
               validated=True, before=None, live_token=None, usage=None,
               snap=None, live_num="1", entry_walled=False,
               record_usage_headers=None, fleet=None, disabled=None,
-              reason="candidates-exhausted"):
+              reason="candidates-exhausted", stored=None):
         """Stub claude_swap's switcher so no real account store is touched.
 
         ``validated=None`` omits the key entirely (an older cswap that never
@@ -16679,9 +20604,15 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         parameter existed, which is what keeps every case that does not pass
         it exercising the plain strip. A ``fleet`` usage dict may carry
         ``_reset_ts`` directly (the fake ``poll_policy.limiting_reset_ts``
-        reads that key rather than parsing an ISO string). ``disabled``
+        reads that key), or each window its own ``resets_at`` as an epoch
+        float (the fake then takes the latest >=100% one, as the real rule
+        does, and ``parse_reset_ts`` is the identity). ``disabled``
         names which of ``fleet``'s accounts ``is_account_disabled`` answers
-        True for. ``reason`` overrides the default ``switched=False``
+        True for. ``stored`` maps an account to the ``last_good`` its entry
+        carries when that differs from its decision value (a slot cswap
+        walled: the decision value is the synthetic one, ``last_good`` the
+        reading actually measured; ``None`` is no reading); every other
+        account's ``last_good`` is its decision value. ``reason`` overrides the default ``switched=False``
         reason string."""
         from cswap_pin import proxy as pp
 
@@ -16723,19 +20654,20 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                 # helper's own `except` and the unmanaged-login case passes
                 # whatever the code does.
                 None: types.SimpleNamespace(
-                    decision_value=lambda:{
+                    decision_value=lambda: {
                         "five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0}}),
                 "2": types.SimpleNamespace(
-                    decision_value=lambda:{
+                    decision_value=lambda: {
                         "five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0}}),
                 "1": types.SimpleNamespace(
-                    decision_value=lambda:usage,
-                    walled=entry_walled),
+                    decision_value=lambda: usage,
+                    walled=entry_walled, last_good=usage),
             }
             for num, fusage in (fleet or {}).items():
                 entries[num] = types.SimpleNamespace(
                     decision_value=(lambda u: (lambda: u))(fusage),
-                    walled=False)
+                    walled=False,
+                    last_good=(stored or {}).get(num, fusage))
             return entries
 
         _attrs = dict(
@@ -16744,6 +20676,9 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             current_account_number=(
                 live_num if callable(live_num) else lambda: live_num),
             usage_entries_by_account=_usage_entries_by_account,
+            # Every slot holds one fixed account: a wall write needs a roster
+            # that answers (an unreadable one writes no wall).
+            resolve_account=lambda num: (num, f"acct-{num}@example.com", "org"),
         )
         if record_usage_headers is not None:
             _attrs["record_usage_headers"] = record_usage_headers
@@ -16754,10 +20689,19 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             "ClaudeAccountSwitcher": staticmethod(
                 lambda: types.SimpleNamespace(**_attrs)),
         })()
+        def _limiting_reset_ts(u, models=()):
+            # a dict-level `_reset_ts` wins; otherwise the real rule: the
+            # latest `resets_at` among the >=100% windows (epoch floats here)
+            if not isinstance(u, dict):
+                return None
+            if "_reset_ts" in u:
+                return u["_reset_ts"]
+            return max((ra for _, pct, ra in pp.oauth.relevant_windows(u, models)
+                        if pct >= 100.0 and ra is not None), default=None)
+
         fake_poll_policy = type("PP", (), {
-            "limiting_reset_ts": staticmethod(
-                lambda u, models=(): (
-                    u.get("_reset_ts") if isinstance(u, dict) else None)),
+            "limiting_reset_ts": staticmethod(_limiting_reset_ts),
+            "parse_reset_ts": staticmethod(lambda r: r),
         })()
 
         def _require(name):
@@ -16770,6 +20714,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         pp._walled_slots.clear()
         pp._walled_switch_seen_by_session.clear()
         pp._walled_headroom_seen.clear()
+        pp._walled_slot_occupant.clear()
         pp._walled_conversions_by_session.clear()
         pp._walled_relay_spell_by_session.clear()
         TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount._no_real_wait(
@@ -16788,11 +20733,31 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
 
     @classmethod
     def _relay(cls, path="/v1/messages", reset=None, status=b"429 Too Many Requests",
-               auth="", session="", extra_headers=b"", retry_after=None):
+               auth="", session="", extra_headers=b"", body=b"no", withhold=0,
+               framed=True, method="POST", retry_after=None):
+        """``withhold`` holds back that many trailing body bytes and sends
+        them after a delay, so the head read ends before the body does.
+        ``framed=False`` omits `Content-Length`.
+
+        Both ends run from threads over sockets shrunk to macOS's 8 KB
+        AF_UNIX buffer (Linux's is ~208 KB): a body past 8 KB written whole
+        before the relay ran blocked there on macOS CI (T1891). Returns
+        every byte the client was sent.
+
+        The drain waits unbounded while the relay runs, but not for the EOF
+        after it (T1961): trunk CI on macOS hung >300 s there, `cl_a`'s
+        `SHUT_WR` never waking the blocked `recv`. Every byte is queued once
+        the relay returns, so after `EOF_GRACE` the drain is woken instead."""
+        import errno as _errno
+        import os as _os
         import socket as _s
+        import warnings
         from cswap_pin import proxy as pp
         up_a, up_b = _s.socketpair()
         cl_a, cl_b = _s.socketpair()
+        for x in (up_a, up_b, cl_a, cl_b):
+            x.setsockopt(_s.SOL_SOCKET, _s.SO_SNDBUF, 4096)
+            x.setsockopt(_s.SOL_SOCKET, _s.SO_RCVBUF, 4096)
         try:
             head = b"HTTP/1.1 " + status + b"\r\n"
             if reset is not False:  # False omits the header entirely
@@ -16800,17 +20765,184 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             head += ((retry_after or cls.RETRY_AFTER) + b"\r\n"
                      + cls.UNIFIED_STATUS + b"\r\n"
                      + cls.SHOULD_RETRY + b"\r\n" + extra_headers
-                     + b"Content-Length: 2\r\n\r\nno")
-            up_b.sendall(head)
-            up_b.shutdown(_s.SHUT_WR)
-            pp._relay_response(up_a, cl_a, 0, method="POST", path=path,
+                     + (b"Content-Length: %d\r\n" % len(body) if framed else b"")
+                     + b"\r\n")
+            early, late = ((body[:-withhold], body[-withhold:]) if withhold
+                           else (body, b""))
+            got = []
+
+            def _feed():
+                try:
+                    up_b.sendall(head + early)
+                    if late:
+                        time.sleep(0.1)
+                        up_b.sendall(late)
+                    up_b.shutdown(_s.SHUT_WR)
+                except OSError:  # the relay finished and the sockets closed first
+                    pass
+
+            def _drain():
+                while True:
+                    try:
+                        chunk = cl_b.recv(65536)
+                    except TimeoutError:  # re-poll: XNU left an untimed recv asleep (T2609)
+                        continue
+                    except OSError:  # the SHUT_RD wake below, where it raises
+                        return
+                    if not chunk:
+                        return
+                    got.append(chunk)
+            cl_b.settimeout(0.25)
+            reader = threading.Thread(target=_drain, daemon=True)
+            threading.Thread(target=_feed, daemon=True).start()
+            reader.start()
+            st0 = _os.fstat(cl_a.fileno())
+            pp._relay_response(up_a, cl_a, 0, method=method, path=path,
                                auth=auth, session=session)
             cl_a.shutdown(_s.SHUT_WR)
-            return cl_b.recv(4096)
+            reader.join(cls.EOF_GRACE)
+            if reader.is_alive():
+                # `same_inode` False would mean the fd was reused under us
+                st = _os.fstat(cl_a.fileno())
+                # a warning, not stderr: pytest keeps it on a PASSING run
+                warnings.warn("_relay: no EOF after SHUT_WR, woke the drain "
+                              f"(cl_a fd={cl_a.fileno()} same_inode="
+                              f"{(st.st_dev, st.st_ino) == (st0.st_dev, st0.st_ino)})")
+                try:  # XNU's SHUT_RD flushes unread data: never wake over some
+                    pending = cl_b.recv(1, _s.MSG_PEEK | _s.MSG_DONTWAIT)
+                except (BlockingIOError, TimeoutError):  # a timed socket polls first
+                    pending = b""
+                assert not pending, ("missed wakeup with data queued: the "
+                                     "drain left bytes unread, SHUT_RD would drop them")
+                why = "SHUT_RD did not wake the drain"
+                try:
+                    cl_b.shutdown(_s.SHUT_RD)
+                except OSError as e:
+                    why = (f"EOF arrived but the blocked recv was not woken: "
+                           f"SHUT_RD raised errno {e.errno} ({e.strerror})")
+                    # ENOTCONN: the peer's EOF landed after the join timeout (XNU, T2534)
+                    if e.errno != _errno.ENOTCONN:
+                        raise AssertionError(why) from e
+                reader.join(cls.EOF_GRACE)
+                assert not reader.is_alive(), why
+            return b"".join(got)
         finally:
             for x in (up_a, up_b, cl_a, cl_b):
                 try: x.close()
                 except OSError: pass
+
+    def case_a_withheld_eof_is_woken_not_waited_for(self, monkeypatch):
+        """T1961. Trunk CI on macOS hung >300 s in `_relay`'s `reader.join()`:
+        the relay had returned and `cl_a.shutdown(SHUT_WR)` had run, yet the
+        drain never saw EOF. THE INJECTED FAULT is that FIN, swallowed here
+        (no other `SHUT_WR` matters: the response is framed). The helper must
+        wake the drain itself, keep every byte, and warn so."""
+        self._wire(monkeypatch, switched=False)
+        monkeypatch.setattr(type(self), "EOF_GRACE", 0.2)
+        real = socket.socket.shutdown
+        monkeypatch.setattr(socket.socket, "shutdown", lambda s, how: (
+            None if how == socket.SHUT_WR else real(s, how)))
+        body = b"0123456789" * 1000
+        with pytest.warns(UserWarning, match="no EOF after SHUT_WR, woke the drain"):
+            got = self._relay(status=b"200 OK", reset=False, body=body)
+        assert got.startswith(b"HTTP/1.1 200") and got.endswith(body), got[:40]
+
+    def case_a_wake_that_finds_data_queued_fails_naming_it(self, monkeypatch):
+        """T1961. XNU's `SHUT_RD` flushes unread receive data, so a drain that
+        missed a wakeup with bytes queued must fail the helper rather than
+        have them discarded. THE INJECTED FAULT: the peek reports a byte."""
+        self._wire(monkeypatch, switched=False)
+        monkeypatch.setattr(type(self), "EOF_GRACE", 0.2)
+        real_shut, real_recv = socket.socket.shutdown, socket.socket.recv
+        monkeypatch.setattr(socket.socket, "shutdown", lambda s, how: (
+            None if how == socket.SHUT_WR else real_shut(s, how)))
+
+        def _recv(s, n, flags=0):
+            if not flags & socket.MSG_PEEK:
+                return real_recv(s, n, flags)
+            real_shut(s, socket.SHUT_RD)  # end the blocked drain; not the fault
+            return b"x"
+        monkeypatch.setattr(socket.socket, "recv", _recv)
+        with pytest.raises(AssertionError, match="missed wakeup with data queued"), \
+                pytest.warns(UserWarning):
+            self._relay(status=b"200 OK", reset=False)
+
+    @staticmethod
+    def _refuse_the_wake(monkeypatch, err, wakes):
+        """Swallow `SHUT_WR`, and make `SHUT_RD` raise `err` after (`wakes`)
+        or instead of the real shutdown that ends the blocked drain."""
+        real = socket.socket.shutdown
+
+        def _shutdown(s, how):
+            if how == socket.SHUT_WR:
+                return
+            if how == socket.SHUT_RD:
+                if wakes:
+                    real(s, how)
+                raise OSError(err, "refused")
+            real(s, how)
+        monkeypatch.setattr(socket.socket, "shutdown", _shutdown)
+
+    def case_an_enotconn_wake_after_the_eof_arrived_returns_every_byte(self, monkeypatch):
+        """T2534. macOS CI flaked: the peer's EOF landed between the join timeout
+        and `SHUT_RD`, which XNU refuses with ENOTCONN because the socket had
+        already ended. THE INJECTED FAULT: `SHUT_RD` raises ENOTCONN after the
+        drain was ended. That is an EOF, not a missed wakeup."""
+        import errno
+        self._wire(monkeypatch, switched=False)
+        monkeypatch.setattr(type(self), "EOF_GRACE", 0.2)
+        self._refuse_the_wake(monkeypatch, errno.ENOTCONN, wakes=True)
+        body = b"0123456789" * 1000
+        with pytest.warns(UserWarning, match="no EOF after SHUT_WR, woke the drain"):
+            got = self._relay(status=b"200 OK", reset=False, body=body)
+        assert got.startswith(b"HTTP/1.1 200") and got.endswith(body), got[:40]
+
+    def case_a_drain_asleep_in_an_untimed_recv_is_not_left_blocked(self, monkeypatch):
+        """T2609. macOS CI: the EOF reached `cl_b` (`SHUT_RD` raised ENOTCONN) yet
+        the recv already asleep was never woken. THE INJECTED FAULT is that recv:
+        an untimed one in the drain thread delivers data but sleeps past the
+        join instead of returning EOF. The drain must poll with a timeout."""
+        import errno
+        self._wire(monkeypatch, switched=False)
+        monkeypatch.setattr(type(self), "EOF_GRACE", 0.2)
+        self._refuse_the_wake(monkeypatch, errno.ENOTCONN, wakes=True)
+        real_recv, main = socket.socket.recv, threading.main_thread()
+
+        def _recv(s, n, flags=0):
+            data = real_recv(s, n, flags)
+            # only the drain recvs off the main thread; bounded so a red run ends
+            if (not data and flags == 0 and s.gettimeout() is None
+                    and threading.current_thread() is not main):
+                threading.Event().wait(3)
+            return data
+        monkeypatch.setattr(socket.socket, "recv", _recv)
+        body = b"0123456789" * 1000
+        with pytest.warns(UserWarning, match="no EOF after SHUT_WR, woke the drain"):
+            got = self._relay(status=b"200 OK", reset=False, body=body)
+        assert got.startswith(b"HTTP/1.1 200") and got.endswith(body), got[:40]
+
+    def case_an_enotconn_wake_that_ended_nothing_fails_naming_the_errno(self, monkeypatch):
+        """T2534. ENOTCONN is only an EOF that already arrived when the drain then
+        ends. THE INJECTED FAULT: `SHUT_RD` raises it and ends nothing, so the
+        drain stays blocked and the helper must say which errno, not hang."""
+        import errno
+        self._wire(monkeypatch, switched=False)
+        monkeypatch.setattr(type(self), "EOF_GRACE", 0.2)
+        self._refuse_the_wake(monkeypatch, errno.ENOTCONN, wakes=False)
+        with pytest.raises(AssertionError, match=r"not woken.*errno %d" % errno.ENOTCONN), \
+                pytest.warns(UserWarning):
+            self._relay(status=b"200 OK", reset=False)
+
+    def case_any_other_refused_wake_fails_naming_the_errno(self, monkeypatch):
+        """T2534. Only ENOTCONN reads as an EOF: EINVAL after the drain ended
+        still fails, naming its errno."""
+        import errno
+        self._wire(monkeypatch, switched=False)
+        monkeypatch.setattr(type(self), "EOF_GRACE", 0.2)
+        self._refuse_the_wake(monkeypatch, errno.EINVAL, wakes=True)
+        with pytest.raises(AssertionError, match=r"not woken.*errno %d" % errno.EINVAL), \
+                pytest.warns(UserWarning):
+            self._relay(status=b"200 OK", reset=False)
 
     def case_a_successful_switch_rewrites_429_to_401(self, monkeypatch):
         self._wire(monkeypatch, switched=True)
@@ -16891,8 +21023,8 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         earliest = now + 100
         self._wire(
             monkeypatch, switched=False,
-            fleet={"6": {"five_hour": {"pct": 100.0},
-                         "seven_day": {"pct": 0.0}, "_reset_ts": earliest}},
+            fleet={"6": {"five_hour": {"pct": 100.0, "resets_at": earliest},
+                         "seven_day": {"pct": 0.0}}},
         )
         upstream_reset = int(now) + 86400 * 3
         got = self._relay(
@@ -17090,7 +21222,6 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         from cswap_pin import proxy as pp
         for usage in (
             {"five_hour": {"pct": 10.0}},
-            {"seven_day": {"pct": 10.0}},
             {"scoped": [{"name": "Fable", "pct": 10.0}]},
         ):
             self._wire(monkeypatch, switched=False,
@@ -17181,13 +21312,56 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert headers["anthropic-ratelimit-unified-5h-utilization"] == "0.42", (
             recorded)
 
-    def case_no_5h_header_never_calls_record(self, monkeypatch):
+    def case_a_reply_with_no_utilization_header_at_all_never_calls_record(
+        self, monkeypatch,
+    ):
         self._run_usage_thread_synchronously(monkeypatch)
         recorded = []
         self._wire(monkeypatch, switched=True, live_token=self.LIVE,
                    record_usage_headers=lambda *a: recorded.append(a))
         self._relay(status=b"200 OK", reset=False, auth="Bearer " + self.LIVE)
         assert not recorded, recorded
+
+    def case_a_200_with_7d_headers_and_no_5h_header_records_the_7d_reading(
+        self, monkeypatch,
+    ):
+        """T3114: an account whose 5h limit is gone replies with a 7d reading
+        and no 5h header. It is a no-5h account, not an unmeasured one: the
+        reading goes to the store call with no 5h value in it (absent, never
+        0)."""
+        self._run_usage_thread_synchronously(monkeypatch)
+        recorded = []
+        self._wire(monkeypatch, switched=True, live_token=self.LIVE,
+                   live_num="8",
+                   record_usage_headers=lambda num, headers:
+                       recorded.append((num, headers)))
+        self._relay(status=b"200 OK", reset=False, auth="Bearer " + self.LIVE,
+                    extra_headers=_no_5h_headers())
+        assert len(recorded) == 1, recorded
+        num, headers = recorded[0]
+        assert num == "8", recorded
+        assert headers["anthropic-ratelimit-unified-7d-utilization"] == "0.96", (
+            recorded)
+        assert not [k for k in headers if "5h" in k], headers
+
+    def case_cswap_refusing_a_7d_only_reading_costs_the_reply_nothing(
+        self, monkeypatch,
+    ):
+        """A cswap older than its T3160 answers False for a reading with no 5h
+        value: the reply is relayed and nothing is logged as a raise."""
+        from cswap_pin import proxy as pp
+        logged = []
+        monkeypatch.setattr(pp, "_log_lifecycle", logged.append)
+        self._run_usage_thread_synchronously(monkeypatch)
+        asked = []
+        self._wire(monkeypatch, switched=True, live_token=self.LIVE,
+                   record_usage_headers=lambda *a: asked.append(a) or False)
+        got = self._relay(status=b"200 OK", reset=False,
+                          auth="Bearer " + self.LIVE,
+                          extra_headers=_no_5h_headers())
+        assert got.startswith(b"HTTP/1.1 200"), got[:40]
+        assert len(asked) == 1, asked
+        assert not any("usage-header record raised" in m for m in logged), logged
 
     def case_many_200s_inside_30s_spawn_one_thread(self, monkeypatch):
         """T1178: moving the throttle inside `_run` left NOTHING in front
@@ -17774,6 +21948,41 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         got = self._relay(auth="Bearer stale-account-token")
         assert got.startswith(b"HTTP/1.1 401"), got[:40]
         assert not calls, calls
+
+    def case_a_no_5h_account_has_its_headroom_from_its_week(self, monkeypatch):
+        """T3114. The row of an account whose 5h limit is gone has no
+        `five_hour` key (cswap's poller omits it) and a readable week, so its
+        headroom is the week's alone (a scoped window never counts here, the
+        5h/7d-only basis), as the affinity rule reads the same row: a
+        complete reading, not an unknown one. Unknown
+        stays unknown (fails open, T1178) for a 5h key that is there and
+        unreadable, for no 7d window, and for a 5h window the fresh reading
+        dropped as rolled while `last_good` still has the key."""
+        from cswap_pin import proxy as pp
+        past = time.time() - 3600
+        week = {"seven_day": {"pct": 40.0}}
+        for what, usage, stored, want in (
+                ("week alone", week, None, 60.0),
+                ("week full", {"seven_day": {"pct": 100.0}}, None, 0.0),
+                ("week and scoped", {**week, "scoped": [
+                    {"name": "Fable", "pct": 90.0}]}, None, 60.0),
+                ("5h unreadable", {**week, "five_hour": {"pct": None}},
+                 None, None),
+                ("no 7d window", {"scoped": [{"name": "Fable", "pct": 90.0}]},
+                 None, None),
+                ("5h rolled out of the fresh reading", week,
+                 {"five_hour": {"pct": 30.0, "resets_at": past}, **week},
+                 None)):
+            self._wire(monkeypatch, switched=False, fleet={"6": usage},
+                       stored={"6": stored or usage})
+            assert pp._live_account_headroom("6") == want, what
+        # and through the bearer branch: a full week is a KNOWN wall there,
+        # so the stale bearer is not converted and switch() is asked
+        calls = self._wire(monkeypatch, switched=False, live_token=self.LIVE,
+                           usage={"seven_day": {"pct": 100.0}})
+        got = self._relay(auth="Bearer stale-account-token")
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert len(calls) == 1, len(calls)
 
     def case_a_scoped_only_reading_converts(self, monkeypatch):
         """INVERTED (T1178): with no 5h/7d measured at all this reading is
@@ -18400,7 +22609,8 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
     @staticmethod
     def _wire_exclude_capable(monkeypatch, switched, exclude_param=True,
                                validated=True, live_token=None, live_num="1",
-                               before=None):
+                               before=None, occupant=None,
+                               refused_param=False, kwargs_log=None):
         """`ClaudeAccountSwitcher` as a real CLASS carrying `switch` as an
         ordinary method, so `_switch_takes_exclude`'s
         `inspect.signature(...ClaudeAccountSwitcher.switch)` can actually see
@@ -18410,19 +22620,47 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         which is what keeps every case above this one immune to the
         re-decide gate regardless of timing. This wiring is what exercises
         it. ``before``, as in `_wire`, runs at the top of `switch()`, for a
-        case that needs to block inside it."""
+        case that needs to block inside it. ``occupant`` is a ``{slot:
+        email}`` map `resolve_account` answers from, live, so a case can
+        change who holds a slot between two relays (`cswap move`); omitted,
+        every slot holds one fixed account of its own. ``refused_param``
+        adds `current_refused` to the signature (a host that can mark a
+        refusal); without it the signature is `exclude` alone, the older
+        host. ``kwargs_log``, when given, collects every `switch()` call's
+        keyword arguments as a dict, which `calls` (the `exclude` values)
+        cannot say. ``switched`` and ``live_token`` may be callables, a
+        fleet that moves: ``switched(exclude)`` answers whether this call
+        lands, ``live_token()`` which bearer is live now."""
+        from claude_swap.exceptions import AccountNotFoundError
         from cswap_pin import proxy as pp
         calls = []
 
         def _read_credentials(self):
             if live_token is None:
                 raise OSError("credential store unreadable")
-            return json.dumps({"claudeAiOauth": {"accessToken": live_token}})
+            return json.dumps({"claudeAiOauth": {"accessToken": (
+                live_token() if callable(live_token) else live_token)}})
 
         def _current_account_number(self):
             return live_num() if callable(live_num) else live_num
 
-        if exclude_param:
+        if refused_param:
+            def _switch(self, strategy=None, json_output=False, models=None,
+                        current_at_limit=False, current_refused=False,
+                        exclude=None):
+                calls.append(exclude)
+                if kwargs_log is not None:
+                    kwargs_log.append(dict(
+                        strategy=strategy, json_output=json_output,
+                        models=models, current_at_limit=current_at_limit,
+                        current_refused=current_refused, exclude=exclude))
+                if before is not None:
+                    before()
+                did = switched(exclude) if callable(switched) else switched
+                return {"switched": did, "needsLogin": False,
+                        "validated": validated,
+                        "reason": None if did else "candidates-exhausted"}
+        elif exclude_param:
             def _switch(self, strategy=None, json_output=False, models=None,
                         current_at_limit=False, exclude=None):
                 calls.append(exclude)
@@ -18441,17 +22679,32 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                         "validated": validated,
                         "reason": None if switched else "candidates-exhausted"}
 
-        fake_switcher = type("FakeSwitcher", (), {
+        attrs = {
             "_read_credentials": _read_credentials,
             "current_account_number": _current_account_number,
             "switch": _switch,
-        })
+        }
+        def _resolve_account(self, num):
+            if occupant is None:
+                return (num, f"acct-{num}@example.com", "org")
+            if num not in occupant:
+                raise AccountNotFoundError(num)
+            return (num, occupant[num], "org")
+
+        attrs["resolve_account"] = _resolve_account
+        if occupant is not None:
+            attrs["_get_sequence_data"] = lambda self: {"accounts": {
+                n: {"email": e, "organizationUuid": "org"}
+                for n, e in list(occupant.items())}}
+        fake_switcher = type("FakeSwitcher", (), attrs)
         fake_module = type("M", (), {"ClaudeAccountSwitcher": fake_switcher})()
         monkeypatch.setattr(pp, "require", lambda n: fake_module)
         pp._walled_switch_seen.clear()
         pp._walled_slots.clear()
+        pp._refused_slots.clear()
         pp._walled_switch_seen_by_session.clear()
         pp._walled_headroom_seen.clear()
+        pp._walled_slot_occupant.clear()
         pp._walled_conversions_by_session.clear()
         pp._walled_relay_spell_by_session.clear()
         TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount._no_real_wait(
@@ -18555,6 +22808,41 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert "6" not in calls[0], (
             f"an expired wall must not exclude its slot forever: {calls}")
 
+    def case_switch_caps_each_excluded_slot_at_its_own_reset(self, monkeypatch):
+        """cswap's `switch(wall_until=)` (cswap PR #199) caps each at-limit
+        mark at that slot's own reset: the pin sends the walls it bars with
+        `exclude`, the live slot's own, from this 429, included."""
+        from cswap_pin import proxy as pp
+        seen = []
+
+        def _switch(self, strategy=None, json_output=False, models=None,
+                    current_at_limit=False, exclude=None, wall_until=None):
+            seen.append((exclude, wall_until))
+            return {"switched": True, "needsLogin": False, "validated": True}
+
+        self._wire_exclude_capable(
+            monkeypatch, switched=True, live_token=self.LIVE, live_num="4")
+        monkeypatch.setattr(pp.require("switcher").ClaudeAccountSwitcher,
+                            "switch", _switch)
+        pp._walled_slots["6"] = other = time.time() + 3600
+        got = self._relay(auth="Bearer " + self.LIVE)
+        assert got.startswith(b"HTTP/1.1 401"), got[:40]
+        (exclude, wall_until), = seen
+        assert set(wall_until) == {"4", "6"}, wall_until
+        assert wall_until["6"] == other, wall_until
+        assert abs(wall_until["4"] - (time.time() + 120)) < 5, wall_until
+        assert set(wall_until) == set(exclude), (wall_until, exclude)
+
+    def case_a_host_without_wall_until_is_sent_exclude_alone(self, monkeypatch):
+        """THE CONTROL: the kwarg is gated on the signature. An exclude-capable
+        host without it would raise TypeError into the except and relay the
+        429; here `switch()` runs and the walled 401 is answered."""
+        calls = self._wire_exclude_capable(
+            monkeypatch, switched=True, live_token=self.LIVE, live_num="4")
+        got = self._relay(auth="Bearer " + self.LIVE)
+        assert got.startswith(b"HTTP/1.1 401"), got[:40]
+        assert calls == [frozenset({"4"})], calls
+
     def case_a_bearer_branch_conversion_records_no_walled_slot(
         self, monkeypatch,
     ):
@@ -18591,6 +22879,335 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert not calls, (
             f"an unmanaged slot read must not re-attempt the switch: {calls}")
 
+    # --- a wall belongs to the ACCOUNT, not to the slot number (T1800) ------
+
+    def _wall_slot_5_then_a_stale_bearer(self, monkeypatch, held_after):
+        """Wall slot 5 through a real live-token 429 while account A holds it,
+        let `held_after` hold slot 5 (`cswap move`), settle the wall's memo the
+        way the incident's own `switch()` had, then relay a STALE bearer's 429
+        for that same wall. Returns that relay's answer and the lifecycle
+        lines it logged."""
+        from cswap_pin import proxy as pp
+        who = {"5": "a@example.com"}
+        self._wire_exclude_capable(
+            monkeypatch, switched=False, live_token=self.LIVE, live_num="5",
+            occupant=who)
+        first = self._relay(auth="Bearer " + self.LIVE)
+        assert first.startswith(b"HTTP/1.1 429"), first[:40]
+        assert "5" in pp._walled_slots, pp._walled_slots
+        who["5"] = held_after
+        pp._walled_switch_seen[(b"9999999999", "5")] = (
+            True, None, time.monotonic() - 1.0)
+        lines = []
+        monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
+        return self._relay(auth="Bearer stale-account-a-token"), lines
+
+    def case_a_walled_slot_renumbered_to_a_fresh_account_is_not_walled(
+        self, monkeypatch,
+    ):
+        """THE INCIDENT. A wall was recorded while slot 5 held account A; then
+        `cswap move` put account B in slot 5. The memos are keyed on the slot
+        NUMBER, so they still spoke for A: the re-decide memo sent the stale
+        bearer back into the decision path, `_walled_slots` made it read B as
+        walled, and the client got a relayed 429 for a fresh account instead
+        of the 401 that rebuilds it onto B."""
+        got, lines = self._wall_slot_5_then_a_stale_bearer(
+            monkeypatch, held_after="b@example.com")
+        assert got.startswith(b"HTTP/1.1 401"), (
+            "slot 5 holds a different account than the one that walled; the "
+            f"wall is not B's: {got[:40]}")
+        assert not any("again after the pin switched off it" in x
+                       for x in lines), lines
+
+    def case_a_walled_slot_still_held_by_the_same_account_stays_walled(
+        self, monkeypatch,
+    ):
+        """THE CONTROL: same seed, same occupant. The wall is still its
+        account's, so the stale bearer still falls to `switch()` and the
+        relay still answers the 429 it answered before the guard existed."""
+        got, lines = self._wall_slot_5_then_a_stale_bearer(
+            monkeypatch, held_after="a@example.com")
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert any("again after the pin switched off it" in x
+                   for x in lines), (
+            "the capture that proves the changed-hands case silent must see "
+            f"the line fire here: {lines}")
+
+    def case_switch_does_not_exclude_a_slot_that_changed_hands(
+        self, monkeypatch,
+    ):
+        """`exclude=` also names slots OTHER than the live one. Slot 6 walled
+        under account A, cswap moved on to slot 4, and `cswap move` then put
+        account B in slot 6: excluding 6 would refuse B for A's wall, and
+        cswap persists a wall on whoever holds an excluded slot. The control
+        is slot 6 still held by A."""
+        for held_after, excluded in (("a@example.com", True),
+                                     ("b@example.com", False)):
+            who = {"6": "a@example.com", "4": "c@example.com"}
+            live = ["6"]
+            calls = self._wire_exclude_capable(
+                monkeypatch, switched=False, live_token=self.LIVE,
+                live_num=lambda: live[0], occupant=who)
+            self._relay(reset=self.RESET_HEADER, auth="Bearer " + self.LIVE)
+            live[0], who["6"] = "4", held_after
+            self._relay(reset=self.RESET_HEADER_2, auth="Bearer " + self.LIVE)
+            assert len(calls) == 2, calls
+            assert ("6" in calls[1]) is excluded, (held_after, calls)
+
+    def case_a_slot_that_changed_hands_forgets_all_four_memos_and_only_its_own(
+        self, monkeypatch,
+    ):
+        """ONE guard for every memo keyed on the slot: re-keying
+        `_walled_slots` alone would leave `_walled_switch_seen` firing its
+        re-decide. Slot 6 is the bystander whose occupant never changes."""
+        from cswap_pin import proxy as pp
+        who = {"5": "a@example.com", "6": "c@example.com"}
+        self._wire_exclude_capable(monkeypatch, switched=False, occupant=who)
+        reset, soon = b"9999999999", time.monotonic() + 60
+        for slot in ("5", "6"):
+            pp._walled_slots[slot] = time.time() + 3600
+            pp._walled_switch_seen[(reset, slot)] = (True, None, 0.0)
+            pp._walled_switch_seen_by_session[(reset, slot, "s")] = soon
+            pp._walled_headroom_seen[(reset, slot)] = (50.0, 0.0)
+        lines = []
+        monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
+        pp._forget_walled_slots_that_changed_hands("5")
+        assert not lines, lines
+        who["5"] = "b@example.com"
+        pp._forget_walled_slots_that_changed_hands("5")
+        assert len(lines) == 1 and "slot(s) 5 " in lines[0], lines
+        assert set(pp._walled_slots) == {"6"}, pp._walled_slots
+        for memo in (pp._walled_switch_seen, pp._walled_switch_seen_by_session,
+                     pp._walled_headroom_seen):
+            assert {k[1] for k in memo} == {"6"}, memo
+
+    def case_a_slot_that_changed_hands_with_nothing_to_forget_logs_nothing(
+        self, monkeypatch,
+    ):
+        """The line says memos were forgotten; a slot whose memos all expired
+        long ago has none to forget, and logging it anyway is a false claim
+        in the one place an operator reads to learn what the guard did."""
+        from cswap_pin import proxy as pp
+        who = {"5": "a@example.com"}
+        self._wire_exclude_capable(monkeypatch, switched=False, occupant=who)
+        lines = []
+        monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
+        pp._forget_walled_slots_that_changed_hands("5")
+        who["5"] = "b@example.com"
+        pp._forget_walled_slots_that_changed_hands("5")
+        assert not lines, lines
+        assert pp._walled_slot_occupant["5"] == ("b@example.com", "org")
+
+    def case_a_wall_follows_its_account_to_the_slot_cswap_moved_it_to(
+        self, monkeypatch,
+    ):
+        """T1804. The wall is the ACCOUNT's, so when account A, walled in slot
+        5, now lives under number 10, slot 10 is excluded until A's own reset
+        epoch and slot 5 is free: whether `cswap move` emptied 5 (relocate) or
+        gave it to B (swap). When A has left the roster the wall goes with it.
+        The epoch is the one A's wall carried, not a fresh one."""
+        from cswap_pin import proxy as pp
+        reset3 = b"anthropic-ratelimit-unified-reset: 7777777777"
+        a, b, c = "a@example.com", "b@example.com", "c@example.com"
+        for name, after, dest in (
+            ("relocate", {"4": c, "10": a}, "10"),
+            ("swap", {"4": c, "5": b, "10": a}, "10"),
+            ("gone", {"4": c, "5": b}, None),
+        ):
+            who, live = {"4": c, "5": a}, ["5"]
+            calls = self._wire_exclude_capable(
+                monkeypatch, switched=False, live_token=self.LIVE,
+                live_num=lambda: live[0], occupant=who)
+            self._relay(reset=self.RESET_HEADER, auth="Bearer " + self.LIVE)
+            assert set(pp._walled_slots) == {"5"}, (name, pp._walled_slots)
+            epoch = pp._walled_slots["5"]
+            assert abs(epoch - (time.time() + 120)) < 5, (
+                name, pp._walled_slots)
+            who.clear()
+            who.update(after)
+            live[0] = "4"
+            self._relay(reset=self.RESET_HEADER_2, auth="Bearer " + self.LIVE)
+            assert len(calls) == 2, (name, calls)
+            assert "5" not in calls[1], (name, calls)
+            assert ("10" in calls[1]) is (dest is not None), (name, calls)
+            if dest is not None:
+                assert pp._walled_slots[dest] == epoch, (
+                    name, pp._walled_slots)
+                pp._walled_slots[dest] = time.time() - 10
+                self._relay(reset=reset3, auth="Bearer " + self.LIVE)
+                assert len(calls) == 3 and dest not in calls[2], (name, calls)
+
+    class _Roster(dict):
+        """A `{slot: email}` roster that can be torn and lists the slots it
+        has answered. A read is listed only AFTER its value is fetched, so a
+        case that waits for N reads and then moves the roster cannot move it
+        under a read already counted but not yet answered."""
+        torn = False
+
+        def __init__(self, *args):
+            super().__init__(*args)
+            self.reads = []
+
+        def __getitem__(self, num):
+            if self.torn:
+                raise OSError("roster torn")
+            value = super().__getitem__(num)
+            self.reads.append(num)
+            return value
+
+    def _wall_while_the_roster_moves(
+        self, monkeypatch, move, auth=None, session="", torn=False,
+    ):
+        """Slot 5 holds account A and a live-token 429 has read (slot 5, A's
+        token). `cswap move` then commits while that request waits on
+        `_walled_switch_lock`: `move(who)` runs as the lock is entered. Then
+        account C takes slot 5 and a stale bearer's 429 on the same wall
+        arrives. ``auth``/``session`` replace the first relay's live bearer;
+        ``torn`` makes the roster unreadable from the start. Returns the
+        first relay's answer, the memos it left (walls, the slots the shared
+        verdicts are keyed on, per-session verdicts) and the second relay's
+        answer."""
+        from cswap_pin import proxy as pp
+        who = self._Roster({"5": "a@example.com"})
+        who.torn = torn
+        self._wire_exclude_capable(
+            monkeypatch, switched=False, live_token=self.LIVE, live_num="5",
+            occupant=who)
+        real, moves = pp._walled_switch_lock, [move]
+
+        class _Lock:
+            def __enter__(self):
+                if moves:
+                    moves.pop()(who)
+                return real.__enter__()
+
+            def __exit__(self, *exc):
+                return real.__exit__(*exc)
+
+        monkeypatch.setattr(pp, "_walled_switch_lock", _Lock())
+        first = self._relay(auth=auth or "Bearer " + self.LIVE,
+                            session=session)
+        left = (dict(pp._walled_slots),
+                {k[1] for k in pp._walled_switch_seen},
+                dict(pp._walled_switch_seen_by_session))
+        who.torn = False
+        who["5"] = "c@example.com"
+        return first, left, self._relay(auth="Bearer stale-account-a-token")
+
+    def case_a_wall_is_not_written_for_an_account_that_swapped_slots_while_waiting(
+        self, monkeypatch,
+    ):
+        """THE REVIEW'S (a). The 429 read (slot 5, A's token) before the lock;
+        `cswap move` gave slot 5 to B while it waited. The old write still
+        went to `_walled_slots["5"]` and the `(reset, "5")` memo, so B, and
+        whoever takes slot 5 next, inherited A's wall until the reset epoch."""
+        first, left, got = self._wall_while_the_roster_moves(
+            monkeypatch, lambda who: who.update(
+                {"5": "b@example.com", "10": "a@example.com"}))
+        assert first.startswith(b"HTTP/1.1 429"), first[:40]
+        assert left == ({}, {None}, {}), left
+        assert got.startswith(b"HTTP/1.1 401"), got[:40]
+
+    def case_a_wall_is_not_written_for_an_account_that_left_the_slot_while_waiting(
+        self, monkeypatch,
+    ):
+        """THE REVIEW'S (b). `cswap move 5 8` emptied slot 5 while the 429
+        waited: the guard cannot name an occupant, and the wall was still
+        written, to be inherited by the next account moved into 5."""
+        first, left, got = self._wall_while_the_roster_moves(
+            monkeypatch, lambda who: (who.pop("5"),
+                                      who.update({"8": "a@example.com"})))
+        assert first.startswith(b"HTTP/1.1 429"), first[:40]
+        assert left == ({}, {None}, {}), left
+        assert got.startswith(b"HTTP/1.1 401"), got[:40]
+
+    def case_a_wall_is_not_written_when_the_roster_fails_at_the_wall_writing_call(
+        self, monkeypatch,
+    ):
+        """The same hole through any transient roster read failure: the wall
+        could not be attributed to anyone in this call, so none is written."""
+        first, left, got = self._wall_while_the_roster_moves(
+            monkeypatch, lambda who: setattr(who, "torn", True))
+        assert first.startswith(b"HTTP/1.1 429"), first[:40]
+        assert left == ({}, {None}, {}), left
+        assert got.startswith(b"HTTP/1.1 401"), got[:40]
+
+    def case_a_wall_is_not_written_when_the_roster_is_unreadable_at_both_reads(
+        self, monkeypatch,
+    ):
+        """No pre-lock read to compare with and none at the lock either: the
+        two reads agree on "unknown", which is not "unchanged", so the wall is
+        attributed to nobody and none is written."""
+        first, left, got = self._wall_while_the_roster_moves(
+            monkeypatch, lambda who: None, torn=True)
+        assert first.startswith(b"HTTP/1.1 429"), first[:40]
+        assert left == ({}, {None}, {}), left
+        assert got.startswith(b"HTTP/1.1 401"), got[:40]
+
+    def case_a_stale_bearer_session_memo_is_not_written_for_a_slot_that_moved(
+        self, monkeypatch,
+    ):
+        """The bearer branch's per-session 401 memo is keyed on the same slot
+        read: a request that read it before `cswap move` must not leave "this
+        session already had its 401" under the number's NEW occupant."""
+        first, left, got = self._wall_while_the_roster_moves(
+            monkeypatch, lambda who: who.update(
+                {"5": "b@example.com", "10": "a@example.com"}),
+            auth="Bearer stale-account-a-token", session="session-a")
+        assert first.startswith(b"HTTP/1.1 401"), first[:40]
+        assert left == ({}, set(), {}), left
+        assert got.startswith(b"HTTP/1.1 401"), got[:40]
+
+    def case_a_second_waiter_behind_the_move_writes_no_wall_either(
+        self, monkeypatch,
+    ):
+        """A storm's waiters all read (slot 5, A's token) before the lock.
+        The first one through sees B in slot 5 and records it, so for the
+        second one the guard alone finds nothing changed: only comparing each
+        request's OWN pre-lock read of the slot with the occupant at the lock
+        keeps it from writing A's wall for B. Two real threads: both read,
+        both block on the held lock, the move lands, the lock is released.
+        The pre-lock roster read is each thread's LAST step before the lock,
+        so counting those reads says both are parked, with no sleep."""
+        from cswap_pin import proxy as pp
+        who = self._Roster({"5": "a@example.com"})
+        calls = self._wire_exclude_capable(
+            monkeypatch, switched=False, live_token=self.LIVE, live_num="5",
+            occupant=who)
+        answers = []
+        threads = [threading.Thread(target=lambda: answers.append(
+            self._relay(auth="Bearer " + self.LIVE))) for _ in range(2)]
+        with pp._walled_switch_lock:
+            for t in threads:
+                t.start()
+            deadline = time.monotonic() + 10
+            while len(who.reads) < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert len(who.reads) == 2, who.reads
+            who["5"] = "b@example.com"
+        for t in threads:
+            t.join(10)
+        assert len(answers) == 2, answers
+        assert not pp._walled_slots, pp._walled_slots
+        assert len(calls) == 1, (
+            f"both waiters are stale, and the storm still debounces to one "
+            f"switch(): {calls}")
+
+    def case_a_followed_wall_never_shortens_the_account_own_newer_one(
+        self, monkeypatch,
+    ):
+        """Account A's wall follows it to slot 10, which already carries A's
+        own LATER wall (slot 10 is recorded as A's, so the guard leaves its
+        entry alone): the follow keeps the later epoch."""
+        from cswap_pin import proxy as pp
+        who = {"5": "b@example.com", "10": "a@example.com"}
+        self._wire_exclude_capable(monkeypatch, switched=False, occupant=who)
+        pp._walled_slots.update({"5": 1000.0, "10": 2000.0})
+        pp._walled_slot_occupant.update(
+            {"5": ("a@example.com", "org"), "10": ("a@example.com", "org")})
+        pp._forget_walled_slots_that_changed_hands("5")
+        assert pp._walled_slots == {"10": 2000.0}, pp._walled_slots
+
     def case_switch_off_records_the_walled_slot_from_a_real_relay(
         self, monkeypatch,
     ):
@@ -18622,6 +23239,8 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         fake_switcher = type("FakeSwitcher", (), {
             "_read_credentials": _read_credentials,
             "current_account_number": _current_account_number,
+            "resolve_account": lambda self, num: (
+                num, f"acct-{num}@example.com", "org"),
             "switch": _switch,
         })
         fake_module = type("M", (), {"ClaudeAccountSwitcher": fake_switcher})()
@@ -18630,6 +23249,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         pp._walled_slots.clear()
         pp._walled_switch_seen_by_session.clear()
         pp._walled_headroom_seen.clear()
+        pp._walled_slot_occupant.clear()
         pp._walled_conversions_by_session.clear()
         pp._walled_relay_spell_by_session.clear()
         self._no_real_wait(monkeypatch)
@@ -18945,6 +23565,678 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert any("moved again" in m for m in logged), logged
 
 
+class TestAnAccessGrant403OnMessagesBecomesA401:
+    """THE DEFECT (lmd42, 2026-10-06 01:56:59Z-01:59:21Z): after an engine
+    switch the API answered `403 Access to this model requires an access
+    grant your request does not have` to every opus request on a healthy
+    bearer for 2m22s. The pin relayed all 11 unchanged and the sessions drew
+    "Please run /login". Only the rendered text was captured, never the JSON
+    `error.type`, so the arm matches the message and nothing else.
+
+    The 429 arm's helpers are reused, not copied: `_wire_exclude_capable` is
+    a real class so `inspect.signature` sees the parameters, and
+    `_relay` is the same socketpair relay with a body.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    _T = TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount
+    LIVE = _T.LIVE
+    _wire_exclude_capable = staticmethod(_T._wire_exclude_capable)
+    _relay = _T._relay
+    HEADS = (_T.RETRY_AFTER, _T.UNIFIED_STATUS, _T.SHOULD_RETRY)
+
+    GRANT_BODY = json.dumps({"type": "error", "error": {
+        "type": "permission_error",
+        "message": "Access to this model requires an access grant your "
+                   "request does not have"}}).encode()
+    # The same envelope and `error.type`, a different refusal: only the
+    # message tells them apart.
+    OTHER_BODY = json.dumps({"type": "error", "error": {
+        "type": "permission_error",
+        "message": "Your organization does not have access to this "
+                   "resource"}}).encode()
+
+    B = "second-account-token"
+
+    def _wire(self, monkeypatch, log=None, **kw):
+        kw.setdefault("switched", True)
+        kw.setdefault("refused_param", True)
+        kw.setdefault("live_token", self.LIVE)
+        return self._wire_exclude_capable(
+            monkeypatch, kwargs_log=log, **kw)
+
+    def _moving_fleet(self, monkeypatch, tokens=None, **kw):
+        """Two accounts (or ``tokens``, slot -> bearer), slot 1 (bearer
+        `LIVE`) live. A `switch()` lands on a slot that is neither the live
+        one nor in `exclude`, as cswap's candidate search does, and finds
+        `candidates-exhausted` when none is left. Returns the kwargs log and
+        the live-slot cell."""
+        live = {"num": "1"}
+        tokens = tokens or {"1": self.LIVE, "2": self.B}
+
+        def lands(exclude):
+            others = [n for n in tokens
+                      if n != live["num"] and n not in (exclude or ())]
+            if others:
+                live["num"] = others[0]
+            return bool(others)
+
+        log = []
+        self._wire(monkeypatch, log=log, switched=lands, live_num=lambda:
+                   live["num"], live_token=lambda: tokens[live["num"]], **kw)
+        return log, live
+
+    def _r403(self, body=None, auth=None, path="/v1/messages", **kw):
+        """A 403 as the API sends it: no rate-limit reset, the same
+        retry-hint headers the 429 helper always carries. ``auth=None`` is the
+        live account's own bearer."""
+        return self._relay(
+            path=path, status=b"403 Forbidden", reset=False,
+            auth="Bearer " + self.LIVE if auth is None else auth,
+            body=self.GRANT_BODY if body is None else body, **kw)
+
+    def _untouched(self, **kw):
+        """The same response on a route no arm looks at: what "relayed
+        byte-identical" is measured against."""
+        return self._r403(path="/v1/other", **kw)
+
+    def _key(self):
+        """The memo key: the grant marker plus the bearer's fingerprint, and
+        the slot."""
+        import hashlib
+        return (b"grant:" + hashlib.sha256(self.LIVE.encode()).hexdigest()[:16]
+                .encode(), "1")
+
+    def case_a_grant_403_becomes_a_401_after_exactly_one_switch(
+        self, monkeypatch,
+    ):
+        from cswap_pin import proxy as pp
+        log = []
+        self._wire(monkeypatch, log=log)
+        monkeypatch.setattr(pp, "_fleet_held_until", 777.0)
+        got = self._r403()
+        assert got.startswith(b"HTTP/1.1 401"), got[:60]
+        assert len(log) == 1, log
+        kw = log[0]
+        assert kw["current_refused"] is True, kw
+        assert kw["exclude"] == {"1"}, (
+            "the slot whose bearer drew the refusal, and no other, is what "
+            f"switch() must mark and leave: {kw}")
+        assert not kw["current_at_limit"], (
+            f"a refusal is not a wall: {kw}")
+        assert (kw["strategy"], kw["json_output"], kw["models"]) == (
+            "best", True, ("all",)), kw
+        low = got.lower()
+        assert b"retry-after" not in low and b"x-should-retry" not in low, (
+            "a 401 that keeps the 403's retry hints is not the rebuild "
+            f"trigger: {got[:200]!r}")
+        assert got.endswith(self.GRANT_BODY), got[-80:]
+        assert pp._walled_switch_seen[self._key()][0] is True, (
+            pp._walled_switch_seen)
+        assert pp._walled_slots == {}, (
+            f"a refusal walled slot(s) the way a 429 does: {pp._walled_slots}")
+        assert pp._fleet_held_until == 777.0, (
+            "a refusal says nothing about the fleet's walls, but it wrote "
+            f"the fleet-held memo: {pp._fleet_held_until}")
+
+    def case_ten_concurrent_grant_403s_make_one_switch(self, monkeypatch):
+        """Run twice: with the live token fixed through the fake switch, and
+        with the switch moving it to B, where a 403 on A's bearer that
+        arrives AFTER the landing must be told from a waiter that read A as
+        live before it, and gets the 401 too."""
+        for moving in (False, True):
+            entered = threading.Event()
+            release = threading.Event()
+
+            def _block():
+                entered.set()
+                assert release.wait(timeout=5), "release never set -- test bug"
+
+            log = []
+            if moving:
+                log, _ = self._moving_fleet(monkeypatch, before=_block)
+            else:
+                self._wire(monkeypatch, log=log, before=_block)
+            results = {}
+
+            def _run(i):
+                results[i] = self._r403()
+
+            threads = [threading.Thread(target=_run, args=(0,))]
+            threads[0].start()
+            assert entered.wait(timeout=5), "switch() never started"
+            for i in range(1, 10):
+                threads.append(threading.Thread(target=_run, args=(i,)))
+                threads[-1].start()
+            time.sleep(0.3)
+            assert not results, (
+                "a 403 was answered while the one switch() was still "
+                f"landing: {sorted(results)}")
+            release.set()
+            for t in threads:
+                t.join(timeout=5)
+            assert len(results) == 10, (moving, sorted(results))
+            assert {r[:12] for r in results.values()} == {b"HTTP/1.1 401"}, [
+                r[:20] for r in results.values()]
+            if moving:
+                late = self._r403()
+                assert late.startswith(b"HTTP/1.1 401"), late[:60]
+            assert len(log) == 1, (
+                f"ten refusals made {len(log)} switch() calls (moving={moving})")
+
+    def case_a_403_that_is_not_an_access_grant_is_relayed_byte_identical(
+        self, monkeypatch,
+    ):
+        log = []
+        self._wire(monkeypatch, log=log)
+        bodies = {
+            "an org refusal in the same envelope and type": self.OTHER_BODY,
+            "the corporate inspector": (
+                b"<html><body>Access restricted by network policy"
+                b"</body></html>"),
+            "a policy rule": b"403 Blocked by policy rule",
+            "not json": b"{not json",
+            "the phrase outside error.message":
+                b'{"error": "requires an access grant"}',
+            "a message that is not text": b'{"error": {"message": 7}}',
+            "an empty body": b"",
+        }
+        for what, body in bodies.items():
+            got = self._r403(body=body)
+            assert got.startswith(b"HTTP/1.1 403"), (what, got[:60])
+            assert got == self._untouched(body=body), (what, got[:200])
+        for path in ("/v1/messages/count_tokens", "/v1/other"):
+            assert self._r403(path=path) == self._untouched(), path
+        assert not log, f"a switch() was asked for a non-grant 403: {log}"
+
+    def case_an_older_cswap_relays_the_grant_403_unchanged_and_reads_no_body(
+        self, monkeypatch,
+    ):
+        """`switch()` there has `exclude` but not `current_refused`, so
+        passing the kwarg raises TypeError. The capability is read from the
+        signature BEFORE any body is read or any switch is attempted: a
+        `calls` list that stays empty would be just as empty if the pin had
+        tried and been refused."""
+        from cswap_pin import proxy as pp
+        attempts = []
+        monkeypatch.setattr(pp, "_grant_refusal",
+                            lambda *a: attempts.append("body") or (b"", True))
+        monkeypatch.setattr(pp, "_switch_off_walled_account",
+                            lambda *a, **k: attempts.append("switch") or True)
+        self._wire(monkeypatch, refused_param=False)
+        got = self._r403()
+        assert got == self._untouched(), got[:200]
+        assert got.startswith(b"HTTP/1.1 403"), got[:60]
+        assert not attempts, (
+            f"an older host's 403 was read or switched on: {attempts}")
+
+    def case_a_head_response_has_no_body_to_wait_for(self, monkeypatch):
+        """A HEAD 403 announces a `Content-Length` and sends nothing; reading
+        for it would park the relay until the upstream closes."""
+        from cswap_pin import proxy as pp
+        read = []
+        monkeypatch.setattr(pp, "_grant_refusal",
+                            lambda *a: read.append(1) or (b"", False))
+        self._wire(monkeypatch)
+        got = self._r403(body=b"", framed=False, method="HEAD",
+                         extra_headers=b"Content-Length: 115\r\n")
+        assert got.startswith(b"HTTP/1.1 403"), got[:60]
+        assert not read, "a HEAD response's body was waited for"
+
+    def case_a_switch_that_does_not_land_relays_the_403_unchanged(
+        self, monkeypatch,
+    ):
+        from cswap_pin import proxy as pp
+
+        def _boom():
+            raise RuntimeError("config lock held")
+
+        for what, wire in {
+            "no candidate": dict(switched=False),
+            "landed but not validated": dict(validated=False),
+            "validation absent": dict(validated=None),
+            "switch() raised": dict(before=_boom),
+        }.items():
+            log = []
+            self._wire(monkeypatch, log=log, **wire)
+            monkeypatch.setattr(pp, "_fleet_held_until", 777.0)
+            got = self._r403()
+            assert got == self._untouched(), (what, got[:200])
+            assert got.startswith(b"HTTP/1.1 403"), (what, got[:60])
+            for head in self.HEADS:
+                assert head in got, (
+                    f"{what}: the 403's own header {head!r} was stripped: "
+                    f"{got[:200]!r}")
+            assert len(log) == 1, (what, log)
+            assert pp._walled_switch_seen[self._key()][0] is False, (
+                what, pp._walled_switch_seen)
+            assert pp._fleet_held_until == 777.0, what
+            # A repeat inside the negative's expiry debounces: no second
+            # switch(), the 403 unchanged.
+            assert self._r403() == got, what
+            assert len(log) == 1, (what, "a repeat re-asked switch()", log)
+
+    def case_a_bearer_that_is_not_a_bearer_relays_the_403_unchanged(
+        self, monkeypatch,
+    ):
+        log = []
+        self._wire(monkeypatch, log=log)
+        for auth in ("Basic abc", ""):
+            assert self._r403(auth=auth) == self._untouched(auth=auth), auth
+        assert not log, f"a 403 with no bearer drew a switch(): {log}"
+
+    def case_an_old_bearer_with_no_record_gets_one_401_per_session(
+        self, monkeypatch,
+    ):
+        """A bearer that is not the live one and has no validated switch on
+        file (a pin restart inside the bar, an eviction from the 8-entry
+        memo, an engine switch off an account that then refuses) drew the
+        403 unchanged, "Please run /login" until its credential turned over.
+        It gets what the 429 arm's bearer branch gives any stale bearer: one
+        401 per session, none for a repeat of that session inside the window
+        (the 403 unchanged, as the 429 is relayed), no `switch()` and no
+        slot marked, since the 401 makes the client re-read the live
+        credential, a different account."""
+        from cswap_pin import proxy as pp
+        log = []
+        self._wire(monkeypatch, log=log)
+        old = "Bearer some-old-account-token"
+        assert self._r403(auth=old, session="s1").startswith(b"HTTP/1.1 401")
+        again = self._r403(auth=old, session="s1")
+        assert again.startswith(b"HTTP/1.1 403"), (
+            f"the same session got a second 401 with nothing changed: {again[:60]}")
+        assert again == self._untouched(auth=old, session="s1")
+        assert self._r403(auth=old, session="s2").startswith(b"HTTP/1.1 401"), (
+            "another session's old bearer is owed its own 401")
+        assert not log, f"an old bearer's 403 drew a switch(): {log}"
+        assert pp._refused_slots == {} and pp._walled_slots == {}, (
+            pp._refused_slots, pp._walled_slots)
+        # The 401 sends the client to the live slot: not while it is refused.
+        pp._refused_slots["1"] = time.time() + 600
+        other = "Bearer another-old-token"
+        got = self._r403(auth=other, session="s3")
+        assert got.startswith(b"HTTP/1.1 403"), got[:60]
+        assert got == self._untouched(auth=other, session="s3")
+        assert not log, log
+
+    def case_the_old_bearer_log_lines_name_the_session(self, monkeypatch):
+        """Both texts end in `session=<sha256(session)[:12]>`, the same
+        field `bearer=` uses, so a reader can tell one session's repeat from
+        another's; the substrings trace_fold greps stay."""
+        import hashlib
+        from cswap_pin import proxy as pp
+        logged = []
+        monkeypatch.setattr(pp, "_log_lifecycle", logged.append)
+        self._wire(monkeypatch)
+        old = "Bearer some-old-account-token"
+
+        def sid(s):
+            return " session=" + hashlib.sha256(s.encode()).hexdigest()[:12]
+
+        def lines():
+            return [x for x in logged if "403 access-grant refusal" in x]
+
+        assert self._r403(auth=old, session="s1").startswith(b"HTTP/1.1 401")
+        assert self._r403(auth=old, session="s1").startswith(b"HTTP/1.1 403")
+        assert self._r403(auth=old, session="s2").startswith(b"HTTP/1.1 401")
+        a1, b1, a2 = lines()
+        assert "relaying a 401" in a1 and a1.endswith(sid("s1")), a1
+        assert "already had its bearer converted for" in b1
+        assert "relaying the 403 unchanged" in b1 and b1.endswith(sid("s1")), b1
+        assert "relaying a 401" in a2 and a2.endswith(sid("s2")), a2
+        assert sid("s1") != sid("s2")
+
+    def case_an_old_bearer_with_no_session_shares_one_401_and_then_403s(
+        self, monkeypatch,
+    ):
+        """THE CONTROL: with no `x-claude-code-session-id` the 429 bearer
+        branch records into the shared `(reset, slot)` memo, so the first
+        request is converted and every repeat inside the window is relayed
+        unchanged."""
+        log = []
+        self._wire(monkeypatch, log=log)
+        old = "Bearer some-old-account-token"
+        assert self._r403(auth=old).startswith(b"HTTP/1.1 401")
+        for _ in (2, 3):
+            again = self._r403(auth=old)
+            assert again.startswith(b"HTTP/1.1 403"), again[:60]
+            assert again == self._untouched(auth=old)
+        assert not log, f"an old bearer's 403 drew a switch(): {log}"
+
+    def case_a_session_gets_one_401_whatever_bearer_it_sends(
+        self, monkeypatch,
+    ):
+        """Each 401 sends the client to mint a new bearer (`/api/oauth/token`
+        is not pinned), so a memo keyed on the bearer's fingerprint is a new
+        key per retry and the 401 loop reopens, one credential exchange a
+        round. One session, a different unknown bearer on every request: the
+        first draws the 401, every later one the 403 unchanged; another
+        session still gets its own."""
+        log = []
+        self._wire(monkeypatch, log=log)
+        assert self._r403(auth="Bearer unknown-1", session="s1").startswith(
+            b"HTTP/1.1 401")
+        for n in (2, 3):
+            auth = f"Bearer unknown-{n}"
+            got = self._r403(auth=auth, session="s1")
+            assert got.startswith(b"HTTP/1.1 403"), (
+                f"request {n}: a new bearer from the same session drew a "
+                f"second 401: {got[:60]}")
+            assert got == self._untouched(auth=auth, session="s1")
+        assert self._r403(auth="Bearer unknown-4", session="s2").startswith(
+            b"HTTP/1.1 401"), "another session is owed its own 401"
+        assert not log, log
+
+    def case_unknown_session_less_bearers_leave_a_validated_record_in_place(
+        self, monkeypatch,
+    ):
+        """The memo holds 8 entries and drops the oldest. Ten distinct
+        unknown bearers with no session wrote ten `(grant:<fingerprint>,
+        slot)` negatives, and the validated switch off A that a straggler on
+        A's bearer is found by went with the oldest of them. They share one
+        entry per slot now, so the first draws the 401, the other nine the
+        403 unchanged, and A's straggler is still found."""
+        from cswap_pin import proxy as pp
+        log, live = self._moving_fleet(monkeypatch)
+        assert self._r403().startswith(b"HTTP/1.1 401")
+        assert live["num"] == "2" and len(log) == 1, (live, log)
+        assert pp._walled_switch_seen[self._key()][0] is True
+        got = [self._r403(auth=f"Bearer unknown-{n}")[:12] for n in range(10)]
+        assert got == [b"HTTP/1.1 401"] + [b"HTTP/1.1 403"] * 9, got
+        assert pp._walled_switch_seen[self._key()][0] is True, (
+            "ten unknown bearers evicted the validated record: "
+            f"{list(pp._walled_switch_seen)}")
+        pp._refused_slots["1"] = time.time() - 1.0
+        assert self._r403(session="s1").startswith(b"HTTP/1.1 401")
+        assert len(log) == 2 and log[1]["exclude"] == {"1"}, (
+            f"A's straggler was not found, so its slot was not re-marked: {log}")
+
+    def case_a_late_403_on_the_bearer_the_pin_switched_off_gets_a_401(
+        self, monkeypatch,
+    ):
+        """I-1: a session still holding A's bearer after the switch to B (an
+        in-flight request, a frozen bearer) drew "Please run /login" from the
+        403 relayed unchanged. The validated switch on file for A's
+        fingerprint earns it the 401, once per session like the 429 arm's
+        bearer branch, and no `switch()` call: A is marked already."""
+        from cswap_pin import proxy as pp
+        log, live = self._moving_fleet(monkeypatch)
+        monkeypatch.setattr(pp, "_fleet_held_until", 777.0)
+        assert self._r403(session="s1").startswith(b"HTTP/1.1 401")
+        assert live["num"] == "2" and len(log) == 1, (live, log)
+        late = self._r403(session="s1")
+        assert late.startswith(b"HTTP/1.1 401"), late[:60]
+        again = self._r403(session="s1")
+        assert again.startswith(b"HTTP/1.1 403"), (
+            f"the same session got a second 401 with nothing changed: {again[:60]}")
+        assert again == self._untouched(session="s1")
+        assert self._r403(session="s2").startswith(b"HTTP/1.1 401"), (
+            "another session's frozen bearer is owed its own 401")
+        assert len(log) == 1, f"a late 403 asked switch() again: {log}"
+        assert pp._fleet_held_until == 777.0, pp._fleet_held_until
+        assert pp._walled_slots == {}, pp._walled_slots
+
+    def case_a_late_403_marks_the_bearers_slot_again_once_its_bar_lapsed(
+        self, monkeypatch,
+    ):
+        """I-1, the other half: A's mark at cswap lapses after 900 s, and a
+        straggler on A's bearer is how A is marked again. `exclude` names A
+        alone, so cswap marks it and leaves the healthy live account where it
+        is: one call, no credential write."""
+        from cswap_pin import proxy as pp
+        log, live = self._moving_fleet(monkeypatch)
+        assert self._r403().startswith(b"HTTP/1.1 401")
+        pp._refused_slots["1"] = time.time() - 1.0
+        got = self._r403(session="s1")
+        assert got.startswith(b"HTTP/1.1 401"), got[:60]
+        assert len(log) == 2, log
+        kw = log[1]
+        assert (kw["current_refused"], kw["exclude"]) == (True, {"1"}), kw
+        assert not kw["current_at_limit"], kw
+        assert pp._refused_slots["1"] > time.time() + 800, pp._refused_slots
+
+    def case_a_re_mark_that_raises_still_gives_the_straggler_its_401(
+        self, monkeypatch,
+    ):
+        def _boom():
+            if len(log) == 2:
+                raise RuntimeError("config lock held")
+
+        from cswap_pin import proxy as pp
+        log, live = self._moving_fleet(monkeypatch, before=_boom)
+        assert self._r403().startswith(b"HTTP/1.1 401")
+        pp._refused_slots["1"] = time.time() - 1.0
+        lapsed = dict(pp._refused_slots)
+        got = self._r403(session="s1")
+        assert got.startswith(b"HTTP/1.1 401"), got[:60]
+        assert len(log) == 2, log
+        assert pp._refused_slots == lapsed, (
+            "a bar claude-swap never wrote was recorded after a raise: "
+            f"{pp._refused_slots}")
+
+    def case_a_switch_that_raises_leaves_no_bar_the_host_never_wrote(
+        self, monkeypatch,
+    ):
+        """`_mark_refused` ran as an argument, before `switch()` was entered,
+        so a raise left the pin barring a slot claude-swap had not marked."""
+        from cswap_pin import proxy as pp
+
+        def _boom():
+            raise RuntimeError("config lock held")
+
+        log = []
+        self._wire(monkeypatch, log=log, before=_boom)
+        assert self._r403().startswith(b"HTTP/1.1 403")
+        assert len(log) == 1, log
+        assert pp._refused_slots == {}, pp._refused_slots
+
+    def case_a_refusal_re_marks_every_slot_it_excludes(self, monkeypatch):
+        """claude-swap marks EVERY slot in `exclude` for a full bar, so the
+        pin restarts all of their bars too. Restarting only the live slot's
+        let A's bar lapse here while claude-swap still held it: A refused at
+        T0 (-> B), B at T0+600 (-> C, exclude {A, B}, both re-marked), C at
+        T0+1000 must carry A, whose mark from T0+600 is live."""
+        from cswap_pin import proxy as pp
+        tokens = {"1": self.LIVE, "2": self.B, "3": "third-account-token"}
+        log, live = self._moving_fleet(monkeypatch, tokens=tokens)
+
+        def _later(seconds):
+            for slot in pp._refused_slots:
+                pp._refused_slots[slot] -= seconds
+
+        assert self._r403().startswith(b"HTTP/1.1 401")
+        _later(600)
+        assert self._r403(auth="Bearer " + self.B).startswith(b"HTTP/1.1 401")
+        assert live["num"] == "3", live
+        assert log[1]["exclude"] == {"1", "2"}, log
+        assert pp._refused_slots["1"] > time.time() + 800, (
+            "A was excluded and marked again by switch(), its bar was not: "
+            f"{pp._refused_slots}")
+        _later(400)
+        got = self._r403(auth="Bearer " + tokens["3"])
+        assert log[2]["exclude"] == {"1", "2", "3"}, (
+            f"a refusal on the live account must not be offered A: {log}")
+        assert got.startswith(b"HTTP/1.1 403"), got[:60]
+        assert len(log) == 3, log
+
+    def case_a_fleet_where_every_account_refuses_gets_one_401_and_then_403s(
+        self, monkeypatch,
+    ):
+        """I-2: cswap releases its own refusal bar when nothing else is left
+        and lands back on a refused account, so the pin names the slots it
+        saw refused as `exclude`. A refused at once, B (landed on, 401) too:
+        switch() #1 lands, #2 finds nothing and the 403 goes out unchanged,
+        and no later refusal on either bearer is a 401."""
+        log, live = self._moving_fleet(monkeypatch)
+        b = "Bearer " + self.B
+        assert self._r403().startswith(b"HTTP/1.1 401")
+        assert live["num"] == "2"
+        second = self._r403(auth=b)
+        assert second.startswith(b"HTTP/1.1 403"), (
+            f"a second 401, onto the refused account: {second[:60]}")
+        assert second == self._untouched(auth=b)
+        assert log[1]["exclude"] == {"1", "2"}, log
+        assert live["num"] == "2", live
+        for auth in (b, None):
+            for session in ("s1", "s2"):
+                got = self._r403(auth=auth, session=session)
+                assert got.startswith(b"HTTP/1.1 403"), (auth, session, got[:60])
+        assert len(log) == 2, f"later refusals asked switch() again: {log}"
+
+    def case_a_refused_slot_that_changed_hands_is_forgotten(self, monkeypatch):
+        """`_refused_slots` feeds `exclude`, so it follows the same guard as
+        `_walled_slots`: a slot `cswap move` gave to another account must not
+        bar that account for 900 s."""
+        from cswap_pin import proxy as pp
+        who = {"5": "a@example.com", "6": "c@example.com"}
+        self._wire_exclude_capable(monkeypatch, switched=False, occupant=who)
+        for slot in ("5", "6"):
+            pp._refused_slots[slot] = time.time() + 600
+        pp._forget_walled_slots_that_changed_hands("5")
+        who["5"] = "b@example.com"
+        pp._forget_walled_slots_that_changed_hands("5")
+        assert set(pp._refused_slots) == {"6"}, pp._refused_slots
+
+    def case_a_body_nested_past_the_recursion_limit_fails_open(
+        self, monkeypatch,
+    ):
+        log = []
+        self._wire(monkeypatch, log=log)
+        body = b"[" * 16000
+        got = self._r403(body=body)
+        assert got.startswith(b"HTTP/1.1 403"), got[:60]
+        assert got == self._untouched(body=body)
+        assert not log, log
+
+    def case_a_body_over_the_real_cap_is_relayed_whole(self, monkeypatch):
+        """Read nothing, stall nothing: the arm leaves a body past
+        `_GRANT_BODY_CAP` to the plain relay, which carries every byte."""
+        log = []
+        self._wire(monkeypatch, log=log)
+        body = b"x" * 100000
+        got = self._r403(body=body)
+        assert got.startswith(b"HTTP/1.1 403"), got[:60]
+        assert got.endswith(body), len(got)
+        assert not log, log
+
+    def case_the_body_is_decoded_per_content_encoding_for_the_match(
+        self, monkeypatch,
+    ):
+        import gzip
+        import zlib
+        for name, enc, body in (
+            ("gzip", b"gzip", gzip.compress(self.GRANT_BODY)),
+            ("deflate", b"deflate", zlib.compress(self.GRANT_BODY)),
+        ):
+            log = []
+            self._wire(monkeypatch, log=log)
+            got = self._r403(body=body,
+                             extra_headers=b"Content-Encoding: " + enc + b"\r\n")
+            assert got.startswith(b"HTTP/1.1 401"), (name, got[:60])
+            assert got.endswith(body), (
+                f"{name}: the body must go out as the upstream sent it")
+            assert len(log) == 1, (name, log)
+        # Everything it cannot decode fails open: relayed unchanged, no switch.
+        for name, enc, body in (
+            ("brotli", b"br", self.GRANT_BODY),
+            ("corrupt gzip", b"gzip", b"\x1f\x8b not a gzip stream"),
+            ("gzip header on a plain body", b"gzip", self.GRANT_BODY),
+        ):
+            log = []
+            self._wire(monkeypatch, log=log)
+            hdr = b"Content-Encoding: " + enc + b"\r\n"
+            got = self._r403(body=body, extra_headers=hdr)
+            assert got == self._untouched(body=body, extra_headers=hdr), name
+            assert not log, (name, log)
+
+    def case_a_body_it_cannot_frame_or_bound_fails_open(self, monkeypatch):
+        from cswap_pin import proxy as pp
+        monkeypatch.setattr(pp, "_GRANT_BODY_CAP", 200)
+        assert len(self.GRANT_BODY) < 200, "test bug: the control must fit"
+        chunked = b"%x\r\n%s\r\n0\r\n\r\n" % (
+            len(self.GRANT_BODY), self.GRANT_BODY)
+        for what, kw in {
+            "chunked": dict(body=chunked,
+                            extra_headers=b"Transfer-Encoding: chunked\r\n"),
+            "over the cap": dict(body=self.GRANT_BODY[:-2] + b"x" * 300 + b"}"),
+            "no Content-Length": dict(body=self.GRANT_BODY, framed=False),
+        }.items():
+            log = []
+            self._wire(monkeypatch, log=log)
+            got = self._r403(**kw)
+            assert got.startswith(b"HTTP/1.1 403"), (what, got[:60])
+            assert got == self._untouched(**kw), (what, got[:200])
+            assert not log, (what, log)
+
+    def case_a_body_that_arrives_after_the_head_is_matched_and_relayed_whole(
+        self, monkeypatch,
+    ):
+        log = []
+        self._wire(monkeypatch, log=log)
+        got = self._r403(withhold=10)
+        assert got.startswith(b"HTTP/1.1 401"), got[:60]
+        assert got.endswith(self.GRANT_BODY), (
+            f"the body read ahead was not relayed whole: {got[-60:]!r}")
+        assert len(log) == 1, log
+        got = self._r403(body=self.OTHER_BODY, withhold=10)
+        assert got == self._untouched(body=self.OTHER_BODY, withhold=10)
+        assert len(log) == 1, log
+
+    def case_the_response_line_names_bearer_model_and_beta_before_ua(
+        self, certdir,
+    ):
+        """The fields go between the path and ` ua=`, on `/v1/messages`
+        only: readers take the path as the token after the method
+        (cswap's `_message_error_burst`, trace_fold's `_METHOD_PATH_RE`) and
+        the client as everything after the LAST ` ua=` (`_client_ua`), and
+        none of them anchors on the end of the line."""
+        import hashlib
+
+        from cswap_pin import proxy as pp
+        upstream = _FakeUpstream(certdir)
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: None,
+                            upstream=("127.0.0.1", upstream.port))
+        out = certdir / "armed-trace.log"
+        (certdir / pp._TRACE_SWITCH_FILE).write_text(str(out))
+        pp._TRACE_CACHE.clear()
+        proxy.start()
+        try:
+            proxy._trace_tick()
+            for path in ("/v1/messages", "/v1/messages/count_tokens"):
+                assert _request_through_proxy(
+                    proxy.port, certdir / "ca.pem", path, bearer="tok-abc",
+                    ua="claude-code/2.1.290",
+                    body=json.dumps({"model": "claude-opus-4-1",
+                                     "messages": []}),
+                    extra_headers={"anthropic-beta":
+                                   "oauth-2025-04-20,claude-code-20250219"},
+                ) == 200
+        finally:
+            proxy.stop()
+            upstream.stop()
+        lines = [l for l in out.read_text().splitlines()
+                 if "<- HTTP/1.1 200" in l]
+        msg = next(l for l in lines if " POST /v1/messages " in l)
+        m = re.search(r"POST /v1/messages  ts=(\S+) bearer=(\S+) model=(\S+) "
+                      r"beta=(\S+)  ua=(.*)$", msg)
+        assert m, msg
+        assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", m[1]), m[1]
+        assert m.groups()[1:] == (
+            hashlib.sha256(b"tok-abc").hexdigest()[:12], "claude-opus-4-1",
+            "oauth-2025-04-20,claude-code-20250219", "claude-code/2.1.290"), msg
+        # The readers' own parses of the same line.
+        assert msg.split("POST ", 1)[1].split(" ", 1)[0] == "/v1/messages"
+        assert msg.rsplit(" ua=", 1)[1] == "claude-code/2.1.290"
+        assert re.search(r"<- HTTP/[0-9.]+ (\d{3})", msg)[1] == "200"
+        assert re.match(r"\[c\d+\] ", msg), msg
+        # Another route keeps its line exactly.
+        other = next(l for l in lines if "count_tokens" in l)
+        assert re.fullmatch(
+            r"\[c\d+\]     <- HTTP/1.1 200 OK  POST /v1/messages/count_tokens"
+            r"  ua=claude-code/2.1.290", other), other
+
 class TestARateLimitedSlotIsHeldAndTheReplyWaitsWhenEveryCandidateIsHeld:
     """R10-R17 over the real `_relay_response`, with the real host modules
     `rate_limit_hold` and `settings` on a temp backup dir and a fake switcher
@@ -19003,6 +24295,9 @@ class TestARateLimitedSlotIsHeldAndTheReplyWaitsWhenEveryCandidateIsHeld:
             def is_account_disabled(self, num):
                 return num in disabled
 
+            def resolve_account(self, num):
+                return (num, f"acct-{num}@example.com", "org")
+
         mapping = {
             "switcher": types.SimpleNamespace(ClaudeAccountSwitcher=_Switcher),
             "rate_limit_hold": rate_limit_hold,
@@ -19028,8 +24323,10 @@ class TestARateLimitedSlotIsHeldAndTheReplyWaitsWhenEveryCandidateIsHeld:
             monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
         pp._walled_switch_seen.clear()
         pp._walled_slots.clear()
+        pp._refused_slots.clear()
         pp._walled_switch_seen_by_session.clear()
         pp._walled_headroom_seen.clear()
+        pp._walled_slot_occupant.clear()
         pp._walled_conversions_by_session.clear()
         pp._walled_relay_spell_by_session.clear()
         monkeypatch.setattr(pp, "_fleet_held_until", 0.0)
@@ -19580,6 +24877,7 @@ class TestTheEvidenceSurvivesAHandover:
         from cswap_pin import proxy as pp
         with pp._worker_alive_lock:
             pp._worker_alive.clear()
+            pp._worker_alive_written.clear()
 
     @staticmethod
     def _relay(path, status, certdir):
@@ -19692,6 +24990,93 @@ class TestTheEvidenceSurvivesAHandover:
             f"nothing: {pp._alive_load(certdir)!r}")
         assert abs(bare - _t.time()) < 60, f"stale bare stamp: {bare}"
 
+    def _stamp_ages(self, certdir, monkeypatch, times):
+        """One 2xx worker request at each fake wall-clock instant in `times`,
+        returning the age the Rule 0 census reads (`_worker_alive_age`, the
+        FILE's newest stamp for this pid) right after each."""
+        import os
+        import time as _t
+        import types
+        from cswap_pin import proxy as pp
+        self._cold()
+        now = [0.0]
+        monkeypatch.setattr(pp, "time", types.SimpleNamespace(
+            time=lambda: now[0], monotonic=_t.monotonic))
+        ages = []
+        for now[0] in times:
+            pp._note_worker_status(self.BEAT, b"HTTP/1.1 200 OK", certdir)
+            ages.append(pp._worker_alive_age(certdir, os.getpid()))
+        return ages
+
+    def case_a_bridge_requesting_every_5s_keeps_a_fresh_file_stamp(
+            self, certdir, monkeypatch):
+        """THE THROTTLE MEASURED LAST SEEN, NOT LAST WRITTEN. A bridge asking
+        every <=10 s kept refreshing the clock the throttle compared against,
+        so the file stamp aged 0, 25, 85, 145 s while the session was live and
+        the census called a live bridge LOST."""
+        ages = self._stamp_ages(
+            certdir, monkeypatch, [1e6 + t for t in range(0, 61, 5)])
+        assert max(ages) < 15, ages
+
+    def case_CONTROL_a_12s_cadence_writes_every_request(
+            self, certdir, monkeypatch):
+        ages = self._stamp_ages(
+            certdir, monkeypatch, [1e6 + t for t in range(0, 61, 12)])
+        assert set(ages) == {0.0}, ages
+
+    def case_a_wall_clock_stepped_back_does_not_silence_the_file(
+            self, certdir, monkeypatch):
+        """A last-written stamp from the FUTURE must not throttle: unlike the
+        last-seen one it is not rewritten by every request, so one backward
+        step would hold the file still until the clock caught up."""
+        ages = self._stamp_ages(certdir, monkeypatch, [2000.0, 1000.0])
+        assert ages == [0.0, 0.0], ages
+
+    def case_the_written_map_is_evicted_with_the_seen_map(self, certdir):
+        from cswap_pin import proxy as pp
+        self._cold()
+        stale = __import__("time").time() - 3 * pp._STREAM_LIVE_SECONDS
+        with pp._worker_alive_lock:
+            for i in range(300):
+                pp._worker_alive[f"cse_old{i}"] = stale
+                pp._worker_alive_written[f"cse_old{i}"] = stale
+        pp._note_worker_status(self.BEAT, b"HTTP/1.1 200 OK", certdir)
+        assert set(pp._worker_alive_written) == {self.SID} == set(
+            pp._worker_alive), (len(pp._worker_alive_written),
+                                len(pp._worker_alive))
+
+    def case_concurrent_stampers_never_tear_the_file_or_lose_a_stamp(
+            self, certdir):
+        """EVERY RELAY THREAD WRITES THIS FILE. One shared temp name let two
+        writers truncate each other's bytes before `os.replace` (a torn file, or
+        an ENOENT swallowed as "no write"), and the unlocked read-merge-write
+        dropped whichever stamp merged into the staler read. Either one reads
+        back as "no evidence", the answer that lets a real stream 404 through.
+        Fresh sids every round, so a stamp lost in round r is never re-written
+        and stays missing at the end; a barrier makes each round a collision."""
+        import json
+        import threading
+        from cswap_pin import proxy as pp
+        self._cold()
+        threads, rounds = 8, 60
+        gate = threading.Barrier(threads)
+        sids = [f"cse_race{t:02d}r{r:03d}" for t in range(threads)
+                for r in range(rounds)]
+
+        def stamp(t):
+            for r in range(rounds):
+                gate.wait()
+                pp._note_worker_status(
+                    f"/v1/code/sessions/cse_race{t:02d}r{r:03d}/worker/heartbeat",
+                    b"HTTP/1.1 200 OK", certdir)
+
+        ts = [threading.Thread(target=stamp, args=(t,)) for t in range(threads)]
+        for t in ts: t.start()
+        for t in ts: t.join()
+        got = json.loads(pp._alive_path(certdir).read_text())
+        missing = [s for s in sids if s not in got]
+        assert not missing, f"{len(missing)}/{len(sids)} stamps lost: {missing[:3]}"
+
     def case_a_fresh_bare_key_from_an_older_writer_still_spares_the_404(
             self, certdir):
         """The `k == sid` branch in `_stream_404_is_spurious`, untested until
@@ -19718,7 +25103,8 @@ class TestADrainHandsStreamsOverInsteadOfOutlivingThem:
     in the window where a spurious 404 ends it.
 
     The successor already holds the listener, so a released client reconnects
-    at once -- `handleStreamEnd` backs off 1s and carries `from_sequence_num`.
+    to it: the worker stream's `handleConnectionError` waits about 1 s (+-25%,
+    doubling to a 30 s cap) and carries `from_sequence_num` and `Last-Event-ID`.
     """
 
     def test_all(self, request, tmp_path_factory):
@@ -19764,10 +25150,11 @@ class TestADrainHandsStreamsOverInsteadOfOutlivingThem:
         b.send(b"x")                              # still a live socket
         assert a.recv(1) == b"x"
 
-    def case_the_threshold_is_the_CLIENTS_OWN(self, certdir):
-        """45s is `dn` in the 2.1.245 bundle, the liveness timeout the client
-        re-arms on every frame. If this drifts from what the client does, we
-        are cutting streams it would have kept."""
+    def case_the_content_free_threshold_is_the_clients_liveness_window(
+            self, certdir):
+        """45s is the client's default liveness window (2.1.290), re-armed on
+        every parsed frame. Here it is the drain's content-free threshold, not
+        a time at which the client drops a stream."""
         from cswap_pin import proxy as pp
         assert pp._CLIENT_LIVENESS_SECONDS == 45.0
 
@@ -19791,3 +25178,5856 @@ class TestADrainHandsStreamsOverInsteadOfOutlivingThem:
             srv._open_conns.add(a)
             srv._stream_conns.add(a)             # no _content_at entry
         assert srv.release_idle_streams() == 0
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _mitm_stream(certdir, age):
+        """A client holding a REAL MITM'd event stream through an in-process
+        proxy, its last content `age` seconds ago. Yields `(proxy, upstream,
+        tls)`: the upstream holds its second event until `upstream.release`."""
+        from cswap_pin import proxy as pp
+        upstream = _StreamingUpstream(certdir)
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: None,
+                            upstream=("127.0.0.1", upstream.port))
+        proxy.start()
+        raw = tls = None
+        try:
+            raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            raw.sendall(b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
+                        b"Host: api.anthropic.com:443\r\n\r\n")
+            head = b""
+            while b"\r\n\r\n" not in head:
+                head += raw.recv(1)
+            ctx = ssl.create_default_context(cafile=str(certdir / "ca.pem"))
+            tls = ctx.wrap_socket(raw, server_hostname="api.anthropic.com")
+            tls.sendall(b"GET /v1/code/sessions/cse_x/worker/events/stream "
+                        b"HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                        b"Authorization: Bearer t\r\n\r\n")
+            tls.settimeout(5)
+            got = b""
+            while b"event: a" not in got:
+                chunk = tls.recv(4096)
+                assert chunk, "the stream closed before its first event"
+                got += chunk
+            with proxy._live_lock:
+                (conn,) = proxy._stream_conns
+                assert conn.fileno() == -1, "precondition: the wrap detached it"
+                proxy._content_at[conn] = time.monotonic() - age
+            yield proxy, upstream, tls
+        finally:
+            for s_ in (tls, raw):
+                if s_ is not None:
+                    s_.close()
+            proxy.stop()
+            upstream.stop()
+
+    def case_a_MITMd_stream_is_shut_down_for_real(self, certdir):
+        """THE RELEASE SHUT DOWN A DESCRIPTOR THAT WAS NOT THERE.
+
+        `_stream_conns` holds the raw accepted socket, which `wrap_socket`
+        detached, so `shutdown` raised EBADF into the swallowing except and
+        the function still returned 1: the drain logged "handed 1 stream" and
+        the client kept receiving. The socketpair cases above are never
+        wrapped, which is why they were green.
+        """
+        from cswap_pin import proxy as pp
+        with self._mitm_stream(
+                certdir, pp._CLIENT_LIVENESS_SECONDS + 5) as (proxy, up, tls):
+            with proxy._live_lock:
+                # `getattr`: the base has no `_stream_tls`, and this case must
+                # reach the EOF assertion there rather than die on the read.
+                served = list(getattr(proxy, "_stream_tls", {}).values())
+            assert proxy.release_idle_streams() == 1
+            # `SSLSocket.shutdown` nulls `_sslobj` on the object the serving
+            # thread writes through: a send past its check raises, and one
+            # between the null and the syscall goes out as plaintext.
+            assert all(s_._sslobj is not None for s_ in served), (
+                "the release shut down through the TLS object the serving "
+                "thread is writing to")
+            up.release.set()    # a stream NOT shut down delivers its 2nd event
+            assert tls.recv(4096) == b"", "the client was not given an EOF"
+
+    def case_CONTROL_a_MITMd_stream_still_delivering_is_not_released(
+            self, certdir):
+        """What 80455db defended: a live stream present during the release is
+        not selected, not counted, and keeps delivering."""
+        with self._mitm_stream(certdir, 1.0) as (proxy, up, tls):
+            assert proxy.release_idle_streams() == 0
+            up.release.set()
+            assert b"event: b" in tls.recv(4096), "the live stream was cut"
+
+    def case_a_stream_whose_shutdown_fails_is_not_counted(self, certdir):
+        """The count is the shutdowns that did not raise, not the victims."""
+        from cswap_pin import proxy as pp
+        srv = self._server(certdir)
+        a, b = self._register(srv, pp._CLIENT_LIVENESS_SECONDS + 5)
+        c, d = self._register(srv, pp._CLIENT_LIVENESS_SECONDS + 5)
+        a.close()                                 # shutdown(a) raises EBADF
+        assert srv.release_idle_streams() == 1
+        assert d.recv(16) == b"", "the live one was not shut down"
+
+
+def _handshake(ctx, port, host="api.anthropic.com"):
+    """One TLS handshake to a loopback server, `host` being the name checked.
+    Raises ssl.SSLCertVerificationError when `ctx` does not trust what it
+    serves."""
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:
+        ctx.wrap_socket(raw, server_hostname=host).close()
+
+
+def _pin_dir():
+    """The directory `_verifying_context()` derives (conftest redirects the
+    store it lives under to the case's tmp_path)."""
+    from claude_swap.switcher import ClaudeAccountSwitcher
+
+    return _mkdir(ClaudeAccountSwitcher().backup_dir / "pin-proxy")
+
+
+class TestTheVerifyingContextTrustsTheHop:
+    """The daemon's own profile and policy fetches go out through the pin and
+    through whatever re-signing hop is recorded behind it. A third-party hop's
+    CA is recorded in upstream.json and carries no keyUsage."""
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    @staticmethod
+    def _hop_signed_dir(tmp_path):
+        """A directory holding a leaf signed by a CA with NO keyUsage (the pin's
+        own `ensure_ca` always adds one, so it cannot make this)."""
+        import datetime as dt
+
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+
+        from cswap_pin.proxy import _make_leaf
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "hop CA")])
+        now = dt.datetime.now(dt.timezone.utc)
+        ca = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+              .public_key(key.public_key()).serial_number(x509.random_serial_number())
+              .not_valid_before(now - dt.timedelta(days=1))
+              .not_valid_after(now + dt.timedelta(days=30))
+              .add_extension(x509.BasicConstraints(ca=True, path_length=None),
+                             critical=True)
+              .sign(key, hashes.SHA256()))
+        with pytest.raises(x509.ExtensionNotFound):
+            ca.extensions.get_extension_for_class(x509.KeyUsage)
+        leaf, leaf_key = _make_leaf("api.anthropic.com", ca, key)
+        signer = tmp_path / "hop"
+        signer.mkdir()
+        (signer / "ca.pem").write_bytes(ca.public_bytes(serialization.Encoding.PEM))
+        (signer / "leaf.pem").write_bytes(leaf.public_bytes(serialization.Encoding.PEM))
+        (signer / "leaf.key").write_bytes(leaf_key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption()))
+        return signer
+
+    def case_the_recorded_hop_ca_is_trusted_even_with_the_host_helper(
+        self, tmp_path, monkeypatch
+    ):
+        from cswap_pin import proxy
+
+        monkeypatch.delenv("NODE_EXTRA_CA_CERTS", raising=False)
+        # The affected box HAS the host's helper, and it trusts roots plus the
+        # pin's own CA only: the context that failed.
+        monkeypatch.setattr(proxy.oauth, "_pin_aware_ssl_context",
+                            ssl.create_default_context, raising=False)
+        signer = self._hop_signed_dir(tmp_path)
+        upstream = _FakeUpstream(signer)
+        try:
+            # CONTROL: nothing recorded, so the hop's leaf must be refused.
+            with pytest.raises(ssl.SSLCertVerificationError):
+                _handshake(proxy._verifying_context(), upstream.port)
+            proxy.write_upstream_hint(
+                _pin_dir(), "http://127.0.0.1:1", str(signer / "ca.pem"))
+            _handshake(proxy._verifying_context(), upstream.port)
+        finally:
+            upstream.stop()
+
+    def case_a_leaf_the_pins_own_ca_signed_verifies_alone(
+        self, tmp_path, monkeypatch
+    ):
+        from cswap_pin import proxy
+
+        monkeypatch.delenv("NODE_EXTRA_CA_CERTS", raising=False)
+        pin_dir = _pin_dir()
+        ensure_ca(pin_dir, "api.anthropic.com")
+        assert not (pin_dir / "ca-bundle.pem").exists()
+        assert proxy.read_upstream_ca(pin_dir) is None
+        upstream = _FakeUpstream(pin_dir)
+        try:
+            _handshake(proxy._verifying_context(), upstream.port)
+        finally:
+            upstream.stop()
+
+    def case_strict_verification_is_off(self, monkeypatch):
+        from cswap_pin import proxy
+
+        monkeypatch.delenv("NODE_EXTRA_CA_CERTS", raising=False)
+        real = ssl.create_default_context
+
+        def strict_like_3_13(*a, **kw):
+            ctx = real(*a, **kw)
+            ctx.verify_flags |= ssl.VERIFY_X509_STRICT
+            return ctx
+
+        monkeypatch.setattr(ssl, "create_default_context", strict_like_3_13)
+        assert not proxy._verifying_context().verify_flags & ssl.VERIFY_X509_STRICT
+
+
+class TestPumpBackpressure:
+    """One tunnel's backlog is bounded, and a backed-up tunnel stalls no other.
+
+    MEASURED (an `aws s3 sync` through a blind CONNECT tunnel, sent faster than
+    the hop leg drained): `_PumpLoop` kept reading the source while its peer
+    was backed up, rebuilding the backlog as one bytes object on every read and
+    every partial send. Two tunnels reached 4.15 MB of backlog each, the one
+    pump thread ran 99.5% of a core (86% kernel), and holding the GIL it
+    delayed every other thread ~2.4 s: /health took 1-11 s and Remote Control
+    bridges lost their heartbeats and gave up.
+
+    Every tunnel here is a socketpair into a `_PumpLoop` of its own, with a
+    4 KiB send buffer on the slow side so the peer "stops draining" at once.
+    """
+
+    CEILING = 2 * 1024 * 1024        # the pump's cap is ~1 MiB, plus one read
+    PAYLOAD = (bytes(range(251)) * (8 * 1024 * 1024 // 251 + 1))[:8 * 1024 * 1024]
+
+    @staticmethod
+    def _tunnel(loop, on_close=None, buf=4096):
+        """feed -> [pump: src -> dst] -> far, `far` never reading by itself."""
+        feed, src = socket.socketpair()
+        dst, far = socket.socketpair()
+        for s in (dst, far):
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, buf)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, buf)
+        loop.add(src, dst, on_close)
+        return feed, src, dst, far
+
+    @staticmethod
+    def _closer():
+        """An `on_close` that records which socket ended the pair."""
+        calls = []
+
+        def on_close(closed_by):
+            calls.append(closed_by)
+
+        on_close._wants_closer = True
+        return on_close, calls
+
+    @staticmethod
+    def _read_to_eof(sock, timeout=20) -> bytes:
+        """Every byte until a clean EOF. A reset raises, a stall times out."""
+        sock.settimeout(timeout)
+        got = bytearray()
+        while chunk := sock.recv(1 << 20):
+            got += chunk
+        return bytes(got)
+
+    @staticmethod
+    def _wait(cond, seconds=5) -> bool:
+        deadline = time.monotonic() + seconds
+        while not cond() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return cond()
+
+    @staticmethod
+    def _backlog(loop, dst) -> int:
+        with loop._lock:
+            return len(loop._pending.get(dst, b""))
+
+    def _blast(self, feed, data=None):
+        """Send `data` as fast as the pump takes it; `done` is set when ALL of
+        it has been accepted, which a held-back source never reaches."""
+        done = threading.Event()
+
+        def run():
+            try:
+                feed.sendall(self.PAYLOAD if data is None else data)
+            except OSError:
+                return
+            done.set()
+
+        threading.Thread(target=run, daemon=True).start()
+        return done
+
+    def _settle(self, loop, dst, done) -> int:
+        """Peak backlog once it stops growing, or once the feeder finished."""
+        peak = last = -1
+        steady, deadline = time.monotonic(), time.monotonic() + 10
+        while not done.is_set() and time.monotonic() < deadline:
+            n = self._backlog(loop, dst)
+            peak = max(peak, n)
+            if n != last:
+                last, steady = n, time.monotonic()
+            elif n and time.monotonic() - steady > 0.3:
+                break
+            time.sleep(0.01)
+        return max(peak, self._backlog(loop, dst))
+
+    @staticmethod
+    def _close(loop, *socks):
+        loop.release_pairs()
+        for s in socks:
+            s.close()
+
+    def test_a_backed_up_tunnel_keeps_its_backlog_bounded_and_the_rest_fast(self):
+        from cswap_pin.proxy import _PumpLoop
+
+        loop = _PumpLoop()
+        feed, src, dst, far = self._tunnel(loop)
+        feed2, in2 = socket.socketpair()
+        out2, sink2 = socket.socketpair()
+        loop.add(in2, out2)
+        done = self._blast(feed)
+        try:
+            peak = self._settle(loop, dst, done)
+            started = time.monotonic()
+            feed2.sendall(b"ping")
+            sink2.settimeout(5)
+            got = sink2.recv(16)
+            round_trip = time.monotonic() - started
+            assert peak <= self.CEILING, (
+                f"{peak} bytes sit in the pump for one backed-up tunnel "
+                f"(ceiling {self.CEILING}): it kept reading its source")
+            assert not done.is_set(), "the source was never held back"
+            assert got == b"ping"
+            assert round_trip < 0.5, (
+                f"a light tunnel's round trip took {round_trip:.2f}s while "
+                f"another was backed up")
+        finally:
+            self._close(loop, feed, far, feed2, sink2, in2, out2)
+
+    def test_a_held_back_source_resumes_and_every_byte_arrives_in_order(self):
+        from cswap_pin.proxy import _PumpLoop
+
+        loop = _PumpLoop()
+        feed, src, dst, far = self._tunnel(loop)
+        done = self._blast(feed)
+        try:
+            self._settle(loop, dst, done)
+            assert not done.is_set(), "precondition: the source was held back"
+            got = bytearray()
+            far.settimeout(10)
+            while len(got) < len(self.PAYLOAD):
+                chunk = far.recv(65536)
+                assert chunk, f"the tunnel ended after {len(got)} bytes"
+                got += chunk
+            assert got == self.PAYLOAD
+            assert done.wait(5), "the source never finished: reading never resumed"
+        finally:
+            self._close(loop, feed, far)
+
+    def test_a_source_that_ends_with_a_backlog_still_delivers_every_byte(self):
+        from cswap_pin.proxy import _PumpLoop
+
+        loop = _PumpLoop()
+        on_close, calls = self._closer()
+        feed, src, dst, far = self._tunnel(loop, on_close)
+        data = self.PAYLOAD[:512 * 1024]
+        try:
+            assert self._blast(feed, data).wait(5)
+            feed.close()
+            got = self._read_to_eof(far)
+            assert len(got) == len(data), (
+                f"the tunnel dropped {len(data) - len(got)} queued bytes at EOF")
+            assert got == data
+            assert self._wait(lambda: not loop.live_pairs())
+            assert calls == [src], "on_close must run once, naming the source"
+            assert not loop._pending and not loop._draining
+        finally:
+            self._close(loop, feed, far)
+
+    def test_a_slow_client_receives_the_whole_stream_the_upstream_sent_and_closed(self):
+        from cswap_pin.proxy import _PumpLoop
+
+        loop = _PumpLoop()
+        feed, src, dst, far = self._tunnel(loop, buf=8192)
+        data = (self.PAYLOAD * 3)[:20 * 1024 * 1024]
+
+        def send():
+            feed.sendall(data)
+            feed.close()
+
+        threading.Thread(target=send, daemon=True).start()
+        try:
+            time.sleep(0.3)  # the client lags behind
+            got = self._read_to_eof(far, timeout=30)
+            assert len(got) == len(data), f"short by {len(data) - len(got)} bytes"
+            assert got == data
+        finally:
+            self._close(loop, feed, far)
+
+    def test_a_drain_toward_a_source_that_cannot_receive_does_not_end_the_pair(self):
+        from cswap_pin.proxy import _PumpLoop
+
+        loop = _PumpLoop()
+        feed, src, dst, far = self._tunnel(loop)
+        data = self.PAYLOAD[:256 * 1024]
+        try:
+            assert self._blast(feed, data).wait(5)
+            feed.close()
+            assert self._wait(lambda: src in loop._draining)
+            far.sendall(b"late")  # forwarded to a closed upstream: EPIPE
+            assert self._read_to_eof(far) == data
+        finally:
+            self._close(loop, feed, far)
+
+    def test_a_peer_that_never_reads_ends_the_drain_at_its_bound(self, monkeypatch):
+        from cswap_pin import proxy
+
+        monkeypatch.setattr(proxy, "_PUMP_DRAIN_IDLE_SECONDS", 0.5)
+        loop = proxy._PumpLoop()
+        on_close, calls = self._closer()
+        feed, src, dst, far = self._tunnel(loop, on_close)
+        feed2, in2 = socket.socketpair()
+        out2, sink2 = socket.socketpair()
+        loop.add(in2, out2)
+        try:
+            assert self._blast(feed, self.PAYLOAD[:256 * 1024]).wait(5)
+            feed.close()
+            assert self._wait(lambda: src in loop._draining)
+            assert loop.live_pairs() == 2, "the drain ended before its bound"
+            # a1280ea: the drain does not stall the pump for another tunnel
+            feed2.sendall(b"ping")
+            sink2.settimeout(2)
+            assert sink2.recv(16) == b"ping"
+            assert self._wait(lambda: loop.live_pairs() == 1)
+            assert calls == [src]
+            assert not loop._pending and not loop._draining
+        finally:
+            self._close(loop, feed, far, feed2, sink2, in2, out2)
+
+    def test_a_draining_pair_a_release_lets_go_leaves_no_mark(self):
+        from cswap_pin import proxy
+
+        loop = proxy._PumpLoop()
+        on_close, calls = self._closer()
+        feed, src, dst, far = self._tunnel(loop, on_close)
+        try:
+            assert self._blast(feed, self.PAYLOAD[:256 * 1024]).wait(5)
+            feed.close()
+            assert self._wait(lambda: src in loop._draining)
+            assert loop.release_pairs() == 1
+            assert not loop._draining and not loop._pending
+            assert calls == [proxy._RELEASED_BY_DRAIN]
+        finally:
+            self._close(loop, feed, far)
+
+    @pytest.mark.parametrize("how", ["source_eof", "released_while_held_back"])
+    def test_a_closed_pair_leaves_no_pending_entry(self, how, monkeypatch):
+        from cswap_pin import proxy
+
+        # The far side never reads: a source EOF drains to its bound, not at once.
+        monkeypatch.setattr(proxy, "_PUMP_DRAIN_IDLE_SECONDS", 0.5)
+        loop = proxy._PumpLoop()
+        feed, src, dst, far = self._tunnel(loop)
+        # Held back needs more than the cap; plain EOF needs a backlog, not a pause.
+        data = None if how == "released_while_held_back" else self.PAYLOAD[:256 * 1024]
+        done = self._blast(feed, data)
+        try:
+            peak = self._settle(loop, dst, done)
+            assert peak > 0, "precondition: the peer is not draining"
+            if how == "source_eof":
+                feed.close()
+            else:
+                assert loop.release_pairs() == 1
+            deadline = time.monotonic() + 5
+            while loop.live_pairs() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert loop.live_pairs() == 0, "precondition: the pair ended"
+            assert not loop._pending, (
+                f"a closed pair left {len(loop._pending)} entr(y/ies) in "
+                f"`_pending`: {[len(v) for v in loop._pending.values()]} bytes")
+        finally:
+            self._close(loop, feed, far)
+
+
+class TestBulkTunnelsHaveTheirOwnPump:
+    """A CONNECT to a host the pin does not serve runs on its own selector.
+
+    MEASURED: one `aws s3 sync` to a non-Anthropic host (every command Claude
+    Code runs inherits HTTPS_PROXY, so aws, curl, pip and git all reach the pin
+    as blind CONNECTs) shared one pump thread with the Remote Control bridges
+    and deafened 12 of 17. The served hosts are the ones `_capped_tunnel`
+    already exempts from the cap. Draining and handover still count both loops:
+    `_PUMP` answers for the bulk one.
+    """
+
+    @staticmethod
+    def _loop_for(certdir, monkeypatch, host):
+        """The `_PumpLoop` a blind CONNECT to `host` is handed to."""
+        import cswap_pin.proxy as pp
+
+        seen = []
+        real_add = pp._PumpLoop.add
+
+        def spy(self, *a, **k):
+            seen.append(self)
+            return real_add(self, *a, **k)
+
+        monkeypatch.setattr(pp._PumpLoop, "add", spy)
+        monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
+        hop = _StallingHop(delay=0.0, target=("127.0.0.1", 9), hold_rest=True)
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: None,
+                            upstream=("127.0.0.1", 9),
+                            chain_proxy=("127.0.0.1", hop.port))
+        proxy.start()
+        pp._PUMP.reset_for_tests()
+        raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+        try:
+            raw.settimeout(10)
+            raw.sendall(f"CONNECT {host}:443 HTTP/1.1\r\n"
+                        f"Host: {host}:443\r\n\r\n".encode())
+            assert b" 200 " in raw.recv(4096), "the tunnel was not set up"
+            deadline = time.monotonic() + 5
+            while not seen and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert seen, "the pair never reached a pump"
+            return seen[0]
+        finally:
+            raw.close()
+            pp._PUMP.release_pairs()
+            proxy.stop()
+            hop.stop()
+
+    def test_a_served_host_stays_on_the_bridges_pump(
+            self, certdir, monkeypatch):
+        import cswap_pin.proxy as pp
+
+        loop = self._loop_for(certdir, monkeypatch, "bridge.claudeusercontent.com")
+        assert loop is pp._PUMP
+
+    def test_a_host_the_pin_does_not_serve_gets_a_pump_of_its_own(
+            self, certdir, monkeypatch):
+        import cswap_pin.proxy as pp
+
+        loop = self._loop_for(certdir, monkeypatch, "bulk.example.test")
+        assert loop is not pp._PUMP, (
+            "a blind tunnel to a host the pin does not serve runs on the "
+            "selector thread that carries the Remote Control bridges")
+        assert loop is pp._BULK_PUMP
+
+    def test_the_process_counts_a_tunnel_on_the_bulk_pump(self):
+        """What the drain, the reaper's marker and the claim read is `_PUMP`.
+        A tunnel on the other loop must not fall out of any of the four."""
+        import cswap_pin.proxy as pp
+
+        pp._PUMP.reset_for_tests()
+        pairs = [socket.socketpair(), socket.socketpair()]
+        try:
+            pp._BULK_PUMP.add(*pairs[0])
+            assert pp._PUMP.live_pairs() == 1
+            assert pp._PUMP.live_pairs("tunnel") == 1
+            assert pp._PUMP.live_pairs("bridge") == 0
+            time.sleep(0.05)
+            assert pp._PUMP.quiet_for() >= 0.05, (
+                "the drain's silence clock never saw the bulk loop move")
+            assert pp._PUMP.release_pairs("bridge") == 0
+            assert pp._PUMP.release_pairs() == 1
+            assert pairs[0][0].fileno() == -1, "the release left the pair open"
+            assert pp._PUMP.live_pairs() == 0
+
+            pp._BULK_PUMP.add(*pairs[1])
+            pp._PUMP.reset_for_tests()
+            assert pp._PUMP.live_pairs() == 0 and pp._PUMP.quiet_for() == 0.0
+        finally:
+            pp._BULK_PUMP.reset_for_tests()
+            for pair in pairs:
+                for s in pair:
+                    s.close()
+
+
+class TestSessionAffinityOnMessages:
+    """A warm session keeps the account it was on after cswap switches the
+    live one: the pin sends its `/v1/messages` with the kept slot's STORED
+    token. Opt-in, off by default (`_wire` arms these cases the way cswap
+    does: `dynamic` plus `cache_aware`; the arming cases cover the rule). Anything the
+    pin cannot vouch for (cold, new, no headroom, expired, unknown slot)
+    forwards the client's bearer exactly as it always did.
+
+    Slot 1 holds `tok-A` (the account the sessions were on), slot 2 holds
+    `tok-B` (live now, what Claude Code sends after the switch).
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    FAR = 4102444800000  # expiresAt, year 2100, ms
+    TOKENS = {"1": "tok-A", "2": "tok-B"}
+    BODY = json.dumps({"model": "claude-fable-5-1", "max_tokens": 4})
+    EMAIL = "acct-{}@example.com"
+
+    @classmethod
+    def _wire(cls, monkeypatch, certdir, armed=True, pct=10.0, walled=False,
+              expires=None, thresholds=None, disabled=None, fail=False,
+              no_expiry=False, carry=False):
+        """A fake switcher over two slots; returns what it was asked.
+        ``pct`` is slot 1's usage on both windows (None: no reading).
+        ``thresholds`` / ``disabled`` give the switcher the per-slot threshold
+        and disabled-slot methods; left None it has neither, as an older
+        claude-swap host. ``fail``: the usage read raises. ``no_expiry``:
+        slot 1's stored credential carries no `expiresAt`. ``carry``: a
+        started pin's tick writes the bindings for a successor; off, so that
+        the next pin built in this process (a stand-in for a handover only in
+        a case that says so) does not read them. A case moves
+        ``seen.wall1`` to change what the next usage read says of slot 1,
+        ``seen.expires1`` to change slot 1's `expiresAt` (None: far off), and
+        ``seen.age1`` to say how many seconds before that read the store row
+        was fetched (None: it never was).
+        Every snapshot rebuild runs inline unless a case swaps
+        `_spawn_usage_header_recorder`."""
+        from cswap_pin import proxy as pp
+
+        if not carry:
+            monkeypatch.setattr(pp.PinProxy, "_carry_affinity_tick",
+                                lambda self: None)
+        seen = types.SimpleNamespace(
+            reads=[], fetches=[], consumed=[], switched=[], walled=[],
+            recorded=[], logs=[], fetch_times=[], wall1=walled, age1=0.0,
+            last_good1=None, expires1=expires, usage1=None if pct is None else {
+                "five_hour": {"pct": pct}, "seven_day": {"pct": pct}})
+
+        def _creds(num, mail):
+            seen.reads.append(num)
+            exp = (seen.expires1 if num == "1" and seen.expires1 is not None
+                   else cls.FAR)
+            cred = {"accessToken": cls.TOKENS[num], "expiresAt": exp}
+            if num == "1" and no_expiry:
+                del cred["expiresAt"]
+            return json.dumps({"claudeAiOauth": cred})
+
+        def _entries(fetch=None):
+            seen.fetches.append(fetch)
+            seen.fetch_times.append(time.monotonic())
+            if fail:
+                raise OSError("keychain")
+            low = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0}}
+            read_at = time.time()
+            return {
+                "1": types.SimpleNamespace(
+                    walled=seen.wall1, decision_value=lambda: seen.usage1,
+                    last_good=seen.last_good1,
+                    fetched_at=None if seen.age1 is None
+                    else read_at - seen.age1),
+                "2": types.SimpleNamespace(
+                    walled=False, decision_value=lambda: low,
+                    last_good=None, fetched_at=read_at),
+            }
+
+        def _record(num, headers):  # the store keeps what a reply said
+            seen.recorded.append(num)
+            try:
+                pct = 100.0 * float(
+                    headers["anthropic-ratelimit-unified-5h-utilization"])
+            except (KeyError, ValueError):
+                return True
+            if num == "1":
+                seen.usage1 = {"five_hour": {"pct": pct},
+                               "seven_day": {"pct": pct}}
+            return True
+
+        sw = types.SimpleNamespace(
+            _get_sequence_data=lambda: {"accounts": {
+                n: {"email": cls.EMAIL.format(n)} for n in cls.TOKENS}},
+            read_account_credentials=_creds,
+            usage_entries_by_account=_entries,
+            record_usage_headers=_record,
+            consume_backup_grant=lambda *a, **k: seen.consumed.append(a),
+            switch=lambda *a, **k: seen.switched.append(k),
+            current_account_number=lambda: "2",
+            _read_credentials=lambda: json.dumps(
+                {"claudeAiOauth": {"accessToken": cls.TOKENS["2"]}}),
+            resolve_account=lambda n: (n, cls.EMAIL.format(n), "org"),
+        )
+        if thresholds is not None:
+            sw.account_switch_thresholds = lambda: dict(thresholds)
+        if disabled is not None:
+            sw.is_account_disabled = lambda n: n in disabled
+        real_require = pp.require
+        monkeypatch.setattr(pp, "require", lambda name: (
+            types.SimpleNamespace(ClaudeAccountSwitcher=lambda: sw)
+            if name == "switcher" else real_require(name)))
+        monkeypatch.setattr(pp, "_switch_off_walled_account",
+                            lambda *a, **k: seen.walled.append(a) or False)
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder",
+                            lambda fn: fn())
+        monkeypatch.setattr(pp, "_log_lifecycle", seen.logs.append)
+        for state in (pp._affinity, pp._affinity_idents, pp._affinity_kept,
+                      pp._affinity_rest, pp._affinity_logged,
+                      pp._affinity_dropped, pp._affinity_why,
+                      pp._affinity_declined, pp._AFFINITY_CACHE,
+                      pp._affinity_last, pp._affinity_carried,
+                      pp._affinity_unseen,
+                      pp._usage_header_seen, pp._usage_header_spawn_seen):
+            state.clear()
+        (certdir / pp._AFFINITY_CARRY_FILE).unlink(missing_ok=True)
+        pp._affinity_snap.update(
+            tried=float("-inf"), at=float("-inf"), busy=False, stuck=0,
+            failures=0, ms=None)
+        pp._affinity_pings.update(sent=0, hit=0)
+        pp._affinity_ping_cost.update(dict.fromkeys(pp._affinity_ping_cost, 0))
+        pp._affinity_pings["refused"].clear()
+        pp._affinity_captures.update(kept=0)
+        pp._affinity_captures["dropped"].clear()
+        pp._rebuild_counts.update(kept=0)
+        pp._rebuild_counts["dropped"].clear()
+        pp._form_pings.clear()
+        pp._affinity_carry.update(sent=0, landed=0)
+        # ARMED THE WAY CSWAP ARMS IT: dynamic + cache_aware. The CI host's
+        # claude-swap has no `cache_aware` and turns `dynamic` into `best`, so
+        # the loaded settings are faked; `seen.loaded` is what a case flips.
+        # The real modules are patched, not replaced: other cases patch
+        # attributes of `claude_swap.autoswitch` the pin reads.
+        from claude_swap import autoswitch, settings as cs_settings
+        seen.loaded = types.SimpleNamespace(
+            strategy="dynamic", cache_aware=armed, threshold=90.0,
+            cache_ttl_seconds=3600.0)
+        monkeypatch.setattr(cs_settings, "load_settings",
+                            lambda root: seen.loaded)
+        # the bar is the threshold, as on the CI host, whatever `dynamic`
+        # means to the installed claude-swap
+        monkeypatch.setattr(autoswitch, "proactive_switch_bar_pct",
+                            lambda _strategy, t: t, raising=False)
+        return seen
+
+    @staticmethod
+    def _seed(session, token, age=0.0):
+        """The session's last /v1/messages was `age` seconds ago, on `token`."""
+        from cswap_pin import proxy as pp
+        pp._affinity[session] = (token, time.monotonic() - age)
+
+    @staticmethod
+    def _age_unseen(token, seconds):
+        """The rebuild for the unseen ``token`` started `seconds` ago, and it
+        was first seen as long before."""
+        from cswap_pin import proxy as pp
+        first, last = pp._affinity_unseen[token]
+        pp._affinity_unseen[token] = (first - seconds, last - seconds)
+
+    @classmethod
+    def _send(cls, certdir, calls, body=None, trace=None,
+              path="/v1/messages", **upstream_kw):
+        """Each of ``calls`` ((bearer, session) or a kwargs dict for
+        `_request_through_proxy`) through a real MITM; returns the statuses
+        and every Authorization the upstream saw (every body it saw is left
+        in `cls.bodies`). ``trace``: a file the request trace goes to."""
+        from cswap_pin import proxy as pp
+        from cswap_pin.proxy import PinProxy
+
+        upstream = _FakeUpstream(certdir, **upstream_kw)
+        cls.bodies = upstream.bodies_seen
+        cls.heads = upstream.heads_seen
+        proxy = PinProxy(certdir=certdir,
+                         pin_token_provider=lambda: "PIN-TOKEN",
+                         upstream=("127.0.0.1", upstream.port))
+        if trace is not None:
+            (certdir / pp._TRACE_SWITCH_FILE).write_text(str(trace))
+            pp._TRACE_CACHE.clear()
+        proxy.start()
+        try:
+            if trace is not None:
+                proxy._trace_tick()  # the only thing that opens the handle
+            statuses = [_request_through_proxy(
+                proxy.port, certdir / "ca.pem", path,
+                body=body or cls.BODY,
+                **(c if isinstance(c, dict) else dict(
+                    bearer=c[0], extra_headers=(
+                        {"x-claude-code-session-id": c[1]} if c[1] else None)))
+            ) for c in calls]
+        finally:
+            proxy.stop()
+            upstream.stop()
+        return statuses, upstream.auths_seen
+
+    def case_off_forwards_each_requests_own_bearer(self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir, armed=False)
+        taken = []
+
+        class _Lock:
+            def __enter__(self):
+                taken.append(1)
+
+            def __exit__(self, *exc):
+                return False
+
+        monkeypatch.setattr(pp, "_affinity_lock", _Lock())
+        statuses, auths = self._send(
+            certdir, [("tok-A", "S"), ("tok-B", "S")], reply=self._util(0.42))
+        assert auths == ["Bearer tok-A", "Bearer tok-B"], auths
+        assert not (seen.reads or seen.fetches), (
+            "a switch that is off ran affinity code", seen)
+        assert not taken, "a reply under a switch that is off took the lock"
+
+    def case_switching_off_forgets_the_kept_slots(self, monkeypatch, certdir):
+        """Slots kept while armed would otherwise outlive the switch: a reply
+        at the bar then drops one and records it to the store, for a feature
+        that is off."""
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir)
+        self._send(certdir, [("tok-A", "S0")])
+        assert pp._affinity_kept, "armed, the first rebuild kept the slots"
+        seen.loaded.cache_aware = False
+        pp._AFFINITY_CACHE.clear()
+        self._send(certdir, [("tok-A", "S")], reply=self._util(0.95))
+        assert not (pp._affinity_kept or pp._affinity_dropped
+                    or pp._affinity_why), (
+            pp._affinity_kept, pp._affinity_dropped, pp._affinity_why)
+        assert seen.recorded == [], seen.recorded
+
+    def case_a_warm_session_keeps_its_account(self, monkeypatch, certdir):
+        seen = self._wire(monkeypatch, certdir)
+        statuses, auths = self._send(
+            certdir, [("tok-A", "S"), ("tok-B", "S"), ("tok-B", "S")])
+        assert auths == ["Bearer tok-A"] * 3, auths
+        assert statuses == [200, 200, 200], statuses
+        assert not seen.consumed and not seen.switched, seen
+        assert len(seen.fetches) == 1 and seen.fetches[0] == set(), (
+            "one rebuild serves the three requests, and its read may not "
+            "fetch (and so consume)", seen.fetches)
+
+    def case_a_cold_session_follows_the_live_account(self, monkeypatch, certdir):
+        self._wire(monkeypatch, certdir)
+        self._seed("S", "tok-A", age=7200)
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-B"], auths
+
+    def case_a_new_session_follows_the_live_account(self, monkeypatch, certdir):
+        self._wire(monkeypatch, certdir)
+        self._seed("S1", "tok-A")
+        _, auths = self._send(certdir, [("tok-B", "S2")])
+        assert auths == ["Bearer tok-B"], auths
+
+    def case_headroom_is_strictly_under_the_threshold(self, monkeypatch, certdir):
+        for pct, want in ((89.9, "tok-A"), (90.0, "tok-B"), (95.0, "tok-B")):
+            self._wire(monkeypatch, certdir, pct=pct)
+            self._seed("S", "tok-A")
+            _, auths = self._send(certdir, [("tok-B", "S")])
+            assert auths == [f"Bearer {want}"], (pct, auths)
+
+    def case_a_walled_kept_account_is_not_kept(self, monkeypatch, certdir):
+        self._wire(monkeypatch, certdir, walled=True)
+        self._seed("S", "tok-A")
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-B"], auths
+
+    def case_no_reading_is_no_headroom(self, monkeypatch, certdir):
+        self._wire(monkeypatch, certdir, pct=None)
+        self._seed("S", "tok-A")
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-B"], auths
+
+    @staticmethod
+    def _iso(ago_s):
+        import datetime as dt
+        return (dt.datetime.fromtimestamp(time.time() - ago_s, dt.timezone.utc)
+                .isoformat(timespec="seconds").replace("+00:00", "Z"))
+
+    def case_a_rolled_5h_window_on_a_fresh_reading_keeps_the_slot(
+            self, monkeypatch, certdir):
+        """cswap's fresh reading drops a window that just rolled (439e4043),
+        and the pin read the gap as "no reading" (3 of 3 measured declines
+        sat 14 s to 1 min after a roll). The last reading says it rolled:
+        0% there, and the slot is scored on the rest."""
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir)
+        seen.usage1 = {"seven_day": {"pct": 10.0}}
+        seen.last_good1 = {"five_hour": {"pct": 30.0, "resets_at": self._iso(60)},
+                           "seven_day": {"pct": 10.0,
+                                         "resets_at": self._iso(-86400)}}
+        self._seed("S", "tok-A")
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-A"], auths
+        seen.usage1 = {"seven_day": {"pct": 95.0}}  # and the rest still counts
+        pp._affinity_snap.update(tried=float("-inf"), at=float("-inf"))
+        self._seed("S", "tok-A")
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-B"], auths
+
+    def case_an_older_cswap_without_parse_reset_ts_knows_no_roll(
+            self, monkeypatch, certdir):
+        """`parse_reset_ts` is cswap's; one without it degrades to "no roll
+        known", the slot declining for the missing window as it always did."""
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir)
+        real = pp.require
+        monkeypatch.setattr(pp, "require", lambda name: (
+            types.SimpleNamespace() if name == "poll_policy" else real(name)))
+        seen.usage1 = {"seven_day": {"pct": 10.0}}
+        seen.last_good1 = {"five_hour": {"pct": 30.0, "resets_at": self._iso(60)},
+                           "seven_day": {"pct": 10.0,
+                                         "resets_at": self._iso(-86400)}}
+        self._seed("S", "tok-A")
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-B"], auths
+        assert pp._affinity_why[self.IDENT] == (
+            "a usage window has no reading"), pp._affinity_why
+
+    def case_a_window_that_never_rolled_is_still_no_reading(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        for last_good in (
+                None, {"five_hour": {"pct": None}, "seven_day": {"pct": 10.0}},
+                {"five_hour": {"pct": 30.0, "resets_at": self._iso(-3600)}},
+                {"five_hour": {"pct": 30.0}}):
+            seen = self._wire(monkeypatch, certdir)
+            seen.usage1 = {"seven_day": {"pct": 10.0}}
+            seen.last_good1 = last_good
+            self._seed("S", "tok-A")
+            _, auths = self._send(certdir, [("tok-B", "S")])
+            assert auths == ["Bearer tok-B"], (last_good, auths)
+            assert pp._affinity_why[self.IDENT] == (
+                "a usage window has no reading"), pp._affinity_why
+
+    def case_a_no_5h_account_is_kept_and_judged_on_its_week(
+            self, monkeypatch, certdir):
+        """An account whose 5h limit is gone stores a week and no 5h window
+        (account 8, 2026-10-31; its `scoped` rides along): its only wall is
+        the week's, so the gap is no "no reading". Kept under its bar,
+        dropped at it."""
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir)
+        for pct, want, why in ((30.0, "tok-A", None),
+                               (95.0, "tok-B", "at its bar")):
+            seen.usage1 = seen.last_good1 = {
+                "seven_day": {"pct": pct}, "scoped": [{"name": "Fable", "pct": 5.0}]}
+            pp._affinity_snap.update(tried=float("-inf"), at=float("-inf"))
+            self._seed("S", "tok-A")
+            _, auths = self._send(certdir, [("tok-B", "S")])
+            assert auths == [f"Bearer {want}"], (pct, auths)
+            assert pp._affinity_why[self.IDENT] == why, pp._affinity_why
+
+    def case_a_reading_too_old_to_trust_says_so(self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir, pct=None)
+        self._send(certdir, [("tok-A", "S0")])
+        assert pp._affinity_why[self.IDENT] == "its reading is too old to trust"
+
+    def case_an_expired_stored_token_is_never_refreshed(
+            self, monkeypatch, certdir):
+        seen = self._wire(monkeypatch, certdir, expires=1)
+        self._seed("S", "tok-A")
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-B"], auths
+        assert not seen.consumed, "affinity consumed a grant"
+
+    def case_a_client_token_in_no_slot_is_left_alone(self, monkeypatch, certdir):
+        self._wire(monkeypatch, certdir)
+        self._seed("S", "tok-A")
+        _, auths = self._send(certdir, [("tok-X", "S")])
+        assert auths == ["Bearer tok-X"], auths
+
+    def case_the_same_token_resolves_nothing(self, monkeypatch, certdir):
+        self._wire(monkeypatch, certdir)
+        self._seed("S", "tok-A")
+        _, auths = self._send(certdir, [("tok-A", "S")])
+        assert auths == ["Bearer tok-A"], auths
+
+    def case_two_tokens_of_one_slot_are_not_a_switch(self, monkeypatch, certdir):
+        """CC's own refresh, persisted by the collector: the kept bearer still
+        resolves to slot 1 (cached), and the client's new token scans to slot
+        1 as well, so the slots do not differ and nothing is injected."""
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+        pp._affinity_idents["tok-A-old"] = ("1", self.EMAIL.format("1"))
+        self._seed("S", "tok-A-old")
+        _, auths = self._send(certdir, [("tok-A", "S")])
+        assert auths == ["Bearer tok-A"], auths
+
+    def case_a_refusal_from_the_kept_account_is_taken_back(
+            self, monkeypatch, certdir):
+        """The client sees B's 200 and nothing of A's refusal; the wall and
+        switch machinery never hears of it; and neither the session nor a
+        second session kept on A tries A again. (A 404 is not here: it is
+        relayed, see `case_a_kept_404_is_relayed_not_resent`.)"""
+        from cswap_pin import proxy as pp
+        for code in (401, 403, 429):
+            seen = self._wire(monkeypatch, certdir)
+            self._seed("S1", "tok-A")
+            self._seed("S2", "tok-A")
+            statuses, auths = self._send(
+                certdir, [("tok-B", "S1"), ("tok-B", "S1"), ("tok-B", "S2")],
+                reject_bearer="tok-A", reject_status=code)
+            assert statuses == [200, 200, 200], (code, statuses)
+            assert auths == ["Bearer tok-A"] + ["Bearer tok-B"] * 3, (
+                code, auths)
+            assert not seen.walled and not seen.switched, (code, seen)
+            assert pp._affinity_rest, (code, pp._affinity_rest)
+            assert pp._affinity["S1"][0] != "tok-A", (code, pp._affinity["S1"])
+            line = [l for l in seen.logs if "session affinity" in l][0]
+            assert str(code) in line and "rested" in line, (code, line)
+
+    @staticmethod
+    def _creds(head):
+        """The credential headers of one request head the upstream saw."""
+        return {l.split(":", 1)[0].lower(): l.split(":", 1)[1].strip()
+                for l in head.split("\r\n")[1:]
+                if l.lower().startswith(("authorization:", "x-api-key:"))}
+
+    @staticmethod
+    def _helper(token, session, **headers):
+        """A `claude -p` step on an apiKeyHelper: the same key twice, as
+        `x-api-key` and as the bearer."""
+        return dict(bearer=token, extra_headers={
+            "x-claude-code-session-id": session, "x-api-key": token, **headers})
+
+    def case_a_helper_shaped_request_is_kept_on_one_credential(
+            self, monkeypatch, certdir):
+        """An apiKeyHelper session sends its key as `x-api-key` AND as the
+        bearer. Kept on slot 1 it must go out with slot 1's token in both, or
+        the API sees two credentials. A key in no slot is not touched."""
+        self._wire(monkeypatch, certdir)
+        self._seed("S", "tok-A")
+        self._seed("S2", "tok-A")
+        statuses, auths = self._send(
+            certdir, [self._helper("tok-B", "S"), self._helper("tok-X", "S2")])
+        assert statuses == [200, 200], statuses
+        assert [self._creds(h) for h in self.heads] == [
+            {"authorization": "Bearer tok-A", "x-api-key": "tok-A"},
+            {"authorization": "Bearer tok-X", "x-api-key": "tok-X"}], self.heads
+
+    def case_an_x_api_key_unlike_the_bearer_is_never_kept(
+            self, monkeypatch, certdir):
+        """Two different credentials are the client's own business: the request
+        is forwarded as it came, and the session's binding is left alone, so
+        its next plain request is kept."""
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+        self._seed("S", "tok-A")
+        at = pp._affinity["S"]
+        _, auths = self._send(certdir, [
+            dict(bearer="tok-B", extra_headers={
+                "x-claude-code-session-id": "S", "x-api-key": "sk-other"}),
+            ("tok-B", "S")])
+        assert self._creds(self.heads[0]) == {
+            "authorization": "Bearer tok-B", "x-api-key": "sk-other"}, self.heads
+        assert auths[1] == "Bearer tok-A", auths
+        assert pp._affinity["S"][0] == "tok-A" and at[1] <= pp._affinity["S"][1]
+
+    def case_a_helper_shaped_kept_request_draws_no_take_back(
+            self, monkeypatch, certdir):
+        """The 401 a request with two different credentials draws was resting
+        the kept slot for a minute, and every warm session that asked in that
+        minute was moved to the live account."""
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir)
+        self._seed("S", "tok-A")
+        statuses, auths = self._send(
+            certdir, [self._helper("tok-B", "S")], reject_two_credentials=True,
+            reject_status=401, reject_body=b"more than one credential")
+        assert (statuses, auths) == ([200], ["Bearer tok-A"]), (statuses, auths)
+        assert not pp._affinity_rest, pp._affinity_rest
+        assert not [l for l in seen.logs if "answered" in l], seen.logs
+
+    def _prime_then_rotate(self, monkeypatch, certdir):
+        """Slot 1's snapshot holds `tok-A`; the store then moves the slot to
+        `tok-A2`, as a cswap refresh does a second before a kept request."""
+        monkeypatch.setattr(type(self), "TOKENS", {"1": "tok-A", "2": "tok-B"})
+        seen = self._wire(monkeypatch, certdir)
+        self._send(certdir, [("tok-A", "S0")])
+        monkeypatch.setattr(type(self), "TOKENS", {"1": "tok-A2", "2": "tok-B"})
+        self._seed("S", "tok-A")
+        return seen
+
+    def case_a_kept_401_after_a_token_rotation_is_resent_on_the_new_token(
+            self, monkeypatch, certdir):
+        """78eb8a8e: cswap's freshen rotated slot 1's token a second before a
+        kept request carried the old one, and the take-back moved the session
+        onto the live account (a 243,630-token cache write). The 401 is read
+        against the store (a rebuild forced now, on its own thread) and the
+        request goes again on the slot, on the token it stores now."""
+        from cswap_pin import proxy as pp
+        seen = self._prime_then_rotate(monkeypatch, certdir)
+        spawned = []
+
+        def _thread(fn):  # a real thread, as in the daemon
+            spawned.append(fn)
+            threading.Thread(target=fn, daemon=True).start()
+
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", _thread)
+        statuses, auths = self._send(
+            certdir, [("tok-B", "S")], reject_bearer="tok-A", reject_status=401)
+        assert (statuses, auths) == ([200], ["Bearer tok-A", "Bearer tok-A2"]), (
+            statuses, auths)
+        assert len(spawned) == 1, "the store is read by one rebuild, off this thread"
+        assert not pp._affinity_rest, pp._affinity_rest
+        assert pp._affinity["S"][0] == "tok-A", pp._affinity["S"]
+        assert not [l for l in seen.logs if "rested" in l or "live" in l], seen.logs
+        (line,) = [l for l in seen.logs if "rotated" in l]
+        assert "slot 1" in line and "tok-" not in line, line
+        # the binding is the slot: its next request is sent on the new token
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-A2"], auths
+
+    def case_a_helper_shaped_kept_401_after_a_rotation_resends_one_credential(
+            self, monkeypatch, certdir):
+        """Rewriting only Authorization on the resend is round 2's two
+        credentials (ff789a0): both headers carry the new token."""
+        self._prime_then_rotate(monkeypatch, certdir)
+        statuses, _ = self._send(
+            certdir, [self._helper("tok-B", "S")], reject_bearer="tok-A",
+            reject_status=401, reject_two_credentials=True)
+        assert statuses == [200], statuses
+        assert [self._creds(h) for h in self.heads] == [
+            {"authorization": "Bearer tok-A", "x-api-key": "tok-A"},
+            {"authorization": "Bearer tok-A2", "x-api-key": "tok-A2"}], self.heads
+
+    def case_a_kept_401_with_the_store_unchanged_is_taken_back(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir)
+        self._seed("S", "tok-A")
+        statuses, auths = self._send(
+            certdir, [("tok-B", "S")], reject_bearer="tok-A", reject_status=401)
+        assert (statuses, auths) == ([200], ["Bearer tok-A", "Bearer tok-B"]), (
+            statuses, auths)
+        assert len(seen.fetches) == 2, ("the 401 reads the store once", seen.fetches)
+        assert pp._affinity_rest and "S" not in pp._affinity, pp._affinity
+        assert not [l for l in seen.logs if "rotated" in l], seen.logs
+
+    def case_a_resend_on_the_rotated_token_that_is_also_refused_is_taken_back(
+            self, monkeypatch, certdir):
+        """At most one extra attempt: kept, kept on the new token, live."""
+        from cswap_pin import proxy as pp
+        self._prime_then_rotate(monkeypatch, certdir)
+        statuses, auths = self._send(
+            certdir, [("tok-B", "S")], reject_bearer={"tok-A", "tok-A2"},
+            reject_status=401)
+        assert (statuses, auths) == (
+            [200], ["Bearer tok-A", "Bearer tok-A2", "Bearer tok-B"]), (
+            statuses, auths)
+        assert pp._affinity_rest and "S" not in pp._affinity, pp._affinity
+
+    def case_only_a_401_reads_the_store_for_a_rotation(
+            self, monkeypatch, certdir):
+        """A 403 or a 429 is no stale token: taken back at once, no re-read."""
+        from cswap_pin import proxy as pp
+        for code in (403, 429):
+            seen = self._prime_then_rotate(monkeypatch, certdir)
+            statuses, auths = self._send(
+                certdir, [("tok-B", "S")], reject_bearer="tok-A",
+                reject_status=code)
+            assert (statuses, auths) == ([200], ["Bearer tok-A", "Bearer tok-B"]), (
+                code, statuses, auths)
+            assert len(seen.fetches) == 1 and pp._affinity_rest, (code, seen)
+
+    def case_a_rebuild_that_does_not_land_in_time_takes_the_session_back(
+            self, monkeypatch, certdir):
+        """The wait is bounded: a store that answers late is today's take-back,
+        never a longer stall."""
+        from cswap_pin import proxy as pp
+        self._prime_then_rotate(monkeypatch, certdir)
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", lambda fn: None)
+        monkeypatch.setattr(pp, "_AFFINITY_REREAD_WAIT_S", 0.3)
+        t = time.monotonic()
+        statuses, auths = self._send(
+            certdir, [("tok-B", "S")], reject_bearer="tok-A", reject_status=401)
+        assert (statuses, auths) == ([200], ["Bearer tok-A", "Bearer tok-B"]), (
+            statuses, auths)
+        assert time.monotonic() - t < 5, "the wait was not bounded"
+        assert pp._affinity_rest, pp._affinity_rest
+
+    def case_a_kept_token_three_minutes_from_expiry_is_kept(
+            self, monkeypatch, certdir):
+        """cswap refreshes only at or after expiry, so the pin's own margin is
+        a minute, not cswap's five (11 warm moves in window 3). The ping and
+        `/health` stay on cswap's buffer."""
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir,
+                   expires=int(time.time() * 1000) + 3 * 60_000)
+        self._seed("S", "tok-A")
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-A"], auths
+        with pp._affinity_lock:
+            assert not pp._affinity_slot_kept(
+                ("1", self.EMAIL.format("1")), time.monotonic())
+
+    def case_a_kept_token_thirty_seconds_from_expiry_is_declined(
+            self, monkeypatch, certdir):
+        seen = self._wire(monkeypatch, certdir,
+                          expires=int(time.time() * 1000) + 30_000)
+        self._seed("S", "tok-A")
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-B"], auths
+        assert [l for l in seen.logs if "its stored token has expired" in l], (
+            seen.logs)
+
+    def case_a_kept_404_is_relayed_not_resent(self, monkeypatch, certdir):
+        """A resend after a kept 404 answered 404 again every time it was
+        measured (12 of 12, then 0 of 40 came back 200): the thread the 404
+        names is not on the live account either. The client hears the 404 and
+        sends the full replay itself, which routes to the kept slot, where the
+        cache is. The session stays bound, the slot is not rested, and the
+        kept body (it names a thread that is gone) is forgotten."""
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir)
+        body = json.dumps({"type": "error", "error": {
+            "type": "not_found_error",
+            "message": "No thread state was found for the requested "
+                       "`previous_message_id`."}}).encode()
+        self._seed("S1", "tok-A")
+        self._seed("S2", "tok-A")
+        pp._affinity_last["S1"] = [
+            [], b"a kept body", 3600.0, 0, time.monotonic(), 0, None,
+            "/v1/messages", "tok-A", "full", None, None]
+        statuses, auths = self._send(
+            certdir, [("tok-B", "S1"), ("tok-B", "S1"), ("tok-B", "S2")],
+            reject_bearer="tok-A", reject_status=404, reject_body=body)
+        assert statuses == [404, 404, 404], statuses
+        assert auths == ["Bearer tok-A"] * 3, auths
+        assert not seen.walled and not seen.switched, seen
+        assert not pp._affinity_rest, pp._affinity_rest
+        assert pp._affinity["S1"][0] == "tok-A", pp._affinity["S1"]
+        assert "S1" not in pp._affinity_last
+        (line,) = [l for l in seen.logs if "session affinity" in l]
+        assert "404" in line and "relayed" in line and "resent" not in line, line
+
+    def case_the_429s_reset_decides_how_long_the_account_is_off(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        ident = ("1", self.EMAIL.format("1"))
+        for headers, lo, hi in (
+                (b"anthropic-ratelimit-unified-reset: %d\r\n"
+                 % (time.time() + 3600), 3000, 3700),
+                (b"", 30, 90)):
+            self._wire(monkeypatch, certdir)
+            self._seed("S", "tok-A")
+            self._send(certdir, [("tok-B", "S")], reject_bearer="tok-A",
+                       reject_status=429, reject_headers=headers)
+            off = pp._affinity_rest[ident] - time.monotonic()
+            assert lo < off < hi, (headers, off)
+
+    def case_other_credentials_and_sessionless_requests_are_untouched(
+            self, monkeypatch, certdir):
+        from cswap_pin.proxy import PinProxy
+        # the tick's own refresh would read the store whatever a request is
+        monkeypatch.setattr(PinProxy, "_affinity_refresh_tick", lambda self: None)
+        seen = self._wire(monkeypatch, certdir)
+        self._seed("S", "tok-A")
+        _, auths = self._send(certdir, [
+            dict(bearer=None, extra_headers={
+                "Authorization": "Basic zzz",
+                "x-claude-code-session-id": "S"}),
+            ("tok-B", None),
+        ])
+        assert auths == ["Basic zzz", "Bearer tok-B"], auths
+        assert not seen.reads, seen
+
+    def case_the_kept_accounts_usage_headers_are_recorded_to_its_slot(
+            self, monkeypatch, certdir):
+        seen = self._wire(monkeypatch, certdir)
+        self._seed("S", "tok-A")
+        _, auths = self._send(certdir, [("tok-B", "S")], reply=(
+            b"HTTP/1.1 200 OK\r\n"
+            b"anthropic-ratelimit-unified-5h-utilization: 0.42\r\n"
+            b"Content-Length: 2\r\n\r\n{}"))
+        assert auths == ["Bearer tok-A"], auths
+        assert seen.recorded == ["1"], seen.recorded
+
+    def case_the_slots_own_switch_threshold_applies(self, monkeypatch, certdir):
+        """The engine leaves a slot at its own `switchThreshold`, whichever
+        side of the global 90 that is, so the pin keeps a session there only
+        under that slot's own bar."""
+        for thresholds, pct, want in (
+                ({"1": 60.0}, 70.0, "tok-B"), ({"1": 60.0}, 50.0, "tok-A"),
+                ({"1": 95.0}, 92.0, "tok-A"), ({"2": 60.0}, 70.0, "tok-A")):
+            self._wire(monkeypatch, certdir, pct=pct, thresholds=thresholds)
+            self._seed("S", "tok-A")
+            _, auths = self._send(certdir, [("tok-B", "S")])
+            assert auths == [f"Bearer {want}"], (thresholds, pct, auths)
+
+    def case_the_dynamic_strategys_bar_applies(self, monkeypatch, certdir):
+        """Under `dynamic` the engine switches at 97, not at the configured
+        threshold. The released host has no `proactive_switch_bar_pct`, so this
+        one stands in for it."""
+        from claude_swap import autoswitch
+        from cswap_pin import proxy as pp
+        for strategy, pct, want in (
+                ("dynamic", 93.0, "tok-A"), ("dynamic", 97.0, "tok-B"),
+                ("best", 93.0, "tok-B")):
+            self._wire(monkeypatch, certdir, pct=pct)
+            monkeypatch.setattr(
+                autoswitch, "proactive_switch_bar_pct",
+                lambda strategy, t: 97.0 if strategy == "dynamic" else t,
+                raising=False)
+            monkeypatch.setattr(pp, "session_affinity_config",
+                                lambda _c: (3600.0, 90.0, strategy))
+            self._seed("S", "tok-A")
+            _, auths = self._send(certdir, [("tok-B", "S")])
+            assert auths == [f"Bearer {want}"], (strategy, pct, auths)
+
+    def case_a_disabled_slot_is_not_kept(self, monkeypatch, certdir):
+        for disabled, want in (({"1"}, "tok-B"), ({"2"}, "tok-A")):
+            self._wire(monkeypatch, certdir, disabled=disabled)
+            self._seed("S", "tok-A")
+            _, auths = self._send(certdir, [("tok-B", "S")])
+            assert auths == [f"Bearer {want}"], (disabled, auths)
+
+    def case_a_kept_session_sends_the_slots_stored_token(
+            self, monkeypatch, certdir):
+        """The session was last seen on `tok-A-old`, which resolves to slot 1;
+        slot 1 now stores `tok-A-new`. What goes out is the STORED token, never
+        the bearer the session happened to hold (every other case seeds the
+        session on the very string the slot stores, and cannot tell)."""
+        from cswap_pin import proxy as pp
+        monkeypatch.setattr(type(self), "TOKENS",
+                            {"1": "tok-A-new", "2": "tok-B"})
+        self._wire(monkeypatch, certdir)
+        pp._affinity_idents["tok-A-old"] = ("1", self.EMAIL.format("1"))
+        self._seed("S", "tok-A-old")
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-A-new"], auths
+
+    def case_the_request_thread_never_reads_the_store(
+            self, monkeypatch, certdir):
+        """A snapshot is rebuilt on a thread of its own, one at a time. A
+        request that finds none yet goes out on its own bearer and follows
+        the live account; once the rebuild has run, the next switch keeps."""
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir)
+        queued = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+        self._seed("S", "tok-A")
+        _, auths = self._send(certdir, [("tok-B", "S"), ("tok-B", "S2")])
+        assert auths == ["Bearer tok-B"] * 2, auths
+        assert not (seen.reads or seen.fetches), (
+            "the request thread read the store", seen)
+        assert len(queued) == 1, "a second rebuild started while one ran"
+        queued[0]()
+        self._seed("S", "tok-A")
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-A"], auths
+
+    def case_a_thread_that_cannot_start_does_not_cost_the_request(
+            self, monkeypatch, certdir):
+        """`threading.Thread.start` can raise (no threads left): the request
+        goes out on its own bearer, and the next one may try again."""
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+
+        def _no_thread(fn):
+            raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", _no_thread)
+        self._seed("S", "tok-A")
+        statuses, auths = self._send(certdir, [("tok-B", "S")])
+        assert (statuses, auths) == ([200], ["Bearer tok-B"]), (statuses, auths)
+        assert not pp._affinity_snap["busy"], "a rebuild that never started"
+
+    def case_a_snapshot_past_the_stale_bound_is_not_used(
+            self, monkeypatch, certdir):
+        """A snapshot older than the bound decides nothing: that request goes
+        out on the client's token, ONCE, and the session keeps its account
+        (a session idle for minutes while a switch happened is the common
+        case), and the request does not renew the session's clock either, so
+        the real TTL still ends it. The rebuild it started serves the next.
+        (A slot far under its bar is the exception: see
+        `case_a_stale_snapshot_keeps_a_slot_far_under_its_bar`.)"""
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir, pct=85.0)
+        queued = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+        self._send(certdir, [("tok-A", "S0")])
+        queued.pop()()  # the first snapshot
+        pp._affinity_snap["at"] -= pp._AFFINITY_STALE_S + 1
+        pp._affinity_snap["tried"] -= pp._AFFINITY_REFRESH_S + 1
+        self._seed("S", "tok-A", age=100)
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-B"], auths
+        assert len(queued) == 1, "the stale request starts a rebuild"
+        token, at = pp._affinity["S"]
+        assert token == "tok-A" and time.monotonic() - at >= 100, (token, at)
+        queued.pop()()
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-A"], (
+            "one stale request rebound the session to the client's token",
+            auths)
+
+    def _successor(self, certdir):
+        from cswap_pin.proxy import PinProxy
+        return PinProxy(certdir=certdir, pin_token_provider=lambda: None)
+
+    def case_a_successor_carries_a_warm_binding_in(self, monkeypatch, certdir):
+        """A handover started every session cold: 2 of the 7 switch-caused
+        busts were unmatched across handovers. The predecessor writes who is
+        bound to which slot (never a bearer, never a body); the successor
+        lands them with its first snapshot."""
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir, carry=True)
+        self._send(certdir, [("tok-A", "S0")])  # the tokens are known
+        self._seed("S", "tok-A", age=100)
+        self._successor(certdir)._carry_affinity_tick()
+        text = (certdir / pp._AFFINITY_CARRY_FILE).read_text()
+        assert "tok-" not in text, text
+        row = json.loads(text)["rows"]["S"]
+        assert row[:2] == list(self.IDENT), row
+        assert abs(row[2] - (time.time() - 100)) < 5, row
+        for state in (pp._affinity, pp._affinity_idents, pp._affinity_kept,
+                      pp._affinity_last):  # a new process holds none of it
+            state.clear()
+        pp._affinity_snap.update(tried=float("-inf"), at=float("-inf"))
+        seen.logs.clear()
+        self._successor(certdir)
+        assert any("carried 2 warm binding(s) in from the predecessor" in l
+                   for l in seen.logs), seen.logs
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-A"], auths
+
+    def case_a_carried_row_past_the_ttl_is_not_carried(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir)
+        (certdir / pp._AFFINITY_CARRY_FILE).write_text(json.dumps({"v": 1, "rows": {
+            "S": [*self.IDENT, time.time() - 7200]}}))
+        self._successor(certdir)
+        assert not pp._affinity_carried and not seen.logs, seen.logs
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-B"], auths
+
+    def case_a_request_that_beats_the_landing_binds_nothing(
+            self, monkeypatch, certdir):
+        """The carried row is the session's binding until the first snapshot
+        lands it: a request that comes first goes out on its own bearer and
+        must not overwrite the row by binding to it."""
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+        queued = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+        pp._affinity_carried["S"] = (self.IDENT, time.time() - 100)
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-B"] and "S" not in pp._affinity, auths
+        queued.pop()()
+        token, at = pp._affinity["S"]
+        assert token == "tok-A" and 90 < time.monotonic() - at < 130, (token, at)
+        assert not pp._affinity_carried
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-A"], auths
+
+    def case_a_carried_row_whose_slot_stores_no_token_is_dropped(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+        pp._affinity_carried["S"] = (("9", "gone@example.com"), time.time())
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-B"], auths
+        assert not pp._affinity_carried and pp._affinity["S"][0] == "tok-B"
+
+    def case_the_carry_is_written_only_when_armed_changed_and_every_5s(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir, carry=True)
+        self._send(certdir, [("tok-A", "S0")])
+        path = certdir / pp._AFFINITY_CARRY_FILE
+        proxy = self._successor(certdir)
+
+        def tick():
+            proxy._affinity_carry_at -= 6
+            proxy._carry_affinity_tick()
+            return set(json.loads(path.read_text())["rows"])
+
+        assert tick() == {"S0"}
+        self._seed("S", "tok-A")
+        proxy._carry_affinity_tick()
+        assert set(json.loads(path.read_text())["rows"]) == {"S0"}, "twice in 5 s"
+        assert tick() == {"S0", "S"}
+        self._seed("S0", "tok-A", age=7200)
+        assert tick() == {"S"}, "a row past the TTL stays out"
+        path.unlink()
+        proxy._stop = True  # it has handed its socket over
+        proxy._affinity_carry_at -= 6
+        proxy._carry_affinity_tick()
+        assert not path.exists(), "a generation that has handed over wrote"
+        proxy._stop = False
+        seen.loaded.cache_aware = False
+        pp._AFFINITY_CACHE.clear()
+        proxy._affinity_carry_at -= 6
+        proxy._carry_affinity_tick()
+        assert not path.exists(), "written while the switch is off"
+
+    def _stale(self, monkeypatch, certdir, **wire):
+        """A landed snapshot, then aged past `_AFFINITY_STALE_S`, with the
+        rebuild a request would start recorded in the returned list instead of
+        run."""
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir, **wire)
+        queued = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+        self._send(certdir, [("tok-A", "S0")])
+        queued.pop()()
+        pp._affinity_snap["at"] -= pp._AFFINITY_STALE_S + 1
+        pp._affinity_snap["tried"] -= pp._AFFINITY_REFRESH_S + 1
+        self._seed("S", "tok-A", age=100)
+        return seen, queued
+
+    def case_a_stale_snapshot_keeps_a_slot_far_under_its_bar(
+            self, monkeypatch, certdir):
+        """Past the stale bound but inside cswap's TRUST_MAX_AGE_S (06768fc8),
+        a slot read 80 points under its bar keeps the session: 12 of 17
+        measured declines had traffic within two minutes and no snapshot yet."""
+        from cswap_pin import proxy as pp
+        _, queued = self._stale(monkeypatch, certdir, pct=10.0)
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-A"], auths
+        assert len(queued) == 1, "the stale request still starts a rebuild"
+        pp._affinity_snap["at"] -= pp._AFFINITY_STALE_MAX_S
+        self._seed("S", "tok-A", age=100)
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-B"], ("past the trust bound", auths)
+
+    def case_a_stale_snapshot_within_the_margin_still_declines(
+            self, monkeypatch, certdir):
+        _, queued = self._stale(monkeypatch, certdir, pct=85.0)
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-B"], auths
+
+    def case_a_stale_snapshot_never_keeps_a_resting_or_unseen_slot(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        self._stale(monkeypatch, certdir, pct=10.0)
+        pp._affinity_rest[self.IDENT] = time.monotonic() + 99
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-B"], ("resting", auths)
+        pp._affinity_rest.clear()
+        self._seed("S", "tok-A", age=100)
+        _, auths = self._send(certdir, [("tok-X", "S")])
+        assert auths == ["Bearer tok-X"], ("client token unseen", auths)
+
+    def case_a_stale_snapshot_never_unbinds_a_session_on_an_expired_token(
+            self, monkeypatch, certdir):
+        """A stale snapshot leaves a session alone. The kept slot's stored
+        token reads expired, but that `expiresAt` is minutes old and cswap may
+        have refreshed it since: rebinding the session to the client's bearer
+        would end its affinity for good."""
+        from cswap_pin import proxy as pp
+        self._stale(monkeypatch, certdir, pct=10.0, expires=1)
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-B"], auths
+        assert pp._affinity["S"][0] == "tok-A", pp._affinity["S"]
+
+    def case_a_kept_reply_updates_the_last_known_use(self, monkeypatch, certdir):
+        """The snapshot said 10; a reply on the kept token says 88 (bar 90,
+        margin 10): a stale snapshot no longer keeps the slot."""
+        seen, _ = self._stale(monkeypatch, certdir, pct=10.0)
+        _, auths = self._send(certdir, [("tok-A", "S")],
+                              reply=self._util(0.88, seven=0.1))
+        assert auths == ["Bearer tok-A"], auths
+        self._seed("S", "tok-A", age=100)
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-B"], auths
+
+    def case_an_idle_armed_pin_refreshes_its_snapshot(
+            self, monkeypatch, certdir):
+        """Nothing but the trace tick asks: 5 of 17 stale declines followed a
+        lull of two minutes or more with no request to start a rebuild."""
+        from cswap_pin import proxy as pp
+        from cswap_pin.proxy import PinProxy
+        seen = self._wire(monkeypatch, certdir, armed=False)
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None)
+        proxy._affinity_refresh_tick()
+        assert not seen.fetches and not pp._affinity_kept, "off, yet it read"
+        seen.loaded.cache_aware = True
+        pp._AFFINITY_CACHE.clear()
+        self._seed("S", "tok-A")
+        proxy._affinity_refresh_tick()
+        assert len(seen.fetches) == 1 and pp._affinity_kept, seen.fetches
+        proxy._affinity_refresh_tick()
+        assert len(seen.fetches) == 1, "a second rebuild inside the period"
+
+    def case_an_armed_pin_with_no_warm_session_refreshes_nothing(
+            self, monkeypatch, certdir):
+        """A rebuild reads every slot's credentials and calls cswap's usage
+        read, which has write arms: with no binding inside the TTL (and none
+        carried in) there is nothing for a snapshot to rule on."""
+        from cswap_pin import proxy as pp
+        from cswap_pin.proxy import PinProxy
+        seen = self._wire(monkeypatch, certdir)
+        queued = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None)
+        proxy._affinity_refresh_tick()
+        self._seed("S", "tok-A", age=pp.session_affinity_config(certdir)[0] + 1)
+        proxy._affinity_refresh_tick()
+        assert not queued, "a rebuild with no warm session"
+        self._seed("S", "tok-A")
+        proxy._affinity_refresh_tick()
+        assert len(queued) == 1, "a warm session, and no rebuild"
+        queued.clear()
+        pp._affinity.clear()
+        pp._affinity_snap["tried"] = float("-inf")
+        pp._affinity_snap["busy"] = False
+        pp._affinity_carried["S"] = (self.IDENT, time.time())
+        proxy._affinity_refresh_tick()
+        assert len(queued) == 1, "a carried binding, and no rebuild"
+
+    def case_a_rebuild_that_raises_is_counted_and_said_once(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir, fail=True)
+        for i in range(3):
+            if i:
+                pp._affinity_snap["tried"] -= pp._AFFINITY_REFRESH_S + 1
+            pp._affinity_kick(90.0, "dynamic")
+        lines = [l for l in seen.logs if "rebuild" in l]
+        assert len(lines) == 1 and "OSError" in lines[0], seen.logs
+        assert "keychain" not in lines[0], "the exception text is not logged"
+        assert self._health(certdir)["snapshot"]["failures"] == 3
+
+    def case_health_reports_the_snapshots_age_and_rebuild_time(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+        pp._affinity_kick(90.0, "dynamic")
+        got = self._health(certdir)["snapshot"]
+        assert got["failures"] == 0 and 0 <= got["age_s"] < 30, got
+        assert isinstance(got["last_rebuild_ms"], int), got
+
+    def case_a_client_token_the_snapshot_has_not_seen_keeps_the_session(
+            self, monkeypatch, certdir):
+        """A token that rotated since the last snapshot resolves to no slot:
+        that request goes out on it and the session is not rebound; the
+        rebuild it starts at once resolves it for the next one."""
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+        started = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder",
+                            lambda fn: (started.append(1), fn()))
+        self._send(certdir, [("tok-A", "S0")])
+        self._seed("S", "tok-A")
+        monkeypatch.setattr(type(self), "TOKENS", {"1": "tok-A", "2": "tok-B2"})
+        _, auths = self._send(certdir, [("tok-B2", "S"), ("tok-B2", "S")])
+        assert auths == ["Bearer tok-B2", "Bearer tok-A"], auths
+        assert len(started) == 2 and pp._affinity["S"][0] == "tok-A", started
+        pp._affinity_snap["tried"] -= pp._AFFINITY_REFRESH_S + 1
+        _, auths = self._send(certdir, [("tok-B2", "S")])
+        assert auths == ["Bearer tok-A"], auths
+
+    def case_an_unseen_client_token_starts_one_rebuild_at_once(
+            self, monkeypatch, certdir):
+        """Every measured decline for an unseen token (4 of 4) sat inside the
+        30 s refresh period, which is all a545ec4 left to resolve a rotated
+        token. The first request with a token no snapshot holds starts the
+        rebuild now (that request still goes out on the client's bearer, no
+        rule changes); the second request with it starts none."""
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+        queued = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+        self._send(certdir, [("tok-A", "S0")])
+        queued.pop()()  # the first snapshot, fresh
+        self._seed("S", "tok-A")
+        monkeypatch.setattr(type(self), "TOKENS", {"1": "tok-A", "2": "tok-B2"})
+        _, auths = self._send(certdir, [("tok-B2", "S")])
+        assert auths == ["Bearer tok-B2"], auths
+        assert len(queued) == 1, "no rebuild for the token it has not seen"
+        _, auths = self._send(certdir, [("tok-B2", "S")])
+        assert len(queued) == 1, "a second rebuild for the same token"
+        queued.pop()()
+        _, auths = self._send(certdir, [("tok-B2", "S")])
+        assert auths == ["Bearer tok-A"], auths
+
+    def case_a_request_during_a_rest_leaves_the_binding(
+            self, monkeypatch, certdir):
+        """The kept slot's rest ends and the session is still bound to it. A
+        request inside the rest goes out on the live account; moving the
+        session there too meant its next request went out with no line at all
+        (4 of 16 measured moves)."""
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+        self._send(certdir, [("tok-A", "S0")])  # the first snapshot
+        self._seed("S", "tok-A")
+        at = pp._affinity["S"]
+        pp._affinity_rest[self.IDENT] = time.monotonic() + 99
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-B"], auths
+        assert pp._affinity["S"] == at, "the rest moved the binding"
+        pp._affinity_rest.clear()
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-A"], ("after the rest", auths)
+
+    SUBAGENT = ({"x-claude-code-agent-id": "agent-1"},
+                {"x-claude-code-parent-agent-id": "parent-1"})
+
+    def case_a_subagent_request_that_is_not_kept_leaves_the_parent_bound(
+            self, monkeypatch, certdir):
+        """A subagent (or an in-process teammate) shares its parent's session
+        id but carries none of the parent's cache: Claude Code 2.1.304 puts
+        `x-claude-code-agent-id` on every non-main request. One declined
+        because the parent's slot is resting, at its bar, walled or holding an
+        expired token goes out on its own bearer and leaves the binding
+        exactly as it was (bearer and clock); moving the parent to the
+        subagent's account sent its next request there too, 404 and a full
+        replay (window 2: 327,805 and 379,420 tokens written)."""
+        from cswap_pin import proxy as pp
+        for headers in self.SUBAGENT:
+            sub = [dict(bearer="tok-B", extra_headers={
+                "x-claude-code-session-id": "S", **headers})]
+            self._wire(monkeypatch, certdir)
+            self._send(certdir, [("tok-A", "S0")])
+            self._seed("S", "tok-A")
+            at = pp._affinity["S"]
+            pp._affinity_rest[self.IDENT] = time.monotonic() + 99
+            _, auths = self._send(certdir, sub)
+            assert auths == ["Bearer tok-B"], (headers, auths)
+            assert pp._affinity["S"] == at, (
+                headers, "a subagent moved its parent in a rest")
+            for wire in (dict(pct=95.0), dict(walled=True), dict(expires=1)):
+                self._wire(monkeypatch, certdir, **wire)
+                self._send(certdir, [("tok-A", "S0")])
+                self._seed("S", "tok-A")
+                at = pp._affinity["S"]
+                _, auths = self._send(certdir, sub)
+                assert auths == ["Bearer tok-B"], (headers, wire, auths)
+                assert pp._affinity["S"] == at, (
+                    headers, wire, "a subagent moved its parent")
+
+    def case_a_subagent_that_met_an_expired_slot_does_not_cost_the_parent_its_cache(
+            self, monkeypatch, certdir):
+        """Window 2, 13:56:44 and 14:02:02: slot 1's stored token expired, a
+        subagent's request was declined and moved its parent to slot 2, then
+        slot 1 came back with a fresh token and the parent's own request was
+        kept on slot 2, where its thread is not. Left bound, the parent's next
+        request is ruled against the same snapshot: slot 1 is back, so it goes
+        out on slot 1's bearer, where its cache is."""
+        from cswap_pin import proxy as pp
+        for headers in self.SUBAGENT:
+            monkeypatch.setattr(type(self), "TOKENS",
+                                {"1": "tok-A", "2": "tok-B"})
+            seen = self._wire(monkeypatch, certdir, expires=1)
+            self._send(certdir, [("tok-A", "S0")])
+            self._seed("S", "tok-A")
+            at = pp._affinity["S"]
+            _, auths = self._send(certdir, [dict(bearer="tok-B", extra_headers={
+                "x-claude-code-session-id": "S", **headers})])
+            assert auths == ["Bearer tok-B"], (headers, auths)
+            assert pp._affinity["S"] == at, (headers, "the parent moved")
+            # slot 1 is rebuilt with a fresh token: the client's rotated one
+            monkeypatch.setattr(type(self), "TOKENS",
+                                {"1": "tok-A2", "2": "tok-B"})
+            seen.expires1 = None
+            main = [("tok-A2", "S")]
+            _, auths = self._send(certdir, main)  # unseen: a rebuild, no rule
+            assert auths == ["Bearer tok-A2"], (headers, auths)
+            _, auths = self._send(certdir, main * 2)
+            assert auths == ["Bearer tok-A2"] * 2, (
+                headers, "kept on the subagent's slot", auths)
+            assert pp._affinity["S"][0] == "tok-A2", pp._affinity["S"]
+
+    def case_a_held_body_survives_a_subagents_decline_and_is_pinged_when_the_slot_is_back(
+            self, monkeypatch, certdir):
+        """The parent left bound to slot 1, the keep-alive tick still sees its
+        body as sent on the binding: it is not dropped as sent on another
+        account, and once slot 1 is kept again the ping goes out on its
+        stored token."""
+        from cswap_pin import proxy as pp
+        usage = {"cache_read_input_tokens": 30000,
+                 "cache_creation_input_tokens": 0}
+        seen = self._armed(monkeypatch, certdir, expires=1)
+        at = pp._affinity["S"]
+        sub = dict(bearer="tok-B", extra_headers={
+            "x-claude-code-session-id": "S", "x-claude-code-agent-id": "a-1"})
+        _, auths = self._send(certdir, [sub], body=self._body(pad=10))
+        assert auths == ["Bearer tok-B"], auths
+        assert pp._affinity["S"] == at, "a subagent moved its parent"
+        with self._pair(certdir, reply=self._reply(usage)) as (proxy, up):
+            proxy._keepalive_tick()
+        assert up.bodies_seen == [], "pinged a slot that is not kept"
+        assert "S" in pp._affinity_last, "the body was dropped as sent elsewhere"
+        assert pp._affinity_pings["refused"] == {"its slot is not kept": 1}
+        monkeypatch.setattr(type(self), "TOKENS", {"1": "tok-A2", "2": "tok-B"})
+        seen.expires1 = None
+        pp._affinity_snap.update(tried=float("-inf"), at=float("-inf"))
+        with self._pair(certdir, reply=self._reply(usage)) as (proxy, up):
+            proxy._keepalive_tick()  # the stale snapshot is rebuilt first
+            proxy._keepalive_tick()
+        assert len(up.bodies_seen) == 1, up.bodies_seen
+        assert up.seen_auth == "Bearer tok-A2", up.seen_auth
+
+    def case_a_kept_429_at_the_wall_does_not_hold_the_other_sessions_on_the_slot(
+            self, monkeypatch, certdir):
+        """The 429 that reads the bar drops the slot AND rests it until the
+        window's reset, minutes to hours. Holding every other warm session on
+        it for that long keeps them on a walled account with their clocks
+        frozen, and a reset inside their TTL moves them back for no reason of
+        the bar's. Only a slot that is otherwise keepable (a 401/403's 60 s
+        rest, a 429 below the bar) holds a binding."""
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+        self._seed("S1", "tok-A")
+        self._seed("S2", "tok-A")
+        self._send(certdir, [("tok-B", "S1")], reject_bearer="tok-A",
+                   reject_status=429, reject_headers=(
+                       b"anthropic-ratelimit-unified-5h-utilization: 1.0\r\n"
+                       b"anthropic-ratelimit-unified-reset: %d\r\n"
+                       % (time.time() + 600)))
+        assert self.IDENT not in pp._affinity_kept, "the 429 did not drop it"
+        assert pp._affinity_rest[self.IDENT] - time.monotonic() > 500
+        _, auths = self._send(certdir, [("tok-B", "S2")])
+        assert auths == ["Bearer tok-B"], auths
+        assert pp._affinity["S2"][0] == "tok-B", (
+            "a slot at its bar held a warm session", pp._affinity["S2"])
+
+    def case_a_decline_that_means_the_account_is_gone_still_moves_the_session(
+            self, monkeypatch, certdir):
+        """At its bar, walled, or with a stored token that has expired: the
+        main thread's own request leaves the account for good."""
+        from cswap_pin import proxy as pp
+        for wire in (dict(pct=95.0), dict(walled=True), dict(expires=1)):
+            self._wire(monkeypatch, certdir, **wire)
+            self._send(certdir, [("tok-A", "S0")])
+            self._seed("S", "tok-A")
+            _, auths = self._send(certdir, [("tok-B", "S")])
+            assert auths == ["Bearer tok-B"], (wire, auths)
+            assert pp._affinity["S"][0] == "tok-B", (wire, pp._affinity["S"])
+
+    def case_a_token_cswap_adopts_after_the_first_rebuild_is_ruled_without_the_refresh(
+            self, monkeypatch, certdir):
+        """Claude Code refreshes its own token and cswap adopts it into the
+        slot about a second later: the one immediate rebuild for that token
+        ran before. Another runs once `_AFFINITY_UNSEEN_RETRY_S` has passed
+        since the last (not sooner), so the next request is kept without
+        waiting for the 30 s refresh. A token nobody adopts costs one rebuild
+        per interval, and its requests are never kept."""
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+        started = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder",
+                            lambda fn: (started.append(1), fn()))
+        self._send(certdir, [("tok-A", "S0")])
+        self._seed("S", "tok-A")
+        _, auths = self._send(certdir, [("tok-B2", "S")])  # not adopted yet
+        assert auths == ["Bearer tok-B2"] and len(started) == 2, (auths, started)
+        monkeypatch.setattr(type(self), "TOKENS", {"1": "tok-A", "2": "tok-B2"})
+        _, auths = self._send(certdir, [("tok-B2", "S")])  # adopted, 1 s later
+        assert auths == ["Bearer tok-B2"] and len(started) == 2, (
+            "a second rebuild inside the interval", auths, started)
+        self._age_unseen("tok-B2", pp._AFFINITY_UNSEEN_RETRY_S + 1)
+        _, auths = self._send(certdir, [("tok-B2", "S"), ("tok-B2", "S")])
+        assert auths == ["Bearer tok-B2", "Bearer tok-A"], auths
+        assert len(started) == 3, started
+        for _ in range(2):  # a token nobody adopts
+            n = len(started)
+            _, auths = self._send(certdir, [("tok-Z", "S"), ("tok-Z", "S")])
+            assert auths == ["Bearer tok-Z"] * 2 and len(started) == n + 1, (
+                auths, started)
+            self._age_unseen("tok-Z", pp._AFFINITY_UNSEEN_RETRY_S + 1)
+        assert pp._affinity["S"][0] == "tok-A", pp._affinity["S"]
+
+    def case_a_token_nobody_adopts_is_rebuilt_for_only_in_a_short_window(
+            self, monkeypatch, certdir):
+        """A token no slot ever holds (a fresh /login the pin must not
+        override) would cost a store and Keychain read every
+        `_AFFINITY_UNSEEN_RETRY_S` for as long as its session sends. The
+        immediate rebuilds stop `_AFFINITY_UNSEEN_WINDOW_S` after the token was
+        first seen; the 30 s refresh alone serves it after that."""
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+        started = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder",
+                            lambda fn: (started.append(1), fn()))
+        self._send(certdir, [("tok-A", "S0")])
+        self._seed("S", "tok-A")
+        n = len(started)
+        self._send(certdir, [("tok-Z", "S")])
+        assert len(started) == n + 1, "no rebuild for a token first seen"
+        self._age_unseen("tok-Z", pp._AFFINITY_UNSEEN_RETRY_S + 1)
+        self._send(certdir, [("tok-Z", "S")])
+        assert len(started) == n + 2, "no retry inside the window"
+        self._age_unseen("tok-Z", pp._AFFINITY_UNSEEN_WINDOW_S)
+        for _ in range(3):
+            self._send(certdir, [("tok-Z", "S")])
+            self._age_unseen("tok-Z", pp._AFFINITY_UNSEEN_RETRY_S + 1)
+        assert len(started) == n + 2, "a retry after the window"
+        pp._affinity_snap["tried"] -= pp._AFFINITY_REFRESH_S + 1
+        self._send(certdir, [("tok-Z", "S")])
+        assert len(started) == n + 3, "the 30 s refresh no longer runs"
+
+    def case_a_rebuild_that_hangs_is_abandoned_and_the_next_one_runs(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir)
+        queued = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+
+        def said():
+            return [l for l in seen.logs if "session affinity" in l]
+
+        self._send(certdir, [("tok-A", "S0")])  # starts rebuild 0, which hangs
+        self._send(certdir, [("tok-A", "S0")])
+        assert len(queued) == 1 and not said(), "one at a time while it is young"
+        pp._affinity_snap["tried"] -= pp._AFFINITY_STALE_S + 1
+        self._send(certdir, [("tok-A", "S0")] * 3)
+        assert len(queued) == 2, "a rebuild past the stale bound is abandoned"
+        assert len(said()) == 1 and "abandoned" in said()[0], seen.logs
+        queued[0]()  # the hung one returns while rebuild 1 is running
+        assert pp._affinity_snap["busy"], "it cleared the newer rebuild's flag"
+        assert not pp._affinity_kept and pp._affinity_snap["stuck"] == 0
+        queued[1]()
+        assert not pp._affinity_snap["busy"] and pp._affinity_kept
+
+    def case_an_abandoned_rebuilds_late_result_is_dropped(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir)
+        queued = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+        self._send(certdir, [("tok-A", "S0")])
+        pp._affinity_snap["tried"] -= pp._AFFINITY_STALE_S + 1
+        self._send(certdir, [("tok-A", "S0")])
+        seen.wall1 = True  # the store says slot 1 is walled now
+        queued[1]()
+        seen.wall1 = False  # and the hung rebuild, reading it as it was
+        queued[0]()
+        self._seed("S", "tok-A")
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-B"], (
+            "a late result overwrote a newer snapshot", auths)
+
+    def case_hung_rebuilds_pile_up_no_further_than_a_cap(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir)
+        queued = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+        for _ in range(pp._AFFINITY_STUCK_MAX + 3):
+            self._send(certdir, [("tok-A", "S0")])
+            pp._affinity_snap["tried"] -= pp._AFFINITY_STALE_S + 1
+        assert len(queued) == pp._AFFINITY_STUCK_MAX + 1, len(queued)
+        lines = [l for l in seen.logs if "session affinity" in l]
+        assert len(lines) == pp._AFFINITY_STUCK_MAX, seen.logs
+        assert "stays off" in lines[-1] and not any(
+            "stays off" in l for l in lines[:-1]), (
+            "the cap is reached with the last abandonment, once", lines)
+
+    def case_the_snapshot_is_dated_before_its_usage_read(
+            self, monkeypatch, certdir):
+        """A rebuild that hung part-way must not land old usage marked fresh."""
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir)
+        self._send(certdir, [("tok-A", "S0")])
+        assert pp._affinity_snap["at"] <= seen.fetch_times[0], (
+            pp._affinity_snap["at"], seen.fetch_times)
+
+    @staticmethod
+    def _util(fraction, status=b"200 OK", seven=None):
+        return (b"HTTP/1.1 " + status + b"\r\n"
+                b"anthropic-ratelimit-unified-5h-utilization: %s\r\n%s"
+                b"Content-Length: 2\r\n\r\n{}" % (
+                    str(fraction).encode(), b"" if seven is None else
+                    b"anthropic-ratelimit-unified-7d-utilization: %s\r\n"
+                    % str(seven).encode()))
+
+    def case_a_slot_whose_reply_reads_its_bar_is_dropped_at_once(
+            self, monkeypatch, certdir):
+        """The snapshot lags a crossing by up to a rebuild cycle. A reply's own
+        utilization header, already in hand, is read in memory: no store
+        read, no wait for the next snapshot."""
+        for thresholds, util, want in (
+                (None, 0.95, "tok-B"), (None, 0.90, "tok-B"),
+                (None, 0.89, "tok-A"), ({"1": 60.0}, 0.65, "tok-B"),
+                ({"1": 60.0}, 0.55, "tok-A"), ({"2": 60.0}, 0.65, "tok-A")):
+            seen = self._wire(monkeypatch, certdir, thresholds=thresholds)
+            self._seed("S", "tok-A")
+            _, auths = self._send(
+                certdir, [("tok-A", "S"), ("tok-B", "S")],
+                reply=self._util(util))
+            assert auths == ["Bearer tok-A", f"Bearer {want}"], (
+                thresholds, util, auths)
+            assert len(seen.fetches) == 1, "the drop read the store"
+
+    def case_a_drop_at_the_bar_names_itself_in_the_decline_line(
+            self, monkeypatch, certdir):
+        """A reply that crosses the bar drops the slot in memory, with no
+        rebuild after it: the next request on that warm session is passed over
+        for the drop, and its line says so (the slot's reason in the snapshot
+        is None, it was kept, and a None must not print or key the fold)."""
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir)
+        self._seed("S", "tok-A")
+        _, auths = self._send(
+            certdir, [("tok-A", "S"), ("tok-B", "S")], reply=self._util(0.95))
+        assert auths == ["Bearer tok-A", "Bearer tok-B"], auths
+        lines = [l for l in seen.logs if "a warm session was not kept" in l]
+        assert len(lines) == 1 and "dropped at its bar" in lines[0], seen.logs
+        assert "None" not in lines[0] and None not in pp._affinity_declined, (
+            lines, pp._affinity_declined)
+
+    def case_a_snapshot_started_before_a_drop_does_not_undo_it(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+        queued = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+        self._send(certdir, [("tok-A", "S0")])  # rebuild 0 is under way
+        queued.pop()()
+        pp._affinity_snap["tried"] -= pp._AFFINITY_REFRESH_S + 1
+        self._send(certdir, [("tok-A", "S0")])  # rebuild 1 starts and waits
+        self._seed("S", "tok-A")
+        self._send(certdir, [("tok-A", "S")], reply=self._util(0.95))
+        queued.pop(0)()  # it read the store before that reply
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-B"], auths
+
+    def case_a_rebuild_started_after_a_drop_does_not_keep_the_slot_again(
+            self, monkeypatch, certdir):
+        """The reply that crossed the bar is a 200 inside the 30 s record
+        window: unless the drop carries it past both throttles into the store,
+        a rebuild that starts AFTER the drop reads the old figure and keeps
+        the slot, and the next kept reply drops it again."""
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir)
+        self._seed("S", "tok-A")
+        for util in (0.42, 0.95):
+            _, auths = self._send(
+                certdir, [("tok-B", "S")], reply=self._util(util))
+            assert auths == ["Bearer tok-A"], (util, auths)
+        assert seen.recorded == ["1", "1"], (
+            "the crossing reading was throttled away", seen.recorded)
+        pp._affinity_snap["tried"] -= pp._AFFINITY_REFRESH_S + 1
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert len(seen.fetches) == 2, "no rebuild started after the drop"
+        assert auths == ["Bearer tok-B"], auths
+
+    def case_a_row_fetched_before_the_drop_does_not_keep_the_slot_again(
+            self, monkeypatch, certdir):
+        """A rebuild that starts after a drop still reads whatever the store
+        holds. A row fetched BEFORE the drop is the figure the drop overruled
+        (the record was lost or is late), and one never fetched has no date to
+        trust: either leaves the slot out. One fetched after the drop keeps
+        it. The row's `fetched_at` is the store's wall clock, the drop's stamp
+        is ours."""
+        from cswap_pin import proxy as pp
+        for age, want in ((1000.0, "tok-B"), (None, "tok-B"), (0.0, "tok-A")):
+            seen = self._wire(monkeypatch, certdir)
+            self._seed("S", "tok-A")
+            self._send(certdir, [("tok-B", "S")], reply=self._util(0.95))
+            seen.usage1 = {"five_hour": {"pct": 10.0},
+                           "seven_day": {"pct": 10.0}}  # the store lags
+            seen.age1 = age
+            pp._affinity_snap["tried"] -= pp._AFFINITY_REFRESH_S + 1
+            _, auths = self._send(certdir, [("tok-B", "S")])
+            assert len(seen.fetches) == 2, "no rebuild started after the drop"
+            assert auths == [f"Bearer {want}"], (age, auths)
+            assert any("dropped at its bar" in l for l in seen.logs) == (
+                want == "tok-B"), (age, seen.logs)
+
+    def case_a_drop_on_the_slots_own_bearer_records_to_that_slot(
+            self, monkeypatch, certdir):
+        """The crossing reply came back to a client still on the old bearer,
+        whose slot is not the live one: it is the slot's reading all the same."""
+        seen = self._wire(monkeypatch, certdir)
+        _, auths = self._send(certdir, [("tok-A", "S")], reply=self._util(0.95))
+        assert auths == ["Bearer tok-A"] and seen.recorded == ["1"], (
+            auths, seen.recorded)
+
+    def case_each_utilization_header_is_read_on_its_own(
+            self, monkeypatch, certdir):
+        for five, seven in (("n/a", 0.95), (0.95, "n/a")):
+            self._wire(monkeypatch, certdir)
+            self._seed("S", "tok-A")
+            _, auths = self._send(
+                certdir, [("tok-A", "S"), ("tok-B", "S")],
+                reply=self._util(five, seven=seven))
+            assert auths == ["Bearer tok-A", "Bearer tok-B"], (
+                five, seven, auths)
+
+    @staticmethod
+    def _no_5h(seven, extra=b""):
+        return (b"HTTP/1.1 200 OK\r\n" + extra + _no_5h_headers(seven)
+                + b"Content-Length: 2\r\n\r\n{}")
+
+    def case_a_kept_accounts_7d_only_reply_is_read_against_its_bar(
+            self, monkeypatch, certdir):
+        """T3114: an account with no 5h limit replies with a 7d reading alone.
+        That reading is the whole of its use, so it drops the slot at the bar
+        and keeps it under, and either way records to the kept slot."""
+        for util, want in ((0.96, "tok-B"), (0.80, "tok-A")):
+            seen = self._wire(monkeypatch, certdir)
+            self._seed("S", "tok-A")
+            _, auths = self._send(
+                certdir, [("tok-B", "S"), ("tok-B", "S")],
+                reply=self._no_5h(util))
+            assert auths == ["Bearer tok-A", f"Bearer {want}"], (util, auths)
+            assert seen.recorded[:1] == ["1"], (util, seen.recorded)
+
+    def case_a_7d_only_reply_updates_the_last_known_use(
+            self, monkeypatch, certdir):
+        """The snapshot said 10; a kept reply with 7d alone says 88 (bar 90,
+        margin 10): a stale snapshot no longer keeps the slot. A reply whose
+        5h header is there but unreadable is NOT a no-5h account, and its 7d
+        figure alone is no whole reading."""
+        for extra, want in ((b"", "tok-B"), (
+                b"anthropic-ratelimit-unified-5h-utilization: n/a\r\n",
+                "tok-A")):
+            self._stale(monkeypatch, certdir, pct=10.0)
+            _, auths = self._send(certdir, [("tok-A", "S")],
+                                  reply=self._no_5h(0.88, extra))
+            assert auths == ["Bearer tok-A"], auths
+            self._seed("S", "tok-A", age=100)
+            _, auths = self._send(certdir, [("tok-B", "S")])
+            assert auths == [f"Bearer {want}"], (extra, auths)
+
+    def case_a_stored_credential_with_no_expiry_is_not_kept(
+            self, monkeypatch, certdir):
+        self._wire(monkeypatch, certdir, no_expiry=True)
+        self._seed("S", "tok-A")
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-B"], auths
+
+    def case_a_kept_accounts_429_headers_pass_the_spawn_gate(
+            self, monkeypatch, certdir):
+        """A wall reading must never be dropped: the 30 s throttle (per token
+        and per slot) is for the 200s that carry nothing new."""
+        seen = self._wire(monkeypatch, certdir)
+        self._seed("S", "tok-A")
+        self._send(certdir, [("tok-B", "S")], reply=self._util(0.42))
+        assert seen.recorded == ["1"], seen.recorded
+        _, auths = self._send(
+            certdir, [("tok-B", "S")], reject_bearer="tok-A",
+            reject_status=429, reject_headers=(
+                b"anthropic-ratelimit-unified-5h-utilization: 1.0\r\n"))
+        assert auths == ["Bearer tok-A", "Bearer tok-B"], auths
+        assert seen.recorded == ["1", "1"], seen.recorded
+
+    def case_folded_take_backs_reach_the_log_with_the_next_snapshot(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir)
+        ident = ("1", self.EMAIL.format("1"))
+        for _ in range(3):
+            pp._affinity_take_back("S", ident, 429, None)
+        assert len(seen.logs) == 1, seen.logs
+        last, n = pp._affinity_logged[("1", 429)]
+        pp._affinity_logged[("1", 429)] = (last - 61, n)
+        self._send(certdir, [("tok-A", "S0")])  # a rebuild lands
+        lines = [l for l in seen.logs if "session affinity" in l]
+        assert len(lines) == 2 and "2 more" in lines[1], seen.logs
+        assert "slot 1" in lines[1] and "429" in lines[1], lines
+        pp._affinity_snap["tried"] = float("-inf")
+        self._send(certdir, [("tok-A", "S0")])
+        assert len([l for l in seen.logs if "session affinity" in l]) == 2, (
+            "said twice")
+
+    def case_a_failing_rebuild_is_not_retried_per_request(
+            self, monkeypatch, certdir):
+        seen = self._wire(monkeypatch, certdir, fail=True)
+        self._seed("S", "tok-A")
+        _, auths = self._send(certdir, [("tok-B", "S")] * 3)
+        assert auths == ["Bearer tok-B"] * 3, auths
+        assert len(seen.fetches) == 1, seen.fetches
+
+    def case_a_take_back_leaves_one_rate_limited_lifecycle_line(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir)
+
+        def lines():
+            return [l for l in seen.logs if "session affinity" in l]
+
+        self._seed("S", "tok-A")
+        self._send(certdir, [("tok-B", "S")], reject_bearer="tok-A",
+                   reject_status=429, reject_headers=(
+                       b"anthropic-ratelimit-unified-reset: %d\r\n"
+                       % (time.time() + 3600)))
+        assert len(lines()) == 1, seen.logs
+        line = lines()[0]
+        assert "slot 1" in line and "429" in line, line
+        assert 3000 < int(re.search(r"rested (\d+)s", line).group(1)) < 3700
+        assert not re.search(r"tok-|@", line), "a bearer or an email in it"
+        ident = ("1", self.EMAIL.format("1"))
+        for _ in range(3):
+            pp._affinity_take_back("S", ident, 429, None)
+        assert len(lines()) == 1, "inside the cooldown, one line per slot+code"
+        last, n = pp._affinity_logged[("1", 429)]
+        pp._affinity_logged[("1", 429)] = (last - 61, n)
+        pp._affinity_take_back("S", ident, 429, None)
+        assert "; 3 more" in lines()[-1], lines()
+        pp._affinity_take_back("S", ident, 401, None)
+        assert len(lines()) == 3, "a different code has its own cooldown"
+
+    def case_a_slot_passed_over_leaves_one_rate_limited_line_saying_why(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        for opts, why in (
+                (dict(pct=95.0), "at its bar"), (dict(walled=True), "walled"),
+                (dict(disabled={"1"}), "disabled"),
+                (dict(no_expiry=True), "no expiry"),
+                (dict(pct=None), "too old to trust"),
+                (dict(expires=1), "has expired")):
+            seen = self._wire(monkeypatch, certdir, **opts)
+            self._seed("S", "tok-A")
+            _, auths = self._send(certdir, [("tok-B", "S")])
+            lines = [l for l in seen.logs if "session affinity" in l]
+            assert auths == ["Bearer tok-B"] and len(lines) == 1, (
+                opts, auths, seen.logs)
+            assert "slot 1" in lines[0] and why in lines[0], (opts, lines)
+            assert not re.search(r"tok-|@", lines[0]), "a bearer or an email"
+        seen = self._wire(monkeypatch, certdir, pct=85.0)  # within the margin
+        queued = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+        self._send(certdir, [("tok-A", "S0")])
+        queued.pop()()
+        pp._affinity_snap["at"] -= pp._AFFINITY_STALE_S + 1  # too old to rule
+        self._seed("S", "tok-A")
+        self._send(certdir, [("tok-B", "S")] * 3)
+        lines = [l for l in seen.logs if "session affinity" in l]
+        assert len(lines) == 1 and "too old" in lines[0], seen.logs
+        key = next(iter(pp._affinity_declined))
+        last, n = pp._affinity_declined[key]
+        assert n == 2, "the other two were not counted"
+        pp._affinity_declined[key] = (last - 61, n)
+        self._send(certdir, [("tok-B", "S")])
+        lines = [l for l in seen.logs if "session affinity" in l]
+        assert len(lines) == 2 and "; 2 more" in lines[1], seen.logs
+
+    def case_a_take_back_is_traced_as_one(self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        trace = io.StringIO()
+        monkeypatch.setattr(pp, "_TRACE", trace)
+        self._wire(monkeypatch, certdir)
+        self._seed("S", "tok-A")
+        self._send(certdir, [("tok-B", "S")], reject_bearer="tok-A",
+                   reject_status=403)
+        assert "kept account refused" in trace.getvalue(), trace.getvalue()
+        assert "swap refused" not in trace.getvalue(), trace.getvalue()
+
+    def case_a_refused_429s_usage_headers_reach_the_kept_slot(
+            self, monkeypatch, certdir):
+        seen = self._wire(monkeypatch, certdir)
+        self._seed("S", "tok-A")
+        _, auths = self._send(
+            certdir, [("tok-B", "S")], reject_bearer="tok-A",
+            reject_status=429, reject_headers=(
+                b"anthropic-ratelimit-unified-5h-utilization: 1.0\r\n"))
+        assert auths == ["Bearer tok-A", "Bearer tok-B"], auths
+        assert seen.recorded == ["1"], (
+            "the wall the kept account hit never reached the store", seen)
+
+    def case_the_resend_after_a_take_back_carries_the_body_intact(
+            self, monkeypatch, certdir):
+        self._wire(monkeypatch, certdir)
+        self._seed("S", "tok-A")
+        body = json.dumps({"model": "claude-fable-5-1", "messages": [
+            {"role": "user", "content": "x" * 200000}]})
+        _, auths = self._send(certdir, [("tok-B", "S")], body=body,
+                              reject_bearer="tok-A", reject_status=429)
+        assert auths == ["Bearer tok-A", "Bearer tok-B"], auths
+        assert self.bodies == [body.encode()] * 2, [len(b) for b in self.bodies]
+
+    def case_the_request_trace_says_which_request_was_injected(
+            self, monkeypatch, certdir):
+        self._wire(monkeypatch, certdir)
+        self._seed("S", "tok-A")
+        trace = certdir / "affinity-trace.log"
+        self._send(certdir, [("tok-B", "S"), ("tok-B", None)], trace=trace)
+        rows = [l for l in trace.read_text().splitlines()
+                if "POST /v1/messages pinned=" in l]
+        assert len(rows) == 2, rows
+        assert "swapped=False kept=1 ::" in rows[0], rows
+        assert "kept=" not in rows[1], rows
+
+    def case_arming_is_dynamic_plus_cache_aware(self, monkeypatch, tmp_path):
+        """The pin arms on cswap's own answer (`cache_aware_active`) and, on a
+        host that has none, on the same rule inline. A host with no
+        `cache_aware` field is unarmed."""
+        from claude_swap import autoswitch, settings as cs_settings
+        from cswap_pin import proxy as pp
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        loaded = {}
+        monkeypatch.setattr(cs_settings, "load_settings",
+                            lambda root: loaded["v"])
+
+        def read(**fields):
+            loaded["v"] = types.SimpleNamespace(
+                threshold=90.0, cache_ttl_seconds=3600.0, **fields)
+            pp._AFFINITY_CACHE.clear()
+            return pp.session_affinity_config(certdir)
+
+        monkeypatch.delattr(autoswitch, "cache_aware_active", raising=False)
+        assert read(strategy="dynamic", cache_aware=True) == (
+            3600.0, 90.0, "dynamic")
+        assert read(strategy="dynamic", cache_aware=False) is None
+        assert read(strategy="best", cache_aware=True) is None
+        assert read(strategy="dynamic", cache_aware="yes") is None
+        assert read(strategy="dynamic") is None, "an older cswap has no field"
+        monkeypatch.setattr(autoswitch, "cache_aware_active",
+                            lambda s: s.strategy == "best", raising=False)
+        assert read(strategy="best") == (3600.0, 90.0, "best"), (
+            "cswap's own answer was not the one used")
+        assert read(strategy="dynamic", cache_aware=True) is None
+        assert pp.session_affinity_config(None) is None
+
+    def case_the_marker_and_the_settings_key_no_longer_arm(
+            self, monkeypatch, tmp_path):
+        from claude_swap import settings as cs_settings
+        from cswap_pin import proxy as pp
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        (certdir / "session-affinity").write_text("")
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"remoteControl": {"sessionAffinity": True}}))
+        monkeypatch.setattr(cs_settings, "load_settings",
+                            lambda root: types.SimpleNamespace(
+                                strategy="dynamic", cache_aware=False,
+                                threshold=90.0, cache_ttl_seconds=3600.0))
+        pp._AFFINITY_CACHE.clear()
+        assert pp.session_affinity_config(certdir) is None
+        assert not hasattr(pp, "_AFFINITY_SWITCH_FILE")
+
+    def case_an_older_cswap_stays_unarmed_on_the_wire(
+            self, monkeypatch, certdir):
+        from claude_swap import autoswitch
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir)
+        monkeypatch.delattr(autoswitch, "cache_aware_active", raising=False)
+        seen.loaded = types.SimpleNamespace(strategy="dynamic", threshold=90.0)
+        self._seed("S", "tok-A")
+        _, auths = self._send(
+            certdir, [("tok-B", "S"), ("tok-A", "S")], body=self._body())
+        assert auths == ["Bearer tok-B", "Bearer tok-A"], auths
+        assert not (seen.reads or seen.fetches), seen
+        assert not pp._affinity_last
+
+    def case_keepalive_due_falls_back_to_the_cswap_rule(self, monkeypatch):
+        """The inline copy answers what cswap's `keepalive_due` (991a1055)
+        answers, reason for reason and in its order, and cswap's own wins
+        when it exists."""
+        from claude_swap import autoswitch
+        from cswap_pin import proxy as pp
+        ok = dict(idle_s=3300.0, pings_since_request=0, ttl_s=3600.0,
+                  prefix_est=20000, slot_kept=True)
+        worst = dict(idle_s=0.0, pings_since_request=9, prefix_est=0)
+        tier = "a 5 min cache tier is not worth a ping"
+        rows = [
+            (ok, (True, "")),
+            (dict(ok, idle_s=99999.0, ttl_s=3599.9), (False, tier)),
+            (dict(ok, ttl_s=300.0, slot_kept=False, **worst), (False, tier)),
+            (dict(ok, slot_kept=False, **worst),
+             (False, "its slot is not kept")),
+            (dict(ok, **worst), (False, "not idle long enough")),
+            (dict(ok, idle_s=3299.9), (False, "not idle long enough")),
+            (dict(ok, pings_since_request=2, prefix_est=0),
+             (False, "pings since its last request are spent")),
+            (dict(ok, pings_since_request=1), (True, "")),
+            (dict(ok, prefix_est=19999),
+             (False, "its prefix is too small to pay")),
+        ]
+        cswaps = getattr(autoswitch, "keepalive_due", None)
+        monkeypatch.delattr(autoswitch, "keepalive_due", raising=False)
+        for kw, want in rows:
+            assert pp._keepalive_due(**kw) == want, (kw, want)
+            if cswaps:  # a host that ships the rule must agree with the copy
+                assert cswaps(**kw) == want, (kw, want)
+        monkeypatch.setattr(autoswitch, "keepalive_due",
+                            lambda **kw: (False, "cswap said"), raising=False)
+        assert pp._keepalive_due(**ok) == (False, "cswap said")
+
+    @staticmethod
+    def _body(ttl="1h", pad=0, tail="x"):
+        """A /v1/messages body whose final cache_control carries ``ttl``
+        (None: the 5 min default, no `ttl` key)."""
+        cc = {"type": "ephemeral", **({"ttl": ttl} if ttl else {})}
+        return json.dumps({
+            "model": "claude-fable-5-1", "max_tokens": 4,
+            "system": [{"type": "text", "text": "s",
+                        "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "x" * pad + tail,
+                 "cache_control": cc}]}]})
+
+    @staticmethod
+    def _call(session, **headers):
+        return dict(bearer="tok-A", extra_headers={
+            "x-claude-code-session-id": session, **headers})
+
+    def case_the_last_main_thread_body_is_kept_while_armed(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+        body = self._body(pad=4000)
+        before = time.monotonic()
+        self._send(certdir, [self._call("S")], body=body)
+        (headers, kept, ttl_s, est, at, pings, why, path,
+         sent_on, form, rebuild, mark) = pp._affinity_last["S"]
+        assert kept == body.encode(), "the body is kept byte for byte"
+        assert sent_on == "tok-A", "the bearer the request went out on"
+        assert ttl_s == 3600.0 and est == len(body.encode()) // 4, (ttl_s, est)
+        assert before <= at <= time.monotonic() and pings == 0, (at, pings)
+        assert why is None and path == "/v1/messages", (why, path)
+        assert form == "full" and rebuild is None, (form, rebuild)
+        assert not mark, "no request before it to give back"
+        names = {k.lower() for k, _ in headers}
+        assert "authorization" not in names, "a kept body carries no bearer"
+        assert "x-claude-code-session-id" in names, names
+        pp._affinity_last["S"][5] = 2  # pings sent since that request
+        newer = self._body(pad=10, tail="newer")
+        self._send(certdir, [self._call("S")], body=newer)
+        assert pp._affinity_last["S"][1] == newer.encode(), (
+            "the newest main-thread body replaces the last")
+        assert pp._affinity_last["S"][5] == 0, (
+            "a real request did not reset the pings sent since the last one")
+
+    def case_only_a_main_thread_1h_request_replaces_the_body(
+            self, monkeypatch, certdir):
+        """A subagent (CC names it in `x-claude-code-agent-id`, and
+        `x-claude-code-parent-agent-id` for a nested one) shares the main
+        thread's session id and often asks for the 1 h tier too, so the tier
+        alone does not say which conversation a body belongs to."""
+        from cswap_pin import proxy as pp
+        first = self._body(tail="first")
+        mixed = json.loads(self._body())
+        mixed["messages"][0]["content"][0]["cache_control"].pop("ttl")
+
+        def after(second, headers=None, armed=True):
+            self._wire(monkeypatch, certdir, armed=armed)
+            self._send(certdir, [self._call("S")], body=first)
+            if second is not None:
+                self._send(certdir, [self._call("S", **(headers or {}))],
+                           body=second)
+            entry = pp._affinity_last.get("S")
+            return entry and entry[1]
+
+        newer = self._body(tail="newer")
+        assert after(None) == first.encode()
+        assert after(newer) == newer.encode()
+        assert after(newer, armed=False) is None, "unarmed keeps nothing"
+        for name in ("x-claude-code-agent-id", "x-claude-code-parent-agent-id"):
+            assert after(newer, {name: "a1"}) == first.encode(), (
+                f"a subagent request ({name}) replaced the main thread's body")
+        for name, other in (  # main thread, but not capturable: it is the last
+                ("a 5 min request", self._body(ttl=None, tail="5m")),
+                ("a final breakpoint with no ttl", json.dumps(mixed)),
+                ("message text that spells a ttl",
+                 self._body(ttl=None, tail='"ttl":"1h"')),
+                ("a body that is not JSON but spells a breakpoint",
+                 '{"cache_control" 1h')):
+            assert after(other) is None, (
+                f"{name} left a superseded 1 h body to be pinged")
+        for name, other in (  # no breakpoint: a side call, writes no cache
+                ("no breakpoint at all",
+                 json.dumps({"model": "m", "messages": []})),
+                ("a body that is not JSON and spells no breakpoint", "{1h")):
+            assert after(other) == first.encode(), (
+                f"{name} dropped the body the API's 1 h entry still holds")
+        held = {"anthropic-beta": "message-threads-2026-08-12"}
+        cont = {"model": "m", "messages": [], "thread": {
+            "type": "continue", "previous_message_id": "msg_1"}}
+        assert after(json.dumps(cont), held) is None, (
+            "a held-form request with no breakpoint advances the server's "
+            "thread and must drop the body")
+        assert after(json.dumps({"model": "m", "messages": []}),
+                     held) == first.encode(), (
+            "a beta request with no `thread` is a full body: no breakpoint, "
+            "a side call")
+        monkeypatch.setattr(pp, "_AFFINITY_BODY_MAX", len(first.encode()) + 5)
+        assert after(self._body(pad=200)) is None, (
+            "a 1 h body over the cap is not kept and drops the stale one")
+
+    def case_the_body_table_is_bounded_in_count_and_bytes(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        size = len(self._body(pad=900).encode())
+        self._wire(monkeypatch, certdir)
+        monkeypatch.setattr(pp, "_AFFINITY_BODY_TOTAL", 2 * size + size // 2)
+        for n in range(3):
+            self._send(certdir, [self._call(f"S{n}")],
+                       body=self._body(pad=900, tail=str(n)))
+        assert list(pp._affinity_last) == ["S1", "S2"], list(pp._affinity_last)
+        self._wire(monkeypatch, certdir)
+        monkeypatch.setattr(pp, "_AFFINITY_MAX", 2)
+        for n in range(3):
+            self._send(certdir, [self._call(f"S{n}")],
+                       body=self._body(tail=str(n)))
+        assert list(pp._affinity) == ["S1", "S2"], list(pp._affinity)
+        assert list(pp._affinity_last) == ["S1", "S2"], (
+            "a body outlived its session's binding", list(pp._affinity_last))
+
+    def case_the_body_goes_with_the_session(self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        body = self._body()
+        for status, goes in ((429, True), (404, False)):
+            self._wire(monkeypatch, certdir)
+            self._seed("S", "tok-A")
+            self._send(certdir, [("tok-B", "S")], body=body,
+                       reject_bearer="tok-A", reject_status=status)
+            assert ("S" not in pp._affinity) is goes, (status, pp._affinity)
+            assert "S" not in pp._affinity_last, (
+                status, list(pp._affinity_last))
+            assert bool(pp._affinity_rest) is goes, (status, pp._affinity_rest)
+        seen = self._wire(monkeypatch, certdir)
+        self._send(certdir, [self._call("S")], body=body)
+        assert "S" in pp._affinity_last
+        seen.loaded.cache_aware = False
+        pp._AFFINITY_CACHE.clear()
+        self._send(certdir, [self._call("S")], body=body)
+        assert not pp._affinity_last, "switching off kept the conversation"
+
+    def case_a_body_that_is_not_json_is_unreadable_not_a_5_min_tier(
+            self, monkeypatch, certdir):
+        """Only a body that parses can say its final breakpoint is the 5 min
+        one; the label must not come from the bytes alone."""
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+        junk = '{"cache_control": not json'
+        five = json.dumps({"model": "m", "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "x",
+             "cache_control": {"type": "ephemeral"}}]}]})
+        assert b'"1h"' not in junk.encode() + five.encode()
+        assert pp._final_cache_ttl_s(junk.encode()) is None
+        assert pp._final_cache_ttl_s(five.encode()) == 300.0
+        for body in (junk, five):
+            self._send(certdir, [self._call("S")], body=body)
+        assert self._health(certdir)["captures"] == {
+            "kept": 0, "dropped": {"unreadable": 1, "5 min tier": 1}}, (
+            pp._affinity_captures)
+
+    def _health(self, certdir):
+        from cswap_pin.proxy import PinProxy
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None)
+        proxy.start()
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", proxy.port, timeout=5)
+            conn.request("GET", "/health")
+            body = json.loads(conn.getresponse().read())
+            conn.close()
+        finally:
+            proxy.stop()
+        return body["cache_aware"]
+
+    def case_health_carries_the_cache_aware_key(self, monkeypatch, certdir):
+        import datetime as dt
+        from cswap_pin import proxy as pp
+        shape = {"sent": 0, "refused": {}, "hit": 0, "forms": {},
+                 "cost": dict.fromkeys(
+                     ("input", "cache_read", "cache_creation", "output"), 0)}
+        self._wire(monkeypatch, certdir, armed=False)
+        got = self._health(certdir)
+        assert got["armed"] is False and got["slots"] == {}, got
+        assert got["snapshot"] == {
+            "age_s": None, "last_rebuild_ms": None, "failures": 0}, got
+        assert got["pings"] == shape, got
+        assert got["captures"] == {"kept": 0, "dropped": {}}, got
+        assert got["rebuilds"] == {"kept": 0, "dropped": {}}, got
+        assert got["carry"] == {"sent": 0, "landed": 0}, got
+        since = dt.datetime.strptime(got["since"], "%Y-%m-%dT%H:%M:%SZ")
+        assert since <= dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+
+        self._wire(monkeypatch, certdir)
+        now = time.monotonic()
+        one, two = ("1", self.EMAIL.format("1")), ("2", self.EMAIL.format("2"))
+        pp._affinity_idents.update({"tok-A": one, "tok-B": two})
+        for ident, tok in ((one, "tok-A"), (two, "tok-B")):
+            pp._affinity_kept[ident] = (tok, self.FAR, 90.0, None, 10.0)
+        pp._affinity_rest[two] = now + 100
+        for session, tok, age, est in (
+                ("S1", "tok-A", 60, 1000), ("S2", "tok-A", 120, 500),
+                ("S3", "tok-A", 7200, 9999), ("S4", "tok-B", 30, 200),
+                ("S5", "tok-Z", 10, 77), ("S6", "tok-A", 5, None)):
+            pp._affinity[session] = (tok, now - age)
+            if est is not None:
+                pp._affinity_last[session] = [[], b"", 3600.0, est, now - age, 0]
+        got = self._health(certdir)
+        assert got["armed"] is True and got["pings"] == shape, got
+        assert set(got["slots"]) == {"1", "2"}, got
+        one_, two_ = got["slots"]["1"], got["slots"]["2"]
+        assert (one_["warm"], one_["kept"], one_["prefix_est"]) == (3, 3, 1500)
+        assert 3470 <= one_["ttl_left_min_s"] <= 3480, one_
+        assert (two_["warm"], two_["kept"], two_["prefix_est"]) == (1, 0, 200)
+        assert 3560 <= two_["ttl_left_min_s"] <= 3570, two_
+        pp._affinity_kept[one] = ("tok-A", 1, 90.0, None, 10.0)
+        assert self._health(certdir)["slots"]["1"]["kept"] == 0, (
+            "an expired stored token is not kept")
+
+    def case_health_counts_the_captures_by_reason(self, monkeypatch, certdir):
+        """The sandbox reads from here how often each kind of main-thread
+        request keeps a body or drops one. A request that is ignored (a
+        subagent's, or one with no breakpoint at all) is neither."""
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+        held = {"anthropic-beta": "message-threads-2026-08-12"}
+        bare = json.dumps({"model": "m", "messages": []})
+        for body, headers in (
+                (self._body(tail="kept"), {}),
+                (self._body(ttl=None, tail="5m"), {}),
+                (json.dumps({"model": "m", "messages": [],
+                             "thread": {"type": "create"}}), held),
+                (bare, held),
+                (bare, {}),
+                (self._body(tail="agent"), {"x-claude-code-agent-id": "a1"})):
+            self._send(certdir, [self._call("S", **headers)], body=body)
+        monkeypatch.setattr(pp, "_AFFINITY_BODY_MAX", 100)
+        self._send(certdir, [self._call("S")], body=self._body(pad=200))
+        assert self._health(certdir)["captures"] == {
+            "kept": 1, "dropped": {"5 min tier": 1, "no breakpoint": 1,
+                                   "over the body cap": 1}}, pp._affinity_captures
+
+    def case_health_ttl_left_reads_the_bodys_clock_where_there_is_one(
+            self, monkeypatch, certdir):
+        """A subagent's request renews the binding, not the main thread's
+        cache: the least TTL left is the clock the sender acts on."""
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+        now = time.monotonic()
+        pp._affinity_idents["tok-A"] = self.IDENT
+        pp._affinity_kept[self.IDENT] = ("tok-A", self.FAR, 90.0, None, 10.0)
+        pp._affinity["S1"] = ("tok-A", now - 10)  # a subagent, just now
+        pp._affinity_last["S1"] = [[], b"", 3600.0, 100, now - 3000, 0]
+        pp._affinity["S2"] = ("tok-A", now - 100)  # no body: the binding's
+        left = self._health(certdir)["slots"]["1"]
+        assert left["warm"] == 2 and 590 <= left["ttl_left_min_s"] <= 600, left
+        pp._affinity["S3"] = ("tok-A", now - 10)
+        pp._affinity_last["S3"] = [[], b"", 3600.0, 100, now - 4000, 0]
+        assert self._health(certdir)["slots"]["1"]["ttl_left_min_s"] == 0, (
+            "a body past its TTL has none left")
+
+    # ---- the keep-alive sender -------------------------------------------
+
+    RL = (b"anthropic-ratelimit-unified-5h-utilization: 0.31\r\n"
+          b"anthropic-ratelimit-unified-7d-utilization: 0.12\r\n")
+    IDENT = ("1", EMAIL.format("1"))
+
+    @staticmethod
+    def _reply(usage=None, status=b"200 OK", extra=b""):
+        """A canned upstream answer carrying ``usage`` the way the API does."""
+        body = json.dumps({} if usage is None else {"usage": usage}).encode()
+        return (b"HTTP/1.1 " + status + b"\r\n" + extra
+                + b"Content-Type: application/json\r\nContent-Length: %d\r\n\r\n"
+                % len(body) + body)
+
+    def _armed(self, monkeypatch, certdir, body=None, beta=None,
+               path="/v1/messages", forms=("full", "rebuilt"), headers=None,
+               **wire):
+        """Wire, then one real armed request, so the pin holds `S`'s body and
+        a fresh snapshot. The session is idle 3400 s afterwards."""
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir, **wire)
+        monkeypatch.setattr(pp, "_KEEPALIVE_FORMS", frozenset(forms))
+        extra = {**({"anthropic-beta": beta} if beta else {}), **(headers or {})}
+        self._send(certdir, [self._call("S", **{
+            "anthropic-version": "2023-06-01", "accept-encoding": "gzip",
+            **extra})], body=body or self._body(pad=90000), path=path)
+        self._age(3400)
+        return seen
+
+    @staticmethod
+    def _age(idle_s):
+        """`S`'s last main-thread request was ``idle_s`` ago: the session's
+        binding and the kept body's own clock both say so."""
+        from cswap_pin import proxy as pp
+        pp._affinity["S"] = ("tok-A", time.monotonic() - idle_s)
+        if "S" in pp._affinity_last:  # a refused ping drops it
+            pp._affinity_last["S"][4] = time.monotonic() - idle_s
+
+    @contextlib.contextmanager
+    def _pair(self, certdir, started=False, **upstream_kw):
+        """A pin pointed at a fake upstream; started only when a case needs
+        its threads."""
+        from cswap_pin.proxy import PinProxy
+        up = _FakeUpstream(certdir, **upstream_kw)
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: "PIN-TOKEN",
+                         upstream=("127.0.0.1", up.port))
+        if started:
+            proxy.start()
+        try:
+            yield proxy, up
+        finally:
+            if started:
+                proxy.stop()
+            up.stop()
+
+    def case_a_due_ping_replays_the_last_body_on_the_stored_token(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        sent = json.loads(self._body(pad=90000))
+        sent.update(max_tokens=32000, stream=True, temperature=1,
+                    thinking={"type": "adaptive"})
+        seen = self._armed(monkeypatch, certdir, body=json.dumps(sent),
+                           beta="oauth-2025-04-20,x-1", path="/v1/messages?beta=true")
+        usage = {"cache_read_input_tokens": 30000,
+                 "cache_creation_input_tokens": 100, "input_tokens": 5}
+        before = time.monotonic() - 3400
+        walled = dict(pp._walled_switch_seen)
+        base = [list(x) for x in (
+            seen.walled, seen.consumed, seen.switched, seen.recorded)]
+        with self._pair(certdir, reply=self._reply(usage, extra=self.RL)) as (
+                proxy, up):
+            proxy._keepalive_tick()
+            proxy._keepalive_tick()  # idle 0 now: nothing more is due
+        assert len(up.bodies_seen) == 1, "one ping, not one a tick"
+        assert json.loads(up.seen_body) == {**sent, "max_tokens": 0,
+                                            "stream": False}, up.seen_body[:200]
+        head = up.seen_head.split("\r\n")
+        low = [l.lower() for l in head]
+        assert head[0] == "POST /v1/messages?beta=true HTTP/1.1", head[0]
+        assert up.seen_auth == "Bearer tok-A", "the snapshot's stored token"
+        assert low.count("anthropic-beta: oauth-2025-04-20,x-1") == 1, head
+        assert "x-claude-code-session-id: s" in low, head
+        assert "accept-encoding: identity" in low and not any(
+            "gzip" in l for l in low), head
+        assert f"content-length: {len(up.seen_body)}" in low, head
+        assert "connection: close" in low, head
+        assert pp._affinity_pings == {"sent": 1, "hit": 1, "refused": {}}, (
+            "an idle that is not long enough yet is the normal state, "
+            "not a refusal", pp._affinity_pings)
+        bearer, at = pp._affinity["S"]
+        assert bearer == "tok-A" and at > before + 3399, (
+            "a ping renews the clock the API's cache keeps", at - before)
+        assert pp._affinity_last["S"][4] > before + 3399, (
+            "a 2xx ping renews the body's own clock")
+        assert pp._affinity_last["S"][5] == 1, "one ping since the request"
+        (line,) = [l for l in seen.logs if "keep-alive" in l]
+        for part in ("slot 1", "form full", "status 200", "cache_read 30000",
+                     "cache_creation 100", "hit True",
+                     "anthropic-ratelimit-unified-5h-utilization=0.31",
+                     "anthropic-ratelimit-unified-7d-utilization=0.12"):
+            assert part in line, (part, line)
+        assert "tok-A" not in line and "x" * 40 not in line, line
+        assert [seen.walled, seen.consumed, seen.switched,
+                seen.recorded] == base, "a ping reached the store or a switch"
+        assert pp._walled_switch_seen == walled
+
+    def case_a_helper_shaped_body_is_pinged_on_one_credential(
+            self, monkeypatch, certdir):
+        """The kept headers hold the key the client sent as `x-api-key`. After
+        the slot's token moved on, a ping on the stored token with that old key
+        beside it is two credentials (the API answered 401 to 5 of them). The
+        ping's key is its bearer, and only when the client sent one."""
+        from cswap_pin import proxy as pp
+        for key in ("tok-A", None):
+            self._armed(monkeypatch, certdir,
+                        headers={"x-api-key": key} if key else None)
+            pp._affinity_kept[self.IDENT] = (
+                "tok-A2", *pp._affinity_kept[self.IDENT][1:])  # refreshed
+            with self._pair(certdir, reply=self._reply({})) as (proxy, up):
+                proxy._keepalive_tick()
+            assert len(up.bodies_seen) == 1, (key, "no ping")
+            assert self._creds(up.seen_head) == {
+                "authorization": "Bearer tok-A2",
+                **({"x-api-key": "tok-A2"} if key else {})}, (key, up.seen_head)
+
+    def case_a_ping_that_misses_is_counted_and_two_are_the_most(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        self._armed(monkeypatch, certdir)
+        miss = {"cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 30000}
+        with self._pair(certdir, reply=self._reply(miss)) as (proxy, up):
+            proxy._keepalive_tick()
+            self._age(3400)
+            proxy._keepalive_tick()
+            self._age(3400)
+            proxy._keepalive_tick()
+        assert len(up.bodies_seen) == 2
+        assert pp._affinity_pings == {
+            "sent": 2, "hit": 0,
+            "refused": {"pings since its last request are spent": 1}}, (
+                pp._affinity_pings)
+
+    def case_a_ping_is_refused_by_each_reason_once(self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        ident = self.IDENT
+        spent = "pings since its last request are spent"
+        rows = [  # (reason, forms enabled, what makes the session so)
+            ("form not measured", (), lambda e: None),
+            ("form not measured", ("rebuilt",), lambda e: None),
+            ("its slot is not kept", ("full",),
+             lambda e: pp._affinity_kept.pop(ident)),
+            ("its slot is not kept", ("full",), lambda e:
+             pp._affinity_rest.update({ident: time.monotonic() + 99})),
+            ("its slot is not kept", ("full",), lambda e:
+             pp._affinity_kept.update({ident: ("tok-A", 1, 90.0, None, 10.0)})),
+            ("a 5 min cache tier is not worth a ping", ("full",),
+             lambda e: e.__setitem__(2, 300.0)),
+            (spent, ("full",), lambda e: e.__setitem__(5, 2)),
+            ("its prefix is too small to pay", ("full",),
+             lambda e: e.__setitem__(3, 100)),
+            ("past its cache ttl", ("full",), lambda e: self._age(4000)),
+        ]
+        for reason, forms, make in rows:
+            self._armed(monkeypatch, certdir, forms=forms)
+            make(pp._affinity_last["S"])
+            with self._pair(certdir) as (proxy, up):
+                proxy._keepalive_tick()
+                proxy._keepalive_tick()
+            assert up.bodies_seen == [], (reason, "a refused ping was sent")
+            assert pp._affinity_pings == {
+                "sent": 0, "hit": 0, "refused": {reason: 1}}, (
+                    reason, pp._affinity_pings)
+        self._armed(monkeypatch, certdir)
+        pp._affinity_last["S"][5] = 2
+        with self._pair(certdir) as (proxy, up):
+            proxy._keepalive_tick()
+        assert self._health(certdir)["pings"]["refused"] == {spent: 1}
+        # an expired token is caught again at the send, for the caller that
+        # skips the rule: the harness
+        self._armed(monkeypatch, certdir, forms=())
+        pp._affinity_kept[ident] = ("tok-A", 1, 90.0, None, 10.0)
+        with self._pair(certdir) as (proxy, up):
+            got = proxy._keepalive_ping("S", force_form=True)
+        assert got["refused"] == "token expired" and got["status"] is None, got
+        assert up.bodies_seen == []
+        assert pp._affinity_pings["refused"] == {"token expired": 1}
+
+    def case_only_a_snapshot_that_is_fresh_may_rule(self, monkeypatch, certdir):
+        """A snapshot older than its bound is rebuilt on its thread and the
+        ping waits a tick; a session that is not due costs no rebuild."""
+        from cswap_pin import proxy as pp
+        seen = self._armed(monkeypatch, certdir)
+        stale = dict(tried=float("-inf"), at=float("-inf"))
+        with self._pair(certdir, reply=self._reply({})) as (proxy, up):
+            pp._affinity_snap.update(stale)
+            self._age(100)
+            fetches = len(seen.fetches)
+            proxy._keepalive_tick()
+            assert len(seen.fetches) == fetches, "nothing due, nothing rebuilt"
+            self._age(3400)
+            proxy._keepalive_tick()
+            assert up.bodies_seen == [], "ruled on a snapshot it could not trust"
+            assert len(seen.fetches) == fetches + 1, "no rebuild was started"
+            proxy._keepalive_tick()
+        assert len(up.bodies_seen) == 1, "the tick after the rebuild pinged"
+
+    def case_a_pings_refusal_never_reaches_a_switch_or_a_rest(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        for status in (401, 403, 429, 529):
+            seen = self._armed(monkeypatch, certdir)
+            kept = dict(pp._affinity_kept)
+            base = [list(x) for x in (
+                seen.walled, seen.consumed, seen.switched, seen.recorded)]
+            walled = (dict(pp._walled_switch_seen),
+                      dict(pp._walled_switch_seen_by_session))
+            reply = self._reply(
+                {}, status=b"%d No" % status,
+                extra=b"anthropic-ratelimit-unified-reset: 4102444800\r\n")
+            with self._pair(certdir, reply=reply) as (proxy, up):
+                proxy._keepalive_tick()
+                proxy._keepalive_tick()
+                self._age(3400)
+                proxy._keepalive_tick()
+            assert len(up.bodies_seen) == 1, (status, "pinged again")
+            assert pp._affinity_pings == {
+                "sent": 0, "hit": 0, "refused": {f"http {status}": 1}}, (
+                    status, pp._affinity_pings)
+            assert (dict(pp._walled_switch_seen),
+                    dict(pp._walled_switch_seen_by_session)) == walled
+            assert [seen.walled, seen.consumed, seen.switched,
+                    seen.recorded] == base, (status, seen)
+            assert not (pp._affinity_rest or pp._affinity_dropped), status
+            assert pp._affinity_kept == kept and "S" in pp._affinity, status
+            assert "S" not in pp._affinity_last
+            self._send(certdir, [self._call("S")], body=self._body(pad=90000))
+            assert pp._affinity_last["S"][5] == 0, "a real request pings again"
+            assert pp._affinity_last["S"][6] is None
+
+    def case_a_ping_that_cannot_be_sent_is_counted_and_not_retried(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        self._armed(monkeypatch, certdir)
+        with self._pair(certdir) as (proxy, up):
+            up.stop()  # nothing listens now
+            proxy._keepalive_tick()
+            self._age(3400)
+            proxy._keepalive_tick()
+        (reason, n), = pp._affinity_pings["refused"].items()
+        assert reason.startswith("error ") and n == 1, pp._affinity_pings
+        assert pp._affinity_pings["sent"] == 0 and "S" not in pp._affinity_last
+
+    def case_a_failed_ping_logs_the_api_error_and_no_secret(
+            self, monkeypatch, certdir):
+        """31 of 65 held pings answered 404 and the line said only the code.
+        What the API said is logged field by field: never the raw body, the
+        request, or a header but `request-id` and the utilization ones."""
+        from cswap_pin import proxy as pp
+        seen = self._armed(monkeypatch, certdir)
+        err = json.dumps({"type": "error", "error": {
+            "type": "not_found_error", "details": {"error_code": "thread_gone"},
+            "message": "No thread state was found for the requested "
+                       "`previous_message_id`.\nReplay\tthe \x1b[31mfull conversation "
+                       + "z" * 200}}).encode()
+        reply = (b"HTTP/1.1 404 Not Found\r\nrequest-id: req_abc123\r\n"
+                 b"set-cookie: sid=hunter2\r\n" + self.RL
+                 + b"Content-Length: %d\r\n\r\n" % len(err) + err)
+        with self._pair(certdir, reply=reply) as (proxy, up):
+            proxy._keepalive_tick()
+        (line,) = [l for l in seen.logs if "keep-alive" in l]
+        for part in ("slot 1", "http 404", "not_found_error", "thread_gone",
+                     "No thread state", "request-id req_abc123",
+                     "anthropic-ratelimit-unified-5h-utilization=0.31",
+                     "anthropic-ratelimit-unified-7d-utilization=0.12"):
+            assert part in line, (part, line)
+        assert "tok-" not in line and "x" * 40 not in line, line
+        assert "hunter2" not in line and '"type"' not in line, line
+        assert "`" not in line and "\n" not in line and "z" * 100 not in line, line
+        assert not any(c < " " or c == "\x7f" for c in line), repr(line)
+        assert pp._affinity_pings["refused"] == {"http 404": 1}, (
+            "the counter's key is the status alone")
+
+    def case_a_hit_ping_adds_its_usage_to_the_cost(self, monkeypatch, certdir):
+        self._armed(monkeypatch, certdir)
+        usage = {"input_tokens": 5, "cache_read_input_tokens": 30000,
+                 "cache_creation_input_tokens": 100, "output_tokens": 1}
+        with self._pair(certdir, reply=self._reply(usage)) as (proxy, up):
+            proxy._keepalive_tick()
+        assert self._health(certdir)["pings"]["cost"] == {
+            "input": 5, "cache_read": 30000, "cache_creation": 100,
+            "output": 1}
+
+    # ---- the rebuilt create ping (T2927) ----------------------------------
+    # A held (`message-threads-`) session's server thread lives ~300 s, so a
+    # ping that replays its last `continue` is refused (400 while the thread
+    # lives, 404 after: 0 of 33 answered 200). The pin rebuilds the session's
+    # whole conversation instead (the last create, each relayed reply, each
+    # later continue's messages) and pings with that as a `create`.
+
+    HELD_BETA = "claude-code-20250219,message-threads-2026-08-12"
+    HEADLESS = "a headless session's held thread"
+    NO_REBUILD = "a held thread with no rebuild"
+    CC1H = {"type": "ephemeral", "ttl": "1h"}
+    SYS = [{"type": "text", "text": "x-billing-header: cch=1"},
+           {"type": "text", "text": "the system prompt", "cache_control": CC1H}]
+    TOOLS = [{"name": "Bash", "description": "run a command",
+              "input_schema": {"type": "object",
+                               "properties": {"command": {"type": "string"}}}}]
+
+    @classmethod
+    def _held(cls, thread, content, **top):
+        """A held body: a create carries the system and tools, a continue its
+        new turn only. ``content`` is the last user message (a string, or the
+        blocks of it); the 1 h breakpoint sits on its last block, as the
+        client puts it. ``top`` overrides any top-level field."""
+        blocks = ([{"type": "text", "text": content}]
+                  if isinstance(content, str) else [dict(b) for b in content])
+        blocks[-1]["cache_control"] = cls.CC1H
+        body = {"model": "claude-opus-5-5", "max_tokens": 32000, "stream": True,
+                "thinking": {"type": "adaptive"}, "metadata": {"user_id": "u0"},
+                "diagnostics": {"previous_message_id":
+                                thread.get("previous_message_id")},
+                "thread": thread,
+                "messages": [{"role": "user", "content": blocks}]}
+        if thread["type"] == "create":
+            body.update(system=cls.SYS, tools=cls.TOOLS)
+        return json.dumps({**body, **top})
+
+    @staticmethod
+    def _sse(msg_id, blocks, stop=True, frame="chunked", status=b"200 OK",
+             error=False):
+        """A streamed reply as the API sends it: ``blocks`` are what the
+        message ends up holding (thinking, text, tool_use), streamed as the
+        deltas that build them with a ping between events. ``frame`` is how
+        the body ends: `chunked` in slices that cut across events, `length`,
+        or `close` (the connection ends it). ``stop`` False: no message_stop,
+        a reply cut short; ``error`` an `error` event in its place, as the API
+        sends a mid-stream `overloaded_error`."""
+        def ev(name, data):
+            return b"event: %s\ndata: %s\n\n" % (
+                name.encode(), json.dumps({"type": name, **data}).encode())
+
+        out = [ev("message_start", {"message": {
+            "id": msg_id, "type": "message", "role": "assistant",
+            "content": [], "usage": {"input_tokens": 2}}})]
+        for i, b in enumerate(blocks):
+            if b["type"] == "thinking":
+                t = b["thinking"]
+                start = {"type": "thinking", "thinking": ""}
+                deltas = [{"type": "thinking_delta", "thinking": t[:4]},
+                          {"type": "thinking_delta", "thinking": t[4:]},
+                          {"type": "signature_delta",
+                           "signature": b["signature"]}]
+            elif b["type"] == "text":
+                t = b["text"]
+                start = {"type": "text", "text": ""}
+                deltas = [{"type": "text_delta", "text": t[:5]},
+                          {"type": "text_delta", "text": t[5:]}]
+            else:  # tool_use
+                j = json.dumps(b["input"])
+                start = {**b, "input": {}}
+                deltas = [{"type": "input_json_delta", "partial_json": p}
+                          for p in ("", j[:7], j[7:])]
+            out += [ev("content_block_start", {"index": i,
+                                               "content_block": start}),
+                    ev("ping", {})]
+            out += [ev("content_block_delta", {"index": i, "delta": d})
+                    for d in deltas]
+            out.append(ev("content_block_stop", {"index": i}))
+        out.append(ev("message_delta", {"delta": {"stop_reason": "end_turn"},
+                                        "usage": {"output_tokens": 9}}))
+        if stop and not error:
+            out.append(ev("message_stop", {}))
+        if error:
+            out.append(ev("error", {"error": {
+                "type": "overloaded_error", "message": "Overloaded"}}))
+        body = b"".join(out)
+        head = (b"HTTP/1.1 " + status
+                + b"\r\nContent-Type: text/event-stream\r\n")
+        if frame == "length":
+            return head + b"Content-Length: %d\r\n\r\n" % len(body) + body
+        if frame == "close":
+            return head + b"Connection: close\r\n\r\n" + body
+        cuts = [body[k:k + 37] for k in range(0, len(body), 37)]
+        return (head + b"Transfer-Encoding: chunked\r\n\r\n" + b"".join(
+            b"%x\r\n%s\r\n" % (len(c), c) for c in cuts) + b"0\r\n\r\n")
+
+    def _talk(self):
+        """Three turns of one held session, as (bodies, replies, the messages
+        a rebuild of it must hold): a create, a continue answering a tool
+        call, a continue with a new question. The replies carry signed
+        thinking, a tool call with streamed input, and text."""
+        r1 = [{"type": "thinking", "thinking": "I should run ls",
+               "signature": "sig-one"},
+              {"type": "tool_use", "id": "toolu_1", "name": "Bash",
+               "input": {"command": "ls", "description": "list"},
+               "caller": {"type": "direct"}}]
+        r2 = [{"type": "thinking", "thinking": "one file", "signature": "sig-two"},
+              {"type": "text", "text": "There is one file, a.txt."}]
+        res = [{"type": "tool_result", "tool_use_id": "toolu_1",
+                "content": "a.txt"}]
+        bodies = [
+            self._held({"type": "create"}, "list the files"),
+            self._held({"type": "continue", "previous_message_id": "msg_1"},
+                       res, metadata={"user_id": "u1"}),
+            self._held({"type": "continue", "previous_message_id": "msg_2"},
+                       "and its size?", metadata={"user_id": "u2"})]
+        replies = [self._sse("msg_1", r1), self._sse("msg_2", r2),
+                   self._sse("msg_3", [{"type": "text", "text": "Four."}])]
+        messages = [
+            {"role": "user", "content": "list the files"},
+            {"role": "assistant", "content": r1},
+            {"role": "user", "content": res},
+            {"role": "assistant", "content": r2},
+            {"role": "user", "content": [{
+                "type": "text", "text": "and its size?",
+                "cache_control": self.CC1H}]}]
+        return bodies, replies, messages
+
+    @classmethod
+    def _held_call(cls, session, **headers):
+        return cls._call(session, **{
+            "anthropic-version": "2023-06-01", "accept-encoding": "gzip",
+            "anthropic-beta": cls.HELD_BETA,
+            "user-agent": "claude-cli/2.1.310 (external, cli)", **headers})
+
+    @staticmethod
+    def _await_settled():
+        """The relay settles a reply just after the client has it: wait for
+        every request that awaits one (a held body's rebuild, a full body's
+        entry)."""
+        from cswap_pin import proxy as pp
+        end = time.monotonic() + 5
+        while time.monotonic() < end and any(
+                (e[10] is not None and e[10].body is not None)
+                or e[11] is not None for e in list(pp._affinity_last.values())):
+            time.sleep(0.01)
+
+    @classmethod
+    def _turns(cls, certdir, bodies, replies, session="S", got=None,
+               between=None, **headers):
+        """Each of ``bodies`` through a real MITM on `tok-A` as one held
+        client session, answered by ``replies`` in order. Returns the
+        statuses and the (stopped) upstream, whose heads and bodies it kept;
+        ``got`` (a list) gets each reply body the client read, ``between``
+        (a callable) runs after each request but the last."""
+        from cswap_pin.proxy import PinProxy
+        up = _FakeUpstream(certdir, replies=replies)
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: "PIN-TOKEN",
+                         upstream=("127.0.0.1", up.port))
+        proxy.start()
+        try:
+            statuses = []
+            for n, b in enumerate(bodies):
+                if n and between:
+                    between()
+                statuses.append(_request_through_proxy(
+                    proxy.port, certdir / "ca.pem", "/v1/messages?beta=true",
+                    body=b, body_out=got, **cls._held_call(session, **headers)))
+            cls._await_settled()
+        finally:
+            proxy.stop()
+            up.stop()
+        return statuses, up
+
+    def case_an_idle_held_session_is_pinged_with_a_create_rebuilt_from_its_replies(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        bodies, replies, messages = self._talk()
+        seen = self._wire(monkeypatch, certdir)
+        statuses, real = self._turns(certdir, bodies, replies)
+        self._age(3400)
+        assert statuses == [200, 200, 200], statuses
+        assert all("accept-encoding: identity" in h.lower()
+                   for h in real.heads_seen), (
+            "the tee reads plain SSE, so an armed held request asks the "
+            "upstream for identity whatever the client accepts")
+        assert pp._affinity_last["S"][9] == "held"
+        usage = {"cache_read_input_tokens": 30000,
+                 "cache_creation_input_tokens": 0, "input_tokens": 2}
+        with self._pair(certdir, reply=self._reply(usage)) as (proxy, up):
+            proxy._keepalive_tick()
+        assert len(up.bodies_seen) == 1, "one ping"
+        sent = json.loads(up.seen_body)
+        assert sent["messages"] == messages, sent["messages"]
+        assert sent["system"] == self.SYS and sent["tools"] == self.TOOLS, (
+            "the create's, whole: a continue carries no tools")
+        assert sent["thread"] == {"type": "create"}, sent["thread"]
+        assert sent["max_tokens"] == 0 and sent["stream"] is False
+        assert sent["metadata"] == {"user_id": "u2"} and (
+            sent["model"] == "claude-opus-5-5"), "the latest request's fields"
+        assert up.seen_body.count(b'"cache_control"') == 2, (
+            "the system prompt's and the last block's, no other")
+        assert up.seen_auth == "Bearer tok-A", "the slot's stored token"
+        assert "message-threads-2026-08-12" in up.seen_head
+        assert pp._affinity_last["S"][3] == 30000, "the reply measures it"
+        (line,) = [l for l in seen.logs if "keep-alive" in l]
+        assert "form rebuilt status 200 cache_read 30000" in line, line
+        got = self._health(certdir)
+        cost = {"input": 2, "cache_read": 30000, "cache_creation": 0,
+                "output": 0}
+        assert got["pings"]["sent"] == 1 and got["pings"]["hit"] == 1, got
+        assert got["pings"]["forms"] == {"rebuilt": {
+            "sent": 1, "hit": 1, "refused": {}, "cost": cost}}, got["pings"]
+        assert got["rebuilds"] == {"kept": 3, "dropped": {}}, got["rebuilds"]
+
+    def case_a_reply_is_rebuilt_whatever_frames_it(self, monkeypatch, certdir):
+        bodies, replies, messages = self._talk()
+        usage = {"cache_read_input_tokens": 30000}
+        for frame in ("chunked", "length", "close"):
+            self._wire(monkeypatch, certdir)
+            replies = [self._sse(f"msg_{n}", b, frame=frame) for n, b in (
+                (1, [{"type": "text", "text": "one"}]),
+                (2, [{"type": "text", "text": "two"}]))]
+            self._turns(certdir, bodies[:2], replies)
+            self._age(3400)
+            with self._pair(certdir, reply=self._reply(usage)) as (proxy, up):
+                got = proxy._keepalive_ping("S")
+            assert got["form"] == "rebuilt" and got["status"] == 200, (
+                frame, got)
+            assert [m["content"] for m in json.loads(up.seen_body)["messages"]
+                    ][:2] == ["list the files", "one"], frame
+
+    def case_a_rebuild_that_cannot_be_trusted_is_dropped_and_nothing_is_sent(
+            self, monkeypatch, certdir):
+        """A rebuild that may not be the conversation the cache holds would
+        write the whole prefix again, on a ping: it is dropped under its
+        reason, counted once, and the ping is refused under its own."""
+        from cswap_pin import proxy as pp
+        bodies, replies, _ = self._talk()
+        cut = self._sse("msg_1", [{"type": "text", "text": "cut"}], stop=False)
+        for reason, sent, answers in (
+                ("continue does not chain", bodies[:2], [cut, replies[1]]),
+                ("continue does not chain", [bodies[0], bodies[2]],
+                 [replies[0], replies[2]])):
+            self._wire(monkeypatch, certdir)
+            statuses, _ = self._turns(certdir, sent, answers)
+            assert statuses[0] == 200, (reason, statuses)
+            self._age(3400)
+            assert self._health(certdir)["rebuilds"]["dropped"] == {
+                reason: 1}, (reason, pp._rebuild_counts)
+            with self._pair(certdir, reply=self._reply(
+                    {"cache_read_input_tokens": 30000})) as (proxy, up):
+                proxy._keepalive_tick()
+                proxy._keepalive_tick()
+            assert up.bodies_seen == [], (reason, "a ping went out")
+            assert pp._affinity_pings["refused"] == {self.NO_REBUILD: 1}, (
+                reason, pp._affinity_pings)
+            assert "S" not in pp._affinity_last, (reason, "asked every tick")
+            assert self._health(certdir)["pings"]["forms"] == {"rebuilt": {
+                "sent": 0, "hit": 0, "refused": {self.NO_REBUILD: 1},
+                "cost": dict.fromkeys(
+                    ("input", "cache_read", "cache_creation", "output"), 0)}}
+
+    def case_a_continue_that_fails_leaves_the_rebuild_for_its_retry(
+            self, monkeypatch, certdir):
+        """A 429, 5xx or 400 makes no assistant message and moves no thread:
+        the retry names the same previous id and the rebuild carries on."""
+        from cswap_pin import proxy as pp
+        bodies, replies, messages = self._talk()
+        usage = {"cache_read_input_tokens": 30000}
+        for code in (b"429 Too Many Requests", b"529 Overloaded",
+                     b"500 Internal Server Error", b"502 Bad Gateway",
+                     b"400 Bad Request"):
+            self._wire(monkeypatch, certdir)
+            statuses, _ = self._turns(
+                certdir, [bodies[0], bodies[1], bodies[1], bodies[2]],
+                [replies[0], self._reply({}, status=code), replies[1],
+                 replies[2]])
+            assert statuses == [200, int(code[:3]), 200, 200], (code, statuses)
+            assert pp._rebuild_counts["dropped"] == {}, (code, pp._rebuild_counts)
+            self._age(3400)
+            with self._pair(certdir, reply=self._reply(usage)) as (proxy, up):
+                proxy._keepalive_tick()
+            assert json.loads(up.seen_body)["messages"] == messages, code
+        # and with no retry at all: what the last 2xx request left
+        self._wire(monkeypatch, certdir)
+        self._turns(certdir, bodies[:2], [replies[0], self._reply(
+            {}, status=b"529 Overloaded")])
+        self._age(3400)
+        with self._pair(certdir, reply=self._reply(usage)) as (proxy, up):
+            proxy._keepalive_tick()
+        assert json.loads(up.seen_body)["messages"] == [{
+            "role": "user", "content": [{
+                "type": "text", "text": "list the files",
+                "cache_control": self.CC1H}]}]
+        assert json.loads(up.seen_body)["metadata"] == {"user_id": "u0"}, (
+            "the fields of the request that was answered")
+
+    def case_a_stream_that_ends_in_an_error_event_is_a_failed_request(
+            self, monkeypatch, certdir):
+        """An `overloaded_error` event under HTTP 200 made no message either:
+        its retry names the same previous id, so the rebuild must have given
+        the request back, not settled it as a reply that was cut."""
+        from cswap_pin import proxy as pp
+        bodies, replies, messages = self._talk()
+        failed = self._sse("msg_2", [{"type": "text", "text": "Ov"}],
+                           error=True)
+        self._wire(monkeypatch, certdir)
+        statuses, _ = self._turns(
+            certdir, [bodies[0], bodies[1], bodies[1], bodies[2]],
+            [replies[0], failed, replies[1], replies[2]])
+        assert statuses == [200, 200, 200, 200], statuses
+        assert pp._rebuild_counts["dropped"] == {}, pp._rebuild_counts
+        self._age(3400)
+        with self._pair(certdir, reply=self._reply(
+                {"cache_read_input_tokens": 30000})) as (proxy, up):
+            proxy._keepalive_tick()
+        assert json.loads(up.seen_body)["messages"] == messages
+
+    def case_a_failed_continue_does_not_restart_the_idle_clock(
+            self, monkeypatch, certdir):
+        """The API's cache was last refreshed by the last request that
+        succeeded, however long after it the continue failed: the ping is due,
+        and refused as past its ttl, by that clock and never by the failed
+        attempt's, or a ping goes out on a cold cache and writes it whole."""
+        from cswap_pin import proxy as pp
+        bodies, replies, _ = self._talk()
+        usage = {"cache_read_input_tokens": 30000}
+        failures = {
+            "429": self._reply({}, status=b"429 Too Many Requests"),
+            "an error event": self._sse(
+                "msg_2", [{"type": "text", "text": "Ov"}], error=True)}
+        for idle, pinged in ((3400, 1), (3700, 0)):
+            for how, failure in failures.items():
+                self._wire(monkeypatch, certdir)
+                self._turns(certdir, bodies[:2], [replies[0], failure],
+                            between=lambda: self._age(idle))
+                with self._pair(certdir, reply=self._reply(usage)) as (
+                        proxy, up):
+                    proxy._keepalive_tick()
+                assert len(up.bodies_seen) == pinged, (idle, how)
+                assert pp._affinity_pings["refused"] == (
+                    {} if pinged else {"past its cache ttl": 1}), (
+                    idle, how, pp._affinity_pings)
+
+    def case_a_failed_full_request_does_not_restart_the_idle_clock(
+            self, monkeypatch, certdir):
+        """A full body is kept when it is captured, before its reply is known.
+        A request that then fails wrote no cache: the cache holds the last 2xx
+        request's body, on that request's clock. The ping is due by that
+        clock, carries that body, and is refused as past its ttl by it, never
+        by the failed attempt's, or a ping goes out on a cold cache (or of a
+        turn that was never cached) and writes the whole prefix."""
+        from cswap_pin import proxy as pp
+        first = self._body(pad=90000, tail="first")
+        second = self._body(pad=90000, tail="second")
+        answered = self._sse("msg_1", [{"type": "text", "text": "ok"}])
+        failures = {
+            "429": self._reply({}, status=b"429 Too Many Requests"),
+            "400": self._reply({}, status=b"400 Bad Request"),
+            "529": self._reply({}, status=b"529 Overloaded"),
+            "an error event": self._sse(
+                "msg_2", [{"type": "text", "text": "Ov"}], error=True)}
+        for idle, pinged in ((2300, 1), (2700, 0)):
+            for how, failure in failures.items():
+                self._wire(monkeypatch, certdir)
+                self._turns(certdir, [first, second], [answered, failure],
+                            between=lambda: self._age(1000))
+                pp._affinity_last["S"][4] -= idle  # 1000 s + idle: 3300, 3700
+                with self._pair(certdir, reply=self._reply(
+                        {"cache_read_input_tokens": 30000})) as (proxy, up):
+                    proxy._keepalive_tick()
+                assert len(up.bodies_seen) == pinged, (idle, how)
+                assert pp._affinity_pings["refused"] == (
+                    {} if pinged else {"past its cache ttl": 1}), (
+                    idle, how, pp._affinity_pings)
+                if pinged:
+                    assert json.loads(up.seen_body) == {
+                        **json.loads(first), "max_tokens": 0,
+                        "stream": False}, (how, "the 2xx request's body")
+
+    def case_a_full_request_answered_2xx_replaces_the_body_and_the_clock(
+            self, monkeypatch, certdir):
+        """Whatever a 2xx reply looks like (whole JSON, a stream, one cut
+        short), the request it answers wrote the cache: its body and its
+        capture's clock are the entry's, and nothing is left to give back."""
+        from cswap_pin import proxy as pp
+        first = self._body(pad=90000, tail="first")
+        second = self._body(pad=90000, tail="second")
+        text = [{"type": "text", "text": "ok"}]
+        for how, answer in (
+                ("json", self._reply({})), ("a stream", self._sse("m2", text)),
+                ("a cut stream", self._sse("m2", text, stop=False))):
+            self._wire(monkeypatch, certdir)
+            self._turns(certdir, [first, second],
+                        [self._sse("m1", text), answer],
+                        between=lambda: self._age(1000))
+            entry = pp._affinity_last["S"]
+            assert entry[1] == second.encode() and entry[11] is None, how
+            assert 0 <= time.monotonic() - entry[4] < 60, (
+                how, "the clock is the new request's")
+
+    def case_a_failed_first_full_request_keeps_no_body(
+            self, monkeypatch, certdir):
+        """No request before it answered: its body was never cached, and a
+        ping of it would write it at the 1 h rate. Its retry is kept."""
+        from cswap_pin import proxy as pp
+        body = self._body(pad=90000)
+        for how, failure in (
+                ("429", self._reply({}, status=b"429 Too Many Requests")),
+                ("an error event", self._sse(
+                    "m1", [{"type": "text", "text": "Ov"}], error=True))):
+            self._wire(monkeypatch, certdir)
+            self._turns(certdir, [body], [failure])
+            assert "S" not in pp._affinity_last, how
+            self._turns(certdir, [body, body], [failure, self._reply({})])
+            assert pp._affinity_last["S"][1] == body.encode(), how
+            assert pp._affinity_last["S"][11] is None, how
+
+    def case_a_kept_401s_resend_is_the_tee_that_settles_the_request(
+            self, monkeypatch, certdir):
+        """A kept 401 returns before the tee has a status, and the resend on
+        the rotated token is the same body: that resend's tee settles it, and
+        the first settled nothing (a failure would give the old body back)."""
+        from cswap_pin import proxy as pp
+        self._prime_then_rotate(monkeypatch, certdir)
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", lambda fn:
+                            threading.Thread(target=fn, daemon=True).start())
+        old = self._body(pad=90000, tail="old")
+        new = self._body(pad=90000, tail="new")
+        pp._affinity_last["S"] = [
+            [], old.encode(), 3600.0, 22500, time.monotonic() - 1000, 0, None,
+            "/v1/messages", "tok-A", "full", None, None]
+        statuses, auths = self._send(
+            certdir, [("tok-B", "S")], body=new, reject_bearer="tok-A",
+            reject_status=401)
+        assert (statuses, auths) == ([200], ["Bearer tok-A", "Bearer tok-A2"])
+        self._await_settled()
+        entry = pp._affinity_last["S"]
+        assert entry[1] == new.encode() and entry[11] is None, entry[11]
+        assert 0 <= time.monotonic() - entry[4] < 60, "the new request's clock"
+
+    def case_a_full_request_gives_back_the_last_answered_one(
+            self, monkeypatch, certdir):
+        """A request that comes in while another awaits its reply gives back
+        what that one would have: the last answered. A request that has been
+        replaced settles nothing."""
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+        self._seed("S", "tok-A")
+        headers = [("x-claude-code-session-id", "S")]
+
+        def capture(tail):
+            body = self._body(pad=100, tail=tail).encode()
+            assert pp._affinity_capture(certdir, headers, body, "/v1/messages")
+            return pp._affinity_last["S"]
+
+        a = capture("a")
+        assert a[11] == [], "nothing before it"
+        pp._full_settle(a, "S", 200)
+        assert a[11] is None
+        b = capture("b")
+        assert b[11] == a[:9], "the answered request, whole"
+        c = capture("c")
+        assert c[11] is b[11], "b is not answered yet: c gives back a"
+        pp._full_settle(b, "S", 529)
+        assert pp._affinity_last["S"] is c and c[11] is not None, (
+            "a replaced request settles nothing")
+        c[5] = 1
+        pp._full_settle(c, "S", 429)
+        assert c[:9] == a[:9] and c[11] is None, "a, whole, as it was"
+        pp._full_settle(c, "S", 429)
+        assert c[:9] == a[:9], "settled once"
+
+    def case_a_cut_reply_leaves_the_rebuild_pingable_but_not_chainable(
+            self, monkeypatch, certdir):
+        """The cache holds what the last request sent whether or not its
+        reply was read to the end (Esc, a dropped stream): a ping needs no
+        reply, only a continue naming one does."""
+        import gzip
+
+        from cswap_pin import proxy as pp
+        bodies, replies, _ = self._talk()
+        cut = self._sse("msg_1", [{"type": "text", "text": "cut"}], stop=False)
+        zipped = gzip.compress(b"".join(self._sse(
+            "msg_1", [{"type": "text", "text": "z"}],
+            frame="close").partition(b"\r\n\r\n")[2:]))
+        gz = (b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+              b"Content-Encoding: gzip\r\nContent-Length: %d\r\n\r\n"
+              % len(zipped) + zipped)
+        usage = {"cache_read_input_tokens": 30000}
+        first = [{"role": "user", "content": [{
+            "type": "text", "text": "list the files",
+            "cache_control": self.CC1H}]}]
+        for answer in (cut, gz):
+            self._wire(monkeypatch, certdir)
+            self._turns(certdir, bodies[:1], [answer])
+            self._age(3400)
+            assert pp._rebuild_counts["dropped"] == {}, pp._rebuild_counts
+            with self._pair(certdir, reply=self._reply(usage)) as (proxy, up):
+                proxy._keepalive_tick()
+            assert json.loads(up.seen_body)["messages"] == first
+        # a create re-bases
+        replay = self._held({"type": "create"}, "ignored", messages=[
+            {"role": "user", "content": "list the files"},
+            {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+            {"role": "user", "content": [{
+                "type": "text", "text": "size?", "cache_control": self.CC1H}]}])
+        self._wire(monkeypatch, certdir)
+        self._turns(certdir, [bodies[0], replay], [cut, self._sse(
+            "msg_9", [{"type": "text", "text": "fine"}])])
+        assert pp._rebuild_counts["dropped"] == {}, pp._rebuild_counts
+        self._age(3400)
+        with self._pair(certdir, reply=self._reply(usage)) as (proxy, up):
+            proxy._keepalive_tick()
+        assert [m["content"] for m in json.loads(up.seen_body)["messages"]] == [
+            "list the files", "ok", [{"type": "text", "text": "size?",
+                                      "cache_control": self.CC1H}]]
+
+    def case_a_reply_settles_when_its_message_stop_is_read(
+            self, monkeypatch, certdir):
+        """The client's next continue can come on another connection while
+        this relay waits for the upstream to end the body: it must find the
+        reply it names."""
+        from cswap_pin import proxy as pp
+        from cswap_pin.proxy import PinProxy
+        bodies, _, _ = self._talk()
+        self._wire(monkeypatch, certdir)
+        up = _FakeUpstream(certdir, replies=[self._sse(
+            "msg_1", [{"type": "text", "text": "hi"}], frame="close")])
+        up.linger = 3.0
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: "PIN-TOKEN",
+                         upstream=("127.0.0.1", up.port))
+        proxy.start()
+        client = threading.Thread(target=lambda: _request_through_proxy(
+            proxy.port, certdir / "ca.pem", "/v1/messages?beta=true",
+            body=bodies[0], **self._held_call("S")))
+        client.start()
+        try:
+            end = time.monotonic() + 2
+            while time.monotonic() < end and not (
+                    "S" in pp._affinity_last and pp._affinity_last["S"][10]
+                    and pp._affinity_last["S"][10].reply):
+                time.sleep(0.01)
+            assert client.is_alive(), "the relay was still waiting for the end"
+            rb = pp._affinity_last["S"][10]
+            assert rb.reply and rb.reply[0] == "msg_1", rb.reply
+            parts = pp._rebuild_parts(json.loads(bodies[1]))
+            assert pp._rebuild_stage(
+                rb, parts, bodies[1], None, time.monotonic()) is rb, (
+                "the continue chains")
+        finally:
+            client.join(10)
+            proxy.stop()
+            up.stop()
+
+    def case_the_bytes_a_client_reads_are_the_upstreams_under_a_tee(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        bodies, _, _ = self._talk()
+        blocks = [{"type": "thinking", "thinking": "I should run ls",
+                   "signature": "sig-one"}, {"type": "text", "text": "done"}]
+        want = self._sse("msg_1", blocks, frame="length").partition(
+            b"\r\n\r\n")[2]
+        for frame in ("chunked", "length", "close"):
+            self._wire(monkeypatch, certdir)
+            got = []
+            self._turns(certdir, bodies[:1], [self._sse(
+                "msg_1", blocks, frame=frame)], got=got)
+            assert got == [want], frame
+            assert pp._affinity_last["S"][10].ready(), frame
+
+    def case_a_tee_that_raises_never_touches_the_relay(
+            self, monkeypatch, certdir):
+        """The tee is a statistic: whatever it does, the client reads the
+        upstream's bytes, once. It is off for the rest of that request, and the
+        rebuild it fed is dropped and counted."""
+        from cswap_pin import proxy as pp
+        bodies, _, _ = self._talk()
+        blocks = [{"type": "text", "text": "done"}]
+        want = self._sse("msg_1", blocks, frame="length").partition(
+            b"\r\n\r\n")[2]
+        calls, real = [], pp._SseReply
+        for where in ("init", "feed", "message"):
+            class Boom(real):
+                def __init__(self, cap):
+                    calls.append("init")
+                    if where == "init":
+                        raise RuntimeError("boom")
+                    super().__init__(cap)
+
+                def feed(self, data):
+                    calls.append("feed")
+                    if where == "feed":
+                        raise RuntimeError("boom")
+                    super().feed(data)
+
+                @property
+                def message(self):
+                    if where == "message":
+                        raise RuntimeError("boom")
+                    return super().message
+
+            monkeypatch.setattr(pp, "_SseReply", Boom)
+            self._wire(monkeypatch, certdir)
+            got, calls[:] = [], []
+            statuses, _ = self._turns(certdir, bodies[:1], [self._sse(
+                "msg_1", blocks, frame="chunked")], got=got)
+            assert statuses == [200] and got == [want], (where, statuses, got)
+            assert pp._rebuild_counts["dropped"] == {"tee failed": 1}, (
+                where, pp._rebuild_counts)
+            if where == "feed":
+                assert calls == ["init", "feed"], (
+                    "off after the first failure", calls)
+            self._age(3400)
+            with self._pair(certdir) as (proxy, up):
+                proxy._keepalive_tick()
+            assert up.bodies_seen == [], (where, "a ping went out")
+
+    def case_a_404_drops_the_rebuild_and_the_clients_create_replay_starts_another(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        bodies, replies, _ = self._talk()
+        replay = self._held({"type": "create"}, "ignored", messages=[
+            {"role": "user", "content": "list the files"},
+            {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+            {"role": "user", "content": [{
+                "type": "text", "text": "size?", "cache_control": self.CC1H}]}])
+        self._wire(monkeypatch, certdir)
+        statuses, _ = self._turns(
+            certdir, [bodies[0], bodies[1], replay],
+            [replies[0], self._reply({}, status=b"404 Not Found"),
+             self._sse("msg_9", [{"type": "text", "text": "fine"}])])
+        assert statuses == [200, 404, 200], statuses
+        assert pp._rebuild_counts["dropped"] == {"not 2xx": 1}
+        self._age(3400)
+        with self._pair(certdir, reply=self._reply(
+                {"cache_read_input_tokens": 30000})) as (proxy, up):
+            proxy._keepalive_tick()
+        assert [m["content"] for m in json.loads(up.seen_body)["messages"]] == [
+            "list the files", "ok", [{"type": "text", "text": "size?",
+                                      "cache_control": self.CC1H}]], (
+            "the replay is the new base: nothing of the old thread is in it")
+
+    def case_a_rebuild_over_the_body_cap_is_dropped_and_counted(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        bodies, replies, _ = self._talk()
+        self._wire(monkeypatch, certdir)
+        big = [{"type": "text", "text": "the system prompt " * 200}]
+        self._turns(certdir, [self._held({"type": "create"}, "go", system=big),
+                              ], replies[:1])
+        base = pp._affinity_last["S"][10].size
+        monkeypatch.setattr(pp, "_AFFINITY_BODY_MAX", base + 50)
+        self._turns(certdir, bodies[1:2], replies[1:2])
+        assert len(bodies[1]) < pp._AFFINITY_BODY_MAX, "each body fits"
+        assert pp._rebuild_counts["dropped"] == {
+            "rebuild over the body cap": 1}, pp._rebuild_counts
+        assert pp._affinity_last["S"][10] is None
+        assert pp._rebuild_counts["kept"] == 1, (
+            "the continue that did not fit was never kept")
+
+    def case_a_held_body_over_the_cap_is_never_parsed_and_loses_the_rebuild(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        bodies, replies, _ = self._talk()
+        self._wire(monkeypatch, certdir)
+        self._turns(certdir, bodies[:1], replies[:1])
+        monkeypatch.setattr(pp, "_AFFINITY_BODY_MAX", 2000)
+        big = self._held({"type": "continue", "previous_message_id": "msg_1"},
+                         "x" * 3000)
+        self._turns(certdir, [big], replies[1:2])
+        assert pp._affinity_captures["dropped"] == {"over the body cap": 1}
+        assert pp._rebuild_counts["dropped"] == {"over the body cap": 1}, (
+            pp._rebuild_counts)
+
+    def case_a_session_taken_back_or_told_404_loses_its_rebuild_counted(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        bodies, replies, _ = self._talk()
+        for reason, lose in (
+                ("taken back", lambda: pp._affinity_take_back(
+                    "S", self.IDENT, 429, None)),
+                ("404 relayed", lambda: pp._affinity_relay_404(
+                    "S", self.IDENT))):
+            self._wire(monkeypatch, certdir)
+            self._turns(certdir, bodies[:2], replies[:2])
+            assert pp._affinity_last["S"][10].ready()
+            lose()
+            assert "S" not in pp._affinity_last, reason
+            assert pp._rebuild_counts["dropped"] == {reason: 1}, (
+                reason, pp._rebuild_counts)
+
+    def case_the_total_cap_counts_the_rebuilds_bytes(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        bodies, replies, _ = self._talk()
+        self._wire(monkeypatch, certdir)
+        self._turns(certdir, bodies[:2], replies[:2], session="S0")
+        e = pp._affinity_last["S0"]
+        one = len(e[1]) + e[10].size
+        monkeypatch.setattr(pp, "_AFFINITY_BODY_TOTAL", one + one // 2)
+        self._turns(certdir, bodies[:2], replies[:2], session="S1")
+        assert list(pp._affinity_last) == ["S1"], (
+            "the oldest session's body and rebuild went first",
+            list(pp._affinity_last))
+
+    def case_the_total_cap_sees_a_settled_replys_bytes(
+            self, monkeypatch, certdir):
+        """A reply adds its bytes when it settles, after the capture that
+        checked the total: the settle checks it again."""
+        from cswap_pin import proxy as pp
+        bodies, replies, _ = self._talk()
+        self._wire(monkeypatch, certdir)
+        self._turns(certdir, bodies[:1], replies[:1], session="S0")
+        e = pp._affinity_last["S0"]
+        one, reply = len(e[1]) + e[10].size, len(e[10].reply[1])
+        # S1's capture fits (its reply is not in yet); its settled reply does not
+        monkeypatch.setattr(pp, "_AFFINITY_BODY_TOTAL", 2 * one - reply + 1)
+        self._turns(certdir, bodies[:1], replies[:1], session="S1")
+        assert list(pp._affinity_last) == ["S1"], list(pp._affinity_last)
+        assert pp._rebuild_counts["dropped"] == {"over the total cap": 1}, (
+            pp._rebuild_counts)
+
+    def case_a_beta_body_with_no_thread_is_a_full_body(
+            self, monkeypatch, certdir):
+        """`held_stateless`: the client keeps the beta and drops `thread` for
+        the rest of the conversation. The form is the body's."""
+        from cswap_pin import proxy as pp
+        body = self._body(pad=90000)
+        seen = self._armed(monkeypatch, certdir, body=body, beta=self.HELD_BETA)
+        assert pp._affinity_last["S"][9] == "full"
+        assert all("accept-encoding: identity" in h.lower() for h in self.heads), (
+            "a full request is watched too, as plain SSE")
+        with self._pair(certdir, reply=self._reply(
+                {"cache_read_input_tokens": 30000})) as (proxy, up):
+            proxy._keepalive_tick()
+        assert json.loads(up.seen_body) == {
+            **json.loads(body), "max_tokens": 0, "stream": False}
+        (line,) = [l for l in seen.logs if "keep-alive" in l]
+        assert "form full status 200" in line, line
+
+    def case_only_a_request_with_a_tee_is_asked_for_identity(
+            self, monkeypatch, certdir):
+        """The tee reads plain SSE, so the upstream is asked for identity
+        whatever the client accepts, for the request it watches (an armed
+        main-thread body that is kept) and no other."""
+        self._wire(monkeypatch, certdir)
+        gz = {"accept-encoding": "gzip"}
+        for call, body, want in (
+                (self._call("S", **gz), self._body(pad=100), "identity"),
+                (self._call("S", **gz, **{"x-claude-code-agent-id": "a1"}),
+                 self._body(pad=100), "gzip"),
+                (self._call("S", **gz), self._body(ttl=None), "gzip")):
+            self._send(certdir, [call], body=body)
+            assert f"accept-encoding: {want}" in self.heads[-1].lower(), (
+                want, self.heads[-1])
+
+    def case_a_headless_sessions_held_body_is_refused_once_due_and_dropped(
+            self, monkeypatch, certdir):
+        """T2925: an `sdk-cli` session is a `claude -p` that has exited by
+        the time a ping is due. Refused only when it would otherwise have
+        been pinged, rebuild or no."""
+        from cswap_pin import proxy as pp
+        bodies, replies, _ = self._talk()
+        self._wire(monkeypatch, certdir)
+        self._turns(certdir, bodies[:2], replies[:2], **{
+            "user-agent": "claude-cli/2.1.310 (external, sdk-cli)"})
+        assert pp._affinity_last["S"][10].ready(), "a complete rebuild"
+        self._age(100)
+        with self._pair(certdir) as (proxy, up):
+            proxy._keepalive_tick()
+            assert "S" in pp._affinity_last and pp._affinity_pings["refused"] == {}, (
+                "not due yet: the new reason is not counted early")
+            self._age(3400)
+            proxy._keepalive_tick()
+            proxy._keepalive_tick()
+        assert up.bodies_seen == [], "no ping goes out"
+        assert "S" not in pp._affinity_last, "dropped: never asked again"
+        assert pp._affinity_pings["refused"] == {self.HEADLESS: 1}
+
+    def case_an_unknown_held_prefix_passes_the_floor_once(
+            self, monkeypatch, certdir):
+        """A held body's prefix is unknown until a ping reply measures it, so
+        ping 1 is allowed; a reply that measures nothing leaves ping 2 to the
+        floor."""
+        from cswap_pin import proxy as pp
+        bodies, replies, _ = self._talk()
+        self._wire(monkeypatch, certdir)
+        self._turns(certdir, bodies[:2], replies[:2])
+        self._age(3400)
+        assert pp._affinity_last["S"][3] == 0
+        miss = {"cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 30000}
+        with self._pair(certdir, reply=self._reply(miss)) as (proxy, up):
+            proxy._keepalive_tick()
+            self._age(3400)
+            proxy._keepalive_tick()
+        assert len(up.bodies_seen) == 1, "an unmeasured prefix was pinged twice"
+        assert pp._affinity_pings["refused"] == {
+            "its prefix is too small to pay": 1}, pp._affinity_pings
+
+    def case_a_headless_sessions_full_body_is_still_pinged(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        self._armed(monkeypatch, certdir,
+                    headers={"user-agent": "claude-cli/2.1.310 (external, sdk-cli)"})
+        with self._pair(certdir, reply=self._reply(
+                {"cache_read_input_tokens": 30000})) as (proxy, up):
+            proxy._keepalive_tick()
+        assert len(up.bodies_seen) == 1 and pp._affinity_pings["refused"] == {}
+
+    def case_the_headless_gate_matches_the_entrypoint_token_alone(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        for ua in ("claude-cli/2.1.310 (external, sdk-cli, agent-sdk/0.2.1)",
+                   "claude-cli/2.1.310 (external,sdk-cli)"):
+            assert pp._keepalive_headless([("User-Agent", ua)]), ua
+        for ua in ("claude-cli/2.1.309 (external, cli)", "sdk-cli/1.0",
+                   "claude-cli/2.1.310 (external, not-sdk-cli)",
+                   "claude-cli/2.1.310 (external, sdk-cli-x)", "sdk-cli (x"):
+            assert not pp._keepalive_headless([("User-Agent", ua)]), ua
+        assert not pp._keepalive_headless([("X-Other", "(sdk-cli)")])
+        assert not pp._keepalive_headless([])
+
+    def case_the_one_shot_returns_the_reply_and_skips_only_the_form_gate(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        self._armed(monkeypatch, certdir, forms=())
+        usage = {"cache_read_input_tokens": 20, "cache_creation_input_tokens": 9}
+        with self._pair(certdir, reply=self._reply(usage, extra=self.RL)) as (
+                proxy, up):
+            got = proxy._keepalive_ping("S")
+            assert got["refused"] == "form not measured" and got["status"] is None
+            assert up.bodies_seen == [] and got["form"] == "full"
+            assert proxy._keepalive_ping("nobody")["refused"] == "no body held"
+            got = proxy._keepalive_ping("S", force_form=True)
+        assert got == {
+            "form": "full", "status": 200, "refused": None, "hit": False,
+            "usage": usage,
+            "ratelimit": {"anthropic-ratelimit-unified-5h-utilization": "0.31",
+                          "anthropic-ratelimit-unified-7d-utilization": "0.12"},
+        }, got
+        assert pp._affinity_pings["sent"] == 1
+
+    def case_a_ping_acts_only_on_the_body_it_was_asked_about(
+            self, monkeypatch, certdir):
+        """The tick hands its entry over: a real request that replaced the
+        body since is not the one to ping, to renew or to drop."""
+        from cswap_pin import proxy as pp
+        self._armed(monkeypatch, certdir)
+        old = pp._affinity_last["S"]
+        new = list(old)
+        new[1] = b"newer"
+        pp._affinity_last["S"] = new
+        with self._pair(certdir) as (proxy, up):
+            got = proxy._keepalive_ping("S", force_form=True, entry=old)
+        assert got["refused"] == "no body held" and up.bodies_seen == [], got
+        assert pp._affinity_last["S"] is new
+        for status in (500, 200):  # replaced while the exchange was in flight
+            with self._pair(certdir) as (proxy, up):
+                def swap(*a, status=status):
+                    pp._affinity_last["S"] = new
+                    return status, [], b"{}"
+
+                pp._affinity_last["S"] = old
+                at = new[4]
+                monkeypatch.setattr(proxy, "_keepalive_exchange", swap)
+                proxy._keepalive_ping("S", force_form=True, entry=old)
+            assert pp._affinity_last["S"] is new, (
+                status, "a ping dropped the body that replaced its own")
+            assert new[4] == at and new[5] == 0, "it renewed a body it never sent"
+
+    def case_a_forced_ping_still_respects_a_resting_slot(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        self._armed(monkeypatch, certdir, forms=())
+        pp._affinity_rest[self.IDENT] = time.monotonic() + 99
+        with self._pair(certdir) as (proxy, up):
+            got = proxy._keepalive_ping("S", force_form=True)
+        assert got["refused"] == "its slot is not kept" and up.bodies_seen == []
+
+    def case_the_sender_thread_runs_only_while_armed_and_ends_with_the_pin(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir, armed=False)
+        monkeypatch.setattr(pp, "_KEEPALIVE_TICK_S", 0.05)
+        monkeypatch.setattr(pp, "_KEEPALIVE_FORMS", frozenset({"full"}))
+        body = self._body(pad=90000)
+
+        def real(proxy):
+            return _request_through_proxy(
+                proxy.port, certdir / "ca.pem", "/v1/messages", body=body,
+                **self._call("S"))
+
+        def arm(on):
+            seen.loaded.cache_aware = on
+            pp._AFFINITY_CACHE.clear()
+
+        def until(what):
+            end = time.monotonic() + 10
+            while not what() and time.monotonic() < end:
+                time.sleep(0.02)
+            assert what(), "timed out"
+
+        with self._pair(certdir, started=True) as (proxy, up):
+            real(proxy)
+            assert getattr(proxy, "_keepalive_thread", None) is None, (
+                "a thread was started for a switch that is off")
+            assert proxy._keepalive_tick() is False
+            arm(True)
+            real(proxy)
+            thread = proxy._keepalive_thread
+            assert thread.is_alive() and thread.daemon
+            real(proxy)
+            assert proxy._keepalive_thread is thread, "one thread per pin"
+            self._age(3400)
+            until(lambda: pp._affinity_pings["sent"] == 1)
+            arm(False)
+            until(lambda: not thread.is_alive())  # off: it ends by itself
+            assert not pp._affinity_last, (
+                "the bodies outlived the switch on a pin with no traffic")
+            arm(True)
+            real(proxy)
+            thread = proxy._keepalive_thread
+            assert thread.is_alive(), "armed again, a new thread"
+            assert len(up.bodies_seen) == 5  # four real requests, one ping
+            assert json.loads(up.bodies_seen[3])["max_tokens"] == 0
+        thread.join(5)
+        assert not thread.is_alive(), "the sender outlived its pin"
+
+    def case_idle_is_the_bodys_own_clock(self, monkeypatch, certdir):
+        """A subagent's request refreshes the session's binding, not the main
+        thread's cache: a main thread waiting on one is pinged on ITS body's
+        age, and a body past its TTL is not pinged however fresh the binding."""
+        from cswap_pin import proxy as pp
+        usage = {"cache_read_input_tokens": 30000,
+                 "cache_creation_input_tokens": 0}
+        self._armed(monkeypatch, certdir)
+        pp._affinity["S"] = ("tok-A", time.monotonic())  # a subagent, just now
+        with self._pair(certdir, reply=self._reply(usage)) as (proxy, up):
+            proxy._keepalive_tick()
+        assert len(up.bodies_seen) == 1, (
+            "a subagent's request hid the main thread's idle time")
+        self._armed(monkeypatch, certdir)
+        pp._affinity["S"] = ("tok-A", time.monotonic())
+        pp._affinity_last["S"][4] = time.monotonic() - 4000
+        with self._pair(certdir, reply=self._reply(usage)) as (proxy, up):
+            proxy._keepalive_tick()
+        assert up.bodies_seen == [], "a ping wrote a cache that had expired"
+        assert pp._affinity_pings["refused"] == {"past its cache ttl": 1}
+
+    def case_the_shipped_gate_holds_the_measured_forms_and_a_closed_one_costs_no_rebuild(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        assert pp._KEEPALIVE_FORMS == frozenset({"full", "rebuilt"}), (
+            "the two forms the sandbox measured")
+        seen = self._armed(monkeypatch, certdir, forms=())
+        pp._affinity_snap.update(tried=float("-inf"), at=float("-inf"))
+        fetches = len(seen.fetches)
+        with self._pair(certdir) as (proxy, up):
+            assert proxy._keepalive_tick() is True
+        assert up.bodies_seen == [], "a ping went out through the closed gate"
+        assert len(seen.fetches) == fetches, (
+            "a store rebuild was started for pings that are all refused")
+        assert pp._affinity_pings == {
+            "sent": 0, "hit": 0, "refused": {"form not measured": 1}}
+
+    def case_switching_off_forgets_the_bodies_on_an_idle_pin(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        seen = self._armed(monkeypatch, certdir)
+        assert "S" in pp._affinity_last
+        seen.loaded.cache_aware = False
+        pp._AFFINITY_CACHE.clear()
+        with self._pair(certdir) as (proxy, up):
+            assert proxy._keepalive_tick() is False
+        assert not pp._affinity_last, "the tick kept the conversation"
+
+    def case_a_released_generation_stops_pinging_and_drops_its_bodies(
+            self, monkeypatch, certdir):
+        """`release_listener` hands the port to a successor; the draining
+        process may live for ever, and it must not ping on for sessions the
+        successor now serves."""
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+        monkeypatch.setattr(pp, "_KEEPALIVE_TICK_S", 0.05)
+        monkeypatch.setattr(pp, "_KEEPALIVE_FORMS", frozenset({"full"}))
+        with self._pair(certdir, started=True) as (proxy, up):
+            _request_through_proxy(
+                proxy.port, certdir / "ca.pem", "/v1/messages",
+                body=self._body(pad=90000), **self._call("S"))
+            thread = proxy._keepalive_thread
+            assert thread.is_alive() and "S" in pp._affinity_last
+            proxy.release_listener()
+            thread.join(5)
+            assert not thread.is_alive(), "a released generation kept pinging"
+            assert not pp._affinity_last, "it kept the bodies it no longer serves"
+
+    def case_a_handover_carries_the_kept_bodies_memory_to_memory(
+            self, monkeypatch, certdir, short_certdir):
+        """A session idle across a handover kept no body in the successor: a
+        held one was refused `a held thread with no rebuild`, a full one had
+        no entry. The predecessor sends its `full` bodies and its held ones
+        with a ready rebuild over a unix socket the successor listens on, as
+        the slot they went out on (never a bearer, no `x-api-key` value) and
+        the idle clock as wall time. The successor lands them for sessions it
+        has not captured itself, on ITS token for the slot, and starts its
+        sender. The conversation is written nowhere and logged nowhere."""
+        import stat
+        from cswap_pin import proxy as pp
+        from cswap_pin.proxy import PinProxy
+        tree, certdir = certdir.parent, short_certdir()
+        marker = "BODY-MARKER-9c1e7f"
+        seen = self._wire(monkeypatch, certdir)
+        monkeypatch.setattr(pp, "_KEEPALIVE_FORMS",
+                            frozenset({"full", "rebuilt"}))
+        self._turns(certdir, [self._held({"type": "create"}, "list " + marker)],
+                    [self._sse("msg_1", [{"type": "text", "text": "ok " + marker}])],
+                    session="H")
+        for session, extra in (("F", {"x-api-key": "tok-A"}), ("C", {})):
+            self._send(certdir, [self._call(session, **extra)],
+                       body=self._body(pad=90000, tail=marker + session))
+        for session in "HFC":
+            pp._affinity[session] = ("tok-A", time.monotonic() - 3400)
+            pp._affinity_last[session][4] = time.monotonic() - 3400
+        assert {s: e[9] for s, e in pp._affinity_last.items()} == {
+            "H": "held", "F": "full", "C": "full"}
+        lines = list(pp._carry_lines())
+        assert len(lines) == 3 and all(marker.encode() in l for l in lines)
+        assert not any(b"tok-" in l for l in lines), "a bearer is on the wire"
+        usage = {"cache_read_input_tokens": 30000,
+                 "cache_creation_input_tokens": 0}
+        with self._pair(certdir, reply=self._reply(usage)) as (succ, up):
+            umask = os.umask(0o022)
+            succ._carry_in_held_start()
+            assert os.umask(umask) == 0o022, "the bind left the umask changed"
+            sock = succ._carry_in_path
+            assert stat.S_IMODE(sock.stat().st_mode) == 0o600, sock.stat()
+            assert len(str(sock)) < 104, sock
+            # the successor's first snapshot has not landed: the bodies wait
+            pp._affinity_snap["at"] = float("-inf")
+            started = time.monotonic()
+            PinProxy(certdir=certdir, pin_token_provider=lambda: None
+                     ).release_listener()
+            assert time.monotonic() - started < 2, "the carry held up the release"
+            assert pp._affinity_carry == {"sent": 3, "landed": 0}, pp._affinity_carry
+            # the predecessor is gone: what is left is a new process's own
+            # tables, its token for the slot the rotated one, and a capture of
+            # its own for `C`
+            pp._affinity_last.clear()
+            pp._affinity_idents.clear()
+            pp._affinity_idents["tok-A2"] = self.IDENT
+            pp._affinity_kept[self.IDENT] = (
+                "tok-A2", *pp._affinity_kept[self.IDENT][1:])
+            for session in "HFC":
+                pp._affinity[session] = ("tok-A2", time.monotonic() - 3400)
+            own = [[], b"own", 3600.0, 22500, time.monotonic(), 0, None,
+                   "/v1/messages", "tok-A2", "full", None, None]
+            pp._affinity_last["C"] = own
+            pp._affinity_snap["at"] = time.monotonic()
+            end = time.monotonic() + 5
+            while pp._affinity_carry["landed"] < 2 and time.monotonic() < end:
+                time.sleep(0.02)
+            assert pp._affinity_carry == {"sent": 3, "landed": 2}, pp._affinity_carry
+            assert pp._affinity_last["C"] is own, "its own capture lost"
+            assert not sock.exists(), "the carry socket outlived the carry"
+            for session, form in (("H", "held"), ("F", "full")):
+                e = pp._affinity_last[session]
+                assert e[9] == form and e[8] == "tok-A2", (session, e[8], e[9])
+                assert 3399 < time.monotonic() - e[4] < 3430, "the idle clock"
+                assert (e[10] is not None and e[10].ready()) == (form == "held")
+                assert not any(k.lower() == "authorization" for k, _ in e[0])
+                assert {v for k, v in e[0] if k.lower() == "x-api-key"} <= {""}
+            assert succ._keepalive_thread.is_alive(), "no sender for the bodies"
+            succ._keepalive_tick()
+            assert len(up.bodies_seen) == 2, "one ping for each carried body"
+            held, full = sorted(up.bodies_seen, key=lambda b: b'"thread"' not in b)
+            assert json.loads(held)["thread"] == {"type": "create"}
+            assert marker.encode() in held and (marker + "F").encode() in full
+            assert json.loads(full)["max_tokens"] == 0
+            creds = sorted(map(self._creds, up.heads_seen), key=len)
+            assert creds == [{"authorization": "Bearer tok-A2"},
+                             {"authorization": "Bearer tok-A2",
+                              "x-api-key": "tok-A2"}], (
+                "the ping is on the successor's token, as the client sent it", creds)
+            assert self._health(certdir)["carry"] == {"sent": 3, "landed": 2}
+            succ._trace_tick_stop.set()
+            succ._keepalive_thread.join(5)
+        roots = {tree, certdir}
+        if str(Path.home()).startswith(tempfile.gettempdir()):
+            roots.add(Path.home())  # the suite runs under a scratch HOME
+        for root in roots:
+            for f in root.rglob("*"):
+                assert not f.is_file() or marker.encode() not in f.read_bytes(), (
+                    "the conversation was written to", f)
+        assert not any(marker in l for l in seen.logs), "the conversation was logged"
+        assert any("carried 3 kept" in l for l in seen.logs), seen.logs
+
+    def case_a_carried_body_lands_only_where_the_successor_can_ping_it(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        self._armed(monkeypatch, certdir, forms=("full",))
+        (line,) = pp._carry_lines()
+        row = json.loads(line)
+        pp._affinity_last.clear()
+        gone = dict(row, i=["9", "gone@example.com"])
+        cold = dict(row, w=row["w"] - 4000)
+        elsewhere = dict(row, i=["2", self.EMAIL.format("2")])
+        for why, r in (("a slot the successor does not keep", gone),
+                       ("a body past its ttl", cold),
+                       ("a session bound to another slot", elsewhere)):
+            assert pp._carry_land([r]) == 0 and not pp._affinity_last, why
+        del pp._affinity["S"]
+        assert pp._carry_land([row]) == 0, "a session the successor never bound"
+        pp._affinity["S"] = ("tok-A", time.monotonic())
+        assert pp._carry_land([row, {"junk": 1}]) == 1
+        assert pp._affinity_last["S"][8] == "tok-A"
+
+    def case_an_unreachable_or_stalled_successor_does_not_hold_up_the_release(
+            self, monkeypatch, certdir, short_certdir):
+        from cswap_pin import proxy as pp
+        from cswap_pin.proxy import PinProxy
+        certdir = short_certdir()
+        self._armed(monkeypatch, certdir, forms=("full",),
+                    body=self._body(pad=1500000))
+        monkeypatch.setattr(pp, "_CARRY_OUT_S", 0.5)
+        end = time.monotonic() + 3  # the request's pin, stopped, ends its listener
+        while list(certdir.glob(".carry-*.sock")) and time.monotonic() < end:
+            time.sleep(0.02)
+        dead = socket.socket(socket.AF_UNIX)  # a successor that died: its file stays
+        dead.bind(str(certdir / ".carry-1.sock"))
+        dead.close()
+        started = time.monotonic()
+        PinProxy(certdir=certdir, pin_token_provider=lambda: None
+                 ).release_listener()
+        assert time.monotonic() - started < 1, "a dead socket held up the release"
+        (certdir / ".carry-1.sock").unlink()
+        stuck = socket.socket(socket.AF_UNIX)  # listens, never reads
+        stuck.bind(str(certdir / ".carry-2.sock"))
+        stuck.listen(1)
+        try:
+            proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None)
+            started = time.monotonic()
+            proxy.release_listener()
+            assert time.monotonic() - started < 3, "a stalled successor held it up"
+        finally:
+            stuck.close()
+        assert proxy._stop and pp._affinity_carry["sent"] == 0
+
+    @staticmethod
+    def _carry_sink(certdir, pid, mtime=None):
+        """A stand-in successor: listens on `.carry-<pid>.sock` and collects
+        the lines one connection sends. Returns (listener, lines, thread)."""
+        path = certdir / f".carry-{pid}.sock"
+        srv = socket.socket(socket.AF_UNIX)
+        srv.bind(str(path))
+        srv.listen(1)
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        got = []
+
+        def serve():
+            try:
+                conn = srv.accept()[0]
+            except OSError:
+                return
+            with conn, conn.makefile("rb") as f:
+                got.extend(f)
+
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        return srv, got, t
+
+    def case_a_deploy_carries_the_bodies_across_both_handovers(
+            self, monkeypatch, certdir, short_certdir):
+        """A fleet deploy is two handovers. The holder ask: gen1 releases its
+        listener to gen2, which the holder spawned and which has bound its carry
+        socket. Then gen2's watchdog finds the holder on old code, retires it,
+        and is an orphan: the hand-down arm releases BEFORE its successor
+        exists, so nobody listens until `_spawn_daemon` returns. It carries
+        then, to the process it spawned, and a sender tick that falls in the
+        spawn's wait (a minute apart) must not drop the bodies first."""
+        from cswap_pin import proxy as pp
+        from cswap_pin.proxy import PinProxy
+        certdir = short_certdir()
+        self._armed(monkeypatch, certdir, forms=("full",))
+        for env in (pp._HELD_BY_ENV, pp._SELF_HEAL_ENV):
+            monkeypatch.delenv(env, raising=False)
+        monkeypatch.setattr(pp, "_retire_stale_holder", lambda *a, **k: False)
+        order, gen3 = [], {}
+
+        def spawn(account_num, email, cdir, listen_fd=None):
+            order.append("spawn")
+            gen2._keepalive_tick()
+            gen3["held"] = "S" in pp._affinity_last
+            gen3["sink"] = self._carry_sink(cdir, 424242)
+            pp.write_daemon_state(cdir, 1234, 424242, pp._OWN_FINGERPRINT,
+                                  ungated=True)
+            return 1234
+
+        with self._pair(certdir, started=True) as (gen2, _):
+            release = gen2.release_listener
+            gen2.release_listener = lambda hand_down=False: (
+                order.append("release"), release(hand_down))[1]
+            pp._affinity_snap["at"] = float("-inf")  # gen2 lands only when told
+            PinProxy(certdir=certdir, pin_token_provider=lambda: None
+                     ).release_listener()  # gen1, asked by the holder
+            pp._affinity_last.clear()  # gen1 is gone: gen2 lands what it sent
+            pp._affinity_snap["at"] = time.monotonic()
+            end = time.monotonic() + 5
+            while not pp._affinity_carry["landed"] and time.monotonic() < end:
+                time.sleep(0.02)
+            assert pp._affinity_carry == {"sent": 1, "landed": 1}, pp._affinity_carry
+            assert "S" in pp._affinity_last
+            monkeypatch.setattr(pp, "_spawn_daemon", spawn)
+            pp._watch_own_code(
+                gen2, "1", self.EMAIL.format("1"), certdir, threading.Event(),
+                lambda *a: None, interval=0.01, _own_fingerprint="never-matches")
+            with contextlib.suppress(OSError, TypeError):
+                os.close(gen2._handed_fd)  # the fd a real successor inherits
+            srv, got, t = gen3["sink"]
+            t.join(5)
+            srv.close()
+            assert order == ["release", "spawn"], order
+            assert gen3["held"], "a tick in the spawn's wait dropped the bodies"
+            assert len(got) == 1 and json.loads(got[0])["s"] == "S", (
+                "the hand-down arm carried nothing to its successor", got)
+            assert pp._affinity_carry == {"sent": 2, "landed": 1}, pp._affinity_carry
+            gen2._keepalive_tick()
+            assert not pp._affinity_last, "bodies kept once the carry is over"
+
+    def case_a_failed_spawn_owes_nothing_so_a_later_switch_off_still_clears(
+            self, monkeypatch, certdir):
+        """The hand-down arm marks the bodies owed to the successor it is about
+        to spawn. When that spawn fails the daemon resumes serving with nothing
+        owed: left set, a switch-off hit the owed branch of every tick and the
+        sender never cleared the bodies nor ended."""
+        from cswap_pin import proxy as pp
+        seen = self._armed(monkeypatch, certdir, forms=("full",))
+        for env in (pp._HELD_BY_ENV, pp._SELF_HEAL_ENV):
+            monkeypatch.delenv(env, raising=False)
+        monkeypatch.setattr(pp, "_retire_stale_holder", lambda *a, **k: False)
+        monkeypatch.setattr(pp, "_spawn_daemon", lambda *a, **k: None)
+        with self._pair(certdir, started=True) as (proxy, _):
+            pp._watch_own_code(
+                proxy, "1", self.EMAIL.format("1"), certdir, threading.Event(),
+                lambda *a: None, interval=0.01, _own_fingerprint="never-matches")
+            assert not proxy._stop and "S" in pp._affinity_last, (
+                "premise: the failed spawn resumed serving with its bodies")
+            seen.loaded.cache_aware = False
+            pp._AFFINITY_CACHE.clear()
+            assert proxy._keepalive_tick() is False, "the sender never ends"
+            assert not pp._affinity_last, "a stale debt kept the bodies up"
+
+    def case_a_released_process_takes_no_carry_and_a_sender_picks_its_target(
+            self, monkeypatch, certdir, short_certdir):
+        """A process that released its listener is no longer the server, and
+        one that listened for five minutes on its carry socket was a target a
+        later handover could hand the bodies to. The sender goes to the
+        process `proxy.json` names, else the newest socket, never the first
+        of the sorted names."""
+        from cswap_pin import proxy as pp
+        certdir = short_certdir()
+        self._armed(monkeypatch, certdir, forms=("full",))
+        with self._pair(certdir, started=True) as (draining, _):
+            sock = draining._carry_in_path
+            assert sock.exists()
+            draining.release_listener()
+            assert not sock.exists(), "a released process kept its carry socket"
+            probe = socket.socket(socket.AF_UNIX)
+            with pytest.raises(OSError):
+                probe.connect(str(sock))
+            probe.close()
+        for named, want in ((None, 222), (111, 111)):
+            if named:
+                pp.write_daemon_state(certdir, 1234, named, "fp", ungated=True)
+            sinks = {pid: self._carry_sink(certdir, pid, time.time() - age)
+                     for pid, age in ((111, 60), (222, 0))}
+            try:
+                assert pp._carry_out(certdir) == 1
+                sinks[want][2].join(5)
+                assert [len(sinks[p][1]) for p in sinks] == [
+                    int(p == want) for p in sinks], (named, sinks)
+            finally:
+                for pid, (srv, _, _) in sinks.items():
+                    srv.close()
+                    (certdir / f".carry-{pid}.sock").unlink(missing_ok=True)
+
+    def case_a_carried_body_is_decoded_outside_the_affinity_lock(
+            self, monkeypatch, certdir):
+        """The request path waits on `_affinity_lock`: turning up to 256 MB of
+        rows back into bytes under it stalls every request for as long."""
+        from cswap_pin import proxy as pp
+        self._armed(monkeypatch, certdir, forms=("full",))
+        (line,) = pp._carry_lines()
+        pp._affinity_last.clear()
+        held, real = [], pp._carry_bytes
+        monkeypatch.setattr(pp, "_carry_bytes", lambda s: (
+            held.append(pp._affinity_lock.locked()), real(s))[1])
+        assert pp._carry_land([json.loads(line)]) == 1
+        assert held == [False], held
+
+    def case_a_slot_is_refused_as_not_kept_only_once_the_session_is_due(
+            self, monkeypatch, certdir):
+        """The due rule asks `slot_kept` before idle, so the counter held every
+        tick of a session on a slot that is not kept (78 on one host, none of
+        them readable as a session that needed a ping). Only a session that is
+        otherwise due is refused as not kept, and `daemon.log` says which slot
+        and why, once, with no session in the line."""
+        from cswap_pin import proxy as pp
+        ident = self.IDENT
+        refused = {"its slot is not kept": 1}
+        for make, slot, why in (
+                (lambda: (pp._affinity_kept.pop(ident),
+                          pp._affinity_why.update({ident: "at its bar"})),
+                 "1", "at its bar"),
+                (lambda: pp._affinity_rest.update(
+                    {ident: time.monotonic() + 99}), "1", "resting"),
+                (lambda: pp._affinity_kept.update(
+                    {ident: ("tok-A", 1, 90.0, None, 10.0)}), "1",
+                 "expiry buffer"),
+                (lambda: pp._affinity_idents.clear(), "?", "no slot")):
+            seen = self._armed(monkeypatch, certdir, forms=("full",))
+            make()
+            self._age(100)
+            with self._pair(certdir) as (proxy, up):
+                proxy._keepalive_tick()
+                assert pp._affinity_pings["refused"] == {}, (
+                    why, "a session that is not due was counted")
+                assert not [l for l in seen.logs if "is not kept" in l], seen.logs
+                self._age(3400)
+                proxy._keepalive_tick()
+                proxy._keepalive_tick()
+            assert pp._affinity_pings["refused"] == refused, (
+                why, pp._affinity_pings)
+            (line,) = [l for l in seen.logs if "is not kept" in l]
+            assert f"slot {slot} is not kept" in line and why in line, line
+            assert up.bodies_seen == [] and "session S" not in line
+        # A session whose pings are spent, or whose prefix is too small, needs
+        # no ping on any slot: it keeps its own reason, and the slot is never
+        # named for it (cswap's rule asks the slot first; this one asks last).
+        for field, value, reason in (
+                (5, 2, "pings since its last request are spent"),
+                (3, 100, "its prefix is too small to pay")):
+            seen = self._armed(monkeypatch, certdir, forms=("full",))
+            pp._affinity_kept.pop(self.IDENT)
+            self._age(3400)
+            pp._affinity_last["S"][field] = value
+            with self._pair(certdir) as (proxy, up):
+                proxy._keepalive_tick()
+            assert pp._affinity_pings["refused"] == {reason: 1}, (
+                reason, pp._affinity_pings)
+            assert not [l for l in seen.logs if "is not kept" in l], seen.logs
+
+    def case_a_body_sent_on_another_slot_than_the_binding_is_not_pinged(
+            self, monkeypatch, certdir):
+        """A request that moves the session to a slot that is not kept leaves
+        its body's cache on the old slot: a ping would write the whole prefix
+        on an account that never held it. The pick does not judge it; the
+        sender does, on the bearer the body went out on."""
+        from cswap_pin import proxy as pp
+        other = [("Authorization", "Bearer tok-B"),
+                 ("x-claude-code-session-id", "S")]
+        self._armed(monkeypatch, certdir)
+        assert pp._affinity_pick(certdir, other)[0] == "tok-A", "kept"
+        assert "S" in pp._affinity_last and pp._affinity["S"][0] == "tok-A"
+        gone = pp._affinity_kept.pop(self.IDENT)  # a reply read it at its bar
+        assert pp._affinity_pick(certdir, other) is None
+        assert pp._affinity["S"][0] == "tok-B", "rebound to the live account"
+        assert "S" in pp._affinity_last, "the pick judged a body it did not own"
+        self._age(3400)
+        pp._affinity["S"] = ("tok-B", time.monotonic() - 3400)
+        pp._affinity_kept[self.IDENT] = gone
+        with self._pair(certdir) as (proxy, up):
+            proxy._keepalive_tick()
+        assert up.bodies_seen == [], "a ping wrote the prefix on slot 2"
+        assert pp._affinity_pings["refused"] == {
+            "sent on another account": 1}, pp._affinity_pings
+        assert "S" not in pp._affinity_last, "it would be asked every tick"
+
+    def case_a_body_sent_on_the_clients_bearer_is_not_pinged_on_the_bound_slot(
+            self, monkeypatch, certdir):
+        """A stale snapshot (or a client token it has not seen) sends the
+        request on the CLIENT's bearer and leaves the binding where it was; the
+        body's cache is on the client's account. A ping on the binding's
+        stored token would write it whole on an account that never held it.
+        The same account under a rotated token is the same cache."""
+        from cswap_pin import proxy as pp
+        usage = {"cache_read_input_tokens": 30000,
+                 "cache_creation_input_tokens": 0}
+
+        def stale_send(bearer, stale=True):
+            self._wire(monkeypatch, certdir)
+            monkeypatch.setattr(pp, "_KEEPALIVE_FORMS", frozenset({"full"}))
+            self._send(certdir, [("tok-A", "P")])  # a snapshot to rule on
+            pp._affinity_idents["tok-A2"] = self.IDENT  # slot 1, rotated
+            self._seed("S", "tok-A")
+            with monkeypatch.context() as m:
+                if stale:  # the client's bearer goes out
+                    pp._affinity_snap["at"] = float("-inf")
+                    m.setattr(pp, "_affinity_kick", lambda *a: None)
+                self._send(certdir, [dict(self._call("S"), bearer=bearer)],
+                           body=self._body(pad=90000))
+            assert pp._affinity["S"][0] == "tok-A", "the binding moved"
+            assert pp._affinity_last["S"][8] == (bearer if stale else "tok-A")
+            self._age(3400)
+            pp._affinity_snap["at"] = time.monotonic()
+
+        stale_send("tok-B")
+        with self._pair(certdir, reply=self._reply(usage)) as (proxy, up):
+            got = proxy._keepalive_ping("S", force_form=True)
+        assert got["refused"] == "sent on another account" and got["status"] is None
+        assert up.bodies_seen == [], "pinged an account that never held it"
+        assert "S" not in pp._affinity_last, "kept to be asked again"
+        stale_send("tok-B")
+        with self._pair(certdir, reply=self._reply(usage)) as (proxy, up):
+            proxy._keepalive_tick()
+        assert up.bodies_seen == [], "the tick pinged an account that never held it"
+        assert pp._affinity_pings == {
+            "sent": 0, "hit": 0, "refused": {"sent on another account": 1}}, (
+                pp._affinity_pings)
+        assert "S" not in pp._affinity_last
+        for bearer, stale, what in (
+                ("tok-A2", True, "the same slot under a rotated token"),
+                ("tok-B", False, "the kept slot's stored token")):
+            stale_send(bearer, stale)
+            with self._pair(certdir, reply=self._reply(usage)) as (proxy, up):
+                proxy._keepalive_tick()
+            assert len(up.bodies_seen) == 1 and up.seen_auth == "Bearer tok-A", (
+                f"{what} holds the same cache")
+            assert pp._affinity_pings["refused"] == {}
+
+    def case_a_ping_moves_its_session_to_the_end_of_the_bounded_table(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        self._armed(monkeypatch, certdir)
+        pp._affinity["T"] = ("tok-A", time.monotonic())
+        with self._pair(certdir, reply=self._reply({})) as (proxy, up):
+            proxy._keepalive_tick()
+        assert len(up.bodies_seen) == 1
+        assert list(pp._affinity) == ["T", "S"], (
+            "a ping renewed the clock but not the place in the table",
+            list(pp._affinity))
+
+    def case_health_answers_when_the_report_cannot_be_built(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+        pp._affinity_idents["tok-A"] = self.IDENT
+        pp._affinity["S"] = ("tok-A", time.monotonic())
+        pp._affinity_last["S"] = [[], b""]  # a row the report cannot read
+        got = self._health(certdir)
+        assert got["armed"] is True and got["slots"] == {}, got
+        assert set(got["pings"]) == {"sent", "refused", "hit", "cost",
+                                     "forms"}, got
+
+    def case_a_thread_that_cannot_start_does_not_fail_the_request(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+
+        real_start = threading.Thread.start
+
+        def start(self):  # the sender's thread only: the pin needs its own
+            if getattr(self._target, "__name__", "") == "_keepalive_loop":
+                raise RuntimeError("can't start new thread")
+            real_start(self)
+
+        self._wire(monkeypatch, certdir)
+        with self._pair(certdir, started=True) as (proxy, up):
+            with monkeypatch.context() as m:
+                m.setattr(threading.Thread, "start", start)
+                status = _request_through_proxy(
+                    proxy.port, certdir / "ca.pem", "/v1/messages",
+                    body=self._body(pad=90000), **self._call("S"))
+        assert status == 200 and "S" in pp._affinity_last
+        assert getattr(proxy, "_keepalive_thread", None) is None
+
+    def case_the_session_table_is_bounded(self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+        for i in range(pp._AFFINITY_MAX + 50):
+            pp._affinity_pick(certdir, [
+                ("Authorization", "Bearer tok-A"),
+                ("x-claude-code-session-id", f"s{i}")])
+        assert len(pp._affinity) == pp._AFFINITY_MAX
+
+
+def _client_ws_frame(payload: bytes) -> bytes:
+    """A masked final text frame, built here rather than with the code under
+    test, so a bug in the proxy's own encoder cannot hide in both ends."""
+    import os as _os
+    mask = _os.urandom(4)
+    n = len(payload)
+    if n < 126:
+        head = bytes([0x81, 0x80 | n])
+    else:
+        head = bytes([0x81, 0x80 | 126]) + n.to_bytes(2, "big")
+    return head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+
+
+def _unmask(frame: bytes) -> bytes:
+    n = frame[1] & 0x7F
+    off = 2 + (2 if n == 126 else 8 if n == 127 else 0)
+    mask, data = frame[off:off + 4], frame[off + 4:]
+    return bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+
+
+class _FakeChromeBridge:
+    """bridge.claudeusercontent.com for one WebSocket: records the handshake
+    head and the first two client frames, answers 101 and one server frame."""
+
+    def __init__(self, certdir: Path):
+        self.head = ""
+        self.frames: list[bytes] = []
+        self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self._ctx.load_cert_chain(str(certdir / "leaf.pem"),
+                                  str(certdir / "leaf.key"))
+        self._srv = socket.socket()
+        self._srv.settimeout(10)
+        self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(1)
+        self.port = self._srv.getsockname()[1]
+        self.done = threading.Event()
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        from cswap_pin.proxy import _read_ws_frame
+        try:
+            tls, head = _accept_head(self._srv, self._ctx, 10)
+            self.head = head.decode("latin1")
+            tls.sendall(b"HTTP/1.1 101 Switching Protocols\r\n"
+                        b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+            for _ in range(2):
+                self.frames.append(_read_ws_frame(tls))
+                if len(self.frames) == 1:
+                    tls.sendall(b"\x81\x0b" + b'{"ok":true}')
+            tls.close()
+        except Exception:  # noqa: BLE001 — the asserts report what is missing
+            pass
+        finally:
+            self.done.set()
+            self._srv.close()
+
+
+class _FakeBridgeOtherTraffic:
+    """bridge.claudeusercontent.com for what is NOT `/chrome/`: Claude Code
+    2.1.303 also uses this host for `/devices/mcp`, over https and wss.
+    ``post``: reads the head AND the whole body before it answers 200.
+    ``server_first``: answers 101 and speaks a frame at once, before the
+    client has sent one."""
+
+    def __init__(self, certdir: Path, mode: str):
+        self.got = b""
+        self.mode = mode
+        self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self._ctx.load_cert_chain(str(certdir / "leaf.pem"),
+                                  str(certdir / "leaf.key"))
+        self._srv = socket.socket()
+        self._srv.settimeout(15)
+        self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(1)
+        self.port = self._srv.getsockname()[1]
+        self.done = threading.Event()
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        try:
+            tls, head = _accept_head(self._srv, self._ctx, 15)
+            self.got = head
+            if self.mode == "post":
+                n = int(re.search(rb"(?i)content-length: *(\d+)", head)[1])
+                body = b""
+                while len(body) < n:
+                    chunk = tls.recv(n - len(body))
+                    if not chunk:
+                        return
+                    body += chunk
+                self.got += body
+                tls.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            else:
+                tls.sendall(b"HTTP/1.1 101 Switching Protocols\r\n"
+                            b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+                tls.sendall(b"\x81\x05hello")  # its own TLS record
+            tls.recv(1)  # held open until the client lets go
+        except Exception:  # noqa: BLE001 — the asserts report what is missing
+            pass
+        finally:
+            self.done.set()
+            self._srv.close()
+
+
+class TestChromeBridgeCarriesThePinnedToken:
+    """Claude in Chrome authenticates in its first WebSocket message, with the
+    ACTIVE account's token, to a path naming the PINNED account. Without the
+    swap the relay answers "User mismatch" after every rotation."""
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    @staticmethod
+    def _open(proxy, certdir):
+        raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+        raw.sendall(b"CONNECT bridge.claudeusercontent.com:443 HTTP/1.1\r\n"
+                    b"Host: bridge.claudeusercontent.com:443\r\n\r\n")
+        got = b""
+        while b"\r\n\r\n" not in got:
+            chunk = raw.recv(4096)
+            if not chunk:
+                break
+            got += chunk
+        assert got.startswith(b"HTTP/1.1 200"), got
+        ctx = ssl.create_default_context(cafile=str(certdir / "ca.pem"))
+        return ctx.wrap_socket(raw,
+                               server_hostname="bridge.claudeusercontent.com")
+
+    def case_the_connect_frame_reaches_the_relay_with_the_pinned_token(
+        self, certdir
+    ):
+        from cswap_pin.proxy import PinProxy, _read_ws_frame
+
+        bridge = _FakeChromeBridge(certdir)
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: "PINNED")
+        proxy._dial_tunnel = lambda target, conn: (
+            socket.create_connection(("127.0.0.1", bridge.port), timeout=10),
+            False)
+        proxy.start()
+        try:
+            _stray(bridge.port)
+            tls = self._open(proxy, certdir)
+            tls.sendall(
+                b"GET /chrome/pin-uuid HTTP/1.1\r\n"
+                b"Host: bridge.claudeusercontent.com\r\n"
+                b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                b"Sec-WebSocket-Version: 13\r\n"
+                b"Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n")
+            got = b""
+            while b"\r\n\r\n" not in got:
+                got += tls.recv(4096)
+            assert got.startswith(b"HTTP/1.1 101"), got
+            connect = json.dumps({"type": "connect",
+                                  "client_type": "claude-code",
+                                  "oauth_token": "ACTIVE"}).encode()
+            tls.sendall(_client_ws_frame(connect))
+            assert _read_ws_frame(tls) == b"\x81\x0b" + b'{"ok":true}'
+            # Past 125 bytes, so the second frame takes the 16-bit length.
+            later = json.dumps({"type": "tool_result",
+                                "content": "x" * 200}).encode()
+            later_frame = _client_ws_frame(later)
+            tls.sendall(later_frame)
+            assert bridge.done.wait(10)
+            tls.close()
+        finally:
+            proxy.stop()
+
+        assert "/chrome/pin-uuid" in bridge.head
+        assert "sec-websocket-extensions" not in bridge.head.lower(), (
+            "compression was left negotiable, so a later connect frame could "
+            "arrive deflated and unreadable")
+        sent = json.loads(_unmask(bridge.frames[0]))
+        assert sent == {"type": "connect", "client_type": "claude-code",
+                        "oauth_token": "PINNED"}, sent
+        assert bridge.frames[1] == later_frame, (
+            "a frame after the connect message was altered")
+
+    def case_a_relay_that_never_speaks_tls_is_given_up_on_and_released(
+        self, certdir, monkeypatch
+    ):
+        """A hop that answers CONNECT 200 and goes silent passes the open
+        check, then parks the thread in the UPSTREAM handshake: unbounded, it
+        kept three fds and the connection's debt for good."""
+        import cswap_pin.proxy as px
+
+        monkeypatch.setattr(px, "_CHROME_HANDSHAKE_S", 1.0)
+        silent = socket.socket()
+        silent.bind(("127.0.0.1", 0))
+        # Not 1: macOS drops a SYN once a backlog-1 queue holds the stray (T2964).
+        silent.listen(4)
+        silent.settimeout(10)
+        _stray(silent.getsockname()[1])
+        proxy = px.PinProxy(certdir=certdir, pin_token_provider=lambda: "P")
+        proxy._dial_tunnel = lambda target, conn: (
+            socket.create_connection(silent.getsockname(), timeout=10), False)
+        proxy.start()
+        try:
+            tls = self._open(proxy, certdir)
+            tls.sendall(b"GET /chrome/pin-uuid HTTP/1.1\r\n"
+                        b"Host: bridge.claudeusercontent.com\r\n\r\n")
+            hop = _accept_held(silent)
+            assert proxy.inflight_requests() == 1, "premise: the debt is owed"
+            hop.settimeout(4)
+            heard = b""
+            try:  # the proxy's ClientHello, then EOF once it gives up
+                heard = hop.recv(4096)
+                while hop.recv(4096):
+                    pass
+                cut = True
+            except OSError:
+                cut = False
+            end = time.monotonic() + 5
+            while (proxy.inflight_requests() or proxy.live_client_count()) \
+                    and time.monotonic() < end:
+                time.sleep(0.05)
+            released = not (proxy.inflight_requests()
+                            or proxy.live_client_count())
+            tls.close()
+        finally:
+            proxy.stop()
+        assert heard, "premise: the hop never heard the proxy's ClientHello"
+        assert cut, "the upstream handshake was never given up on"
+        assert released, "the connection was not released after giving up"
+
+    def case_without_a_pinned_token_the_bridge_is_a_blind_tunnel(
+        self, certdir
+    ):
+        from cswap_pin.proxy import PinProxy
+
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None)
+        tunnelled = []
+        proxy._capped_tunnel = lambda target, conn: (
+            tunnelled.append(target), conn.close())
+        proxy._chrome_bridge("bridge.claudeusercontent.com:443",
+                             socket.socket())
+        assert tunnelled == ["bridge.claudeusercontent.com:443"]
+
+    def case_only_the_connect_message_is_rewritten(self):
+        from cswap_pin.proxy import _swap_connect_token
+
+        other = _client_ws_frame(b'{"type":"ping"}')
+        assert _swap_connect_token(other, "PINNED") is None
+        assert _swap_connect_token(_client_ws_frame(b"not json"), "P") is None
+        unmasked = b"\x81" + bytes([20]) + b'{"type":"connect"}  '
+        assert _swap_connect_token(unmasked, "PINNED") is None
+        long_tok = "t" * 300  # the re-encoded frame needs the 16-bit length
+        out = _swap_connect_token(_client_ws_frame(
+            b'{"type":"connect","oauth_token":"A"}'), long_tok)
+        assert out[1] & 0x7F == 126
+        assert json.loads(_unmask(out))["oauth_token"] == long_tok
+
+    def case_a_leaf_without_the_bridge_name_is_reissued_under_the_same_ca(
+        self, tmp_path
+    ):
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        ca_before = (tmp_path / "ca.pem").read_bytes()
+        ca_cert = x509.load_pem_x509_certificate(ca_before)
+        ca_priv = serialization.load_pem_private_key(
+            (tmp_path / "ca.key").read_bytes(), password=None)
+        old = x509.load_pem_x509_certificate(
+            (tmp_path / "leaf.pem").read_bytes())
+        key = serialization.load_pem_private_key(
+            (tmp_path / "leaf.key").read_bytes(), password=None)
+        # The leaf every install had before this change: one SAN.
+        one_san = (
+            x509.CertificateBuilder()
+            .subject_name(x509.Name(
+                [x509.NameAttribute(NameOID.COMMON_NAME, "api.anthropic.com")]))
+            .issuer_name(ca_cert.subject)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(old.not_valid_before_utc)
+            .not_valid_after(old.not_valid_after_utc)
+            .add_extension(x509.SubjectAlternativeName(
+                [x509.DNSName("api.anthropic.com")]), critical=False)
+            .add_extension(x509.ExtendedKeyUsage(
+                [ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+            .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(
+                ca_cert.public_key()), critical=False)
+            .sign(ca_priv, hashes.SHA256())
+        )
+        (tmp_path / "leaf.pem").write_bytes(
+            one_san.public_bytes(serialization.Encoding.PEM))
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        assert (tmp_path / "ca.pem").read_bytes() == ca_before, (
+            "the CA was replaced, which breaks every session wired to it")
+        san = x509.load_pem_x509_certificate(
+            (tmp_path / "leaf.pem").read_bytes()).extensions \
+            .get_extension_for_class(x509.SubjectAlternativeName).value \
+            .get_values_for_type(x509.DNSName)
+        assert set(san) == {"api.anthropic.com",
+                            "bridge.claudeusercontent.com",
+                            "mcp-proxy.anthropic.com"}
+
+
+    def _other_traffic(self, certdir, mode, req, want):
+        """`req` through a pin that HOLDS a pinned token, to a relay that
+        answers as `mode`: (what reached the client, what the relay read)."""
+        from cswap_pin.proxy import PinProxy
+
+        bridge = _FakeBridgeOtherTraffic(certdir, mode)
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: "PINNED")
+        proxy._dial_tunnel = lambda target, conn: (
+            socket.create_connection(("127.0.0.1", bridge.port), timeout=10),
+            False)
+        proxy.start()
+        got = b""
+        try:
+            _stray(bridge.port)
+            tls = self._open(proxy, certdir)
+            tls.settimeout(5)
+            tls.sendall(req)  # one TLS record: head and body together
+            try:
+                while want not in got:
+                    chunk = tls.recv(4096)
+                    if not chunk:
+                        break
+                    got += chunk
+            except (OSError, ssl.SSLError) as e:
+                got += f" <{type(e).__name__}>".encode()
+            tls.close()
+        finally:
+            proxy.stop()
+        return got, bridge.got
+
+    POST = (b"POST /devices/mcp HTTP/1.1\r\n"
+            b"Host: bridge.claudeusercontent.com\r\n"
+            b"Authorization: Bearer ACTIVE\r\n"
+            b"Content-Type: application/json\r\nContent-Length: 17\r\n\r\n"
+            b'{"jsonrpc":"2.0"}')
+
+    def case_a_post_with_a_body_to_another_path_reaches_the_relay(
+        self, certdir
+    ):
+        """`/devices/mcp` is not `/chrome/`: nothing there is rewritten, and
+        the body that followed the head must still get upstream."""
+        got, seen = self._other_traffic(
+            certdir, "post", self.POST, b"HTTP/1.1 200")
+        assert got.startswith(b"HTTP/1.1 200"), got
+        assert seen == self.POST, "the head or the body was altered"
+
+    def case_a_websocket_to_another_path_where_the_relay_speaks_first(
+        self, certdir
+    ):
+        """No client frame is owed on `/devices/mcp`: the relay's frame must
+        reach the client, and the handshake goes through as the client sent
+        it, compression offer included."""
+        req = (b"GET /devices/mcp HTTP/1.1\r\n"
+               b"Host: bridge.claudeusercontent.com\r\n"
+               b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+               b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+               b"Sec-WebSocket-Version: 13\r\n"
+               b"Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n")
+        got, seen = self._other_traffic(certdir, "server_first", req, b"hello")
+        assert b"hello" in got, got
+        assert seen == req, "the handshake was altered"
+
+    def case_a_post_fixture_stops_when_the_body_ends_early(self, certdir):
+        """T2954: a clean TLS close mid-body read as b'' and the fixture's body
+        loop spun on it for ever (an unclean one raised, which ended it)."""
+        bridge = _FakeBridgeOtherTraffic(certdir, "post")
+        tls = ssl.create_default_context(cafile=str(certdir / "ca.pem")) \
+            .wrap_socket(socket.create_connection(("127.0.0.1", bridge.port),
+                                                  timeout=1),
+                         server_hostname="bridge.claudeusercontent.com")
+        tls.sendall(self.POST[:-5])
+        try:
+            tls.unwrap()  # sends close_notify, then waits for the reply
+        except (OSError, ssl.SSLError):
+            pass
+        assert bridge.done.wait(5), "the fixture spun on a body that ended"
+
+    def case_the_armed_trace_sees_the_bridge_mitm(self, certdir):
+        """The MITM replaces a blind tunnel, which writes a trace line (01759e19)
+        so a missing channel shows; this path owes the same line."""
+        import cswap_pin.proxy as pp
+
+        out = certdir / "armed-trace.log"
+        (certdir / pp._TRACE_SWITCH_FILE).write_text(str(out))
+        pp._TRACE_CACHE.clear()
+        self._other_traffic(certdir, "post", self.POST, b"HTTP/1.1 200")
+        assert out.exists() and "CONNECT bridge.claudeusercontent.com:443" in (
+            out.read_text()), "the bridge MITM left no line in the armed trace"
+
+
+class _NeverConnects:
+    """An attempt stuck in SYN-SENT: the read end of a pipe never selects
+    writable, which is exactly what a black-holed connect looks like."""
+
+    def __init__(self):
+        import os as _os
+        self._r, self._w = _os.pipe()
+        self.closed = False
+
+    def fileno(self):
+        return self._r
+
+    def close(self):
+        import os as _os
+        if not self.closed:
+            self.closed = True
+            _os.close(self._r)
+            _os.close(self._w)
+
+
+class TestHappyEyeballsDial:
+    """A broken IPv6 route must not stall upstream dials (RFC 8305).
+
+    Measured: a cellular modem kept its global IPv6 addresses after its IPv6
+    stopped carrying traffic. AAAA resolved first, `create_connection` gave
+    each address the whole 15 s, and every pinned session's Remote Control
+    gave up while Claude Code's own direct dials (Node, happy eyeballs) kept
+    working."""
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    @staticmethod
+    def _listener():
+        srv = socket.socket()
+        srv.settimeout(10)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        return srv
+
+    @staticmethod
+    def _resolve_to(monkeypatch, infos):
+        import cswap_pin.proxy as pp
+        monkeypatch.setattr(pp.socket, "getaddrinfo",
+                            lambda *a, **k: list(infos))
+
+    def case_a_black_holed_first_address_does_not_hold_the_dial(
+        self, monkeypatch
+    ):
+        import cswap_pin.proxy as pp
+
+        srv = self._listener()
+        port = srv.getsockname()[1]
+        dead = _NeverConnects()
+        self._resolve_to(monkeypatch, [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::1", port, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port)),
+        ])
+        real = pp._start_connect
+        monkeypatch.setattr(
+            pp, "_start_connect",
+            lambda fam, addr: (dead, errno.EINPROGRESS)
+            if fam == socket.AF_INET6 else real(fam, addr))
+        t0 = time.monotonic()
+        sock = pp._happy_dial(("example.test", port), timeout=15)
+        took = time.monotonic() - t0
+        try:
+            assert sock.getpeername()[:2] == ("127.0.0.1", port)
+            assert took < 2.0, (
+                f"the dial waited {took:.1f}s on the dead IPv6 attempt instead "
+                "of starting IPv4 after the connection attempt delay")
+            assert dead.closed, "the losing attempt was left open"
+            assert sock.gettimeout() == 15, (
+                "the dial budget was not left on the socket the way "
+                "create_connection leaves it, which callers then clear")
+        finally:
+            sock.close()
+            srv.close()
+
+    def case_a_refused_address_moves_on_at_once(self, monkeypatch):
+        import cswap_pin.proxy as pp
+
+        srv = self._listener()
+        port = srv.getsockname()[1]
+        closed = socket.socket()
+        closed.bind(("127.0.0.1", 0))
+        refused_port = closed.getsockname()[1]
+        closed.close()  # nothing listens there: an immediate RST
+        self._resolve_to(monkeypatch, [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", refused_port)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port)),
+        ])
+        monkeypatch.setattr(pp, "_HAPPY_EYEBALLS_DELAY_S", 5.0)
+        t0 = time.monotonic()
+        sock = pp._happy_dial(("example.test", port), timeout=15)
+        try:
+            assert sock.getpeername()[1] == port
+            assert time.monotonic() - t0 < 2.0, (
+                "a refused attempt waited out the attempt delay instead of "
+                "starting the next address immediately")
+        finally:
+            sock.close()
+            srv.close()
+
+    def case_nothing_reachable_raises_within_the_budget(self, monkeypatch):
+        import cswap_pin.proxy as pp
+
+        deads = [_NeverConnects(), _NeverConnects()]
+        self._resolve_to(monkeypatch, [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::1", 443, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 443)),
+        ])
+        monkeypatch.setattr(pp, "_start_connect",
+                            lambda fam, addr: (deads.pop(0), errno.EINPROGRESS))
+        t0 = time.monotonic()
+        with pytest.raises(OSError):
+            pp._happy_dial(("example.test", 443), timeout=0.8)
+        took = time.monotonic() - t0
+        assert took < 2.0, f"the whole-dial budget was not kept: {took:.1f}s"
+        assert not deads, "an address was never attempted"
+
+
+# ---------------------------------------------------------------------------
+# Inference follows the active account for a host that brings its own login
+# (Claude Desktop's Code tab). Opt-in via cswap's `pin.desktopFollows`.
+# ---------------------------------------------------------------------------
+
+_DESKTOP_UA = "claude-cli/2.1.281 (external, claude-desktop)"
+_CLI_UA = "claude-cli/2.1.281 (external, cli)"
+_FAR_MS = 4102444800000  # expiresAt, year 2100, ms
+_GRANT_403 = json.dumps({"type": "error", "error": {
+    "type": "permission_error",
+    "message": "Access to this model requires an access grant your request "
+               "does not have"}}).encode()
+_OTHER_403 = json.dumps({"type": "error", "error": {
+    "type": "permission_error",
+    "message": "Your organization does not have access to this resource"}}
+).encode()
+
+
+def _health_of(proxy) -> dict:
+    conn = http.client.HTTPConnection("127.0.0.1", proxy.port, timeout=5)
+    conn.request("GET", "/health")
+    body = json.loads(conn.getresponse().read())
+    conn.close()
+    return body["inference_follow"]
+
+
+class TestInferenceFollows:
+    """A host that brings its own login (Claude Desktop) bills the account it
+    is signed into. With `pin.desktopFollows` on, its `/v1/messages` goes out
+    on cswap's active account instead, from a snapshot a thread of its own
+    reads, and a refusal is taken back onto the host's own bearer."""
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(
+            self,
+            request,
+            tmp_path_factory,
+            # settings.json sits beside `pin-proxy/`: one per case, never shared
+            extra={"certdir": lambda t: _make_certdir(_mkdir(t / "pin-proxy"))},
+        )
+
+    @staticmethod
+    def _seed(token, expires=_FAR_MS):
+        """The follow snapshot holds ``token``, read just now."""
+        from cswap_pin import proxy as pp
+
+        now = time.monotonic()
+        pp._follow_snap.update(token=token, expires=expires, at=now,
+                               tried=now, busy=False)
+
+    @classmethod
+    def _arm(cls, monkeypatch, certdir, token="ACTIVE", expires=_FAR_MS,
+             on=True, seed=True):
+        """Clean follow state, the switch on (or off), the snapshot holding
+        ``token`` (``seed``), and the credential reader a case moves through
+        ``ctx.cell``; ``ctx.reads`` counts its calls. Every read runs inline
+        unless a case swaps `_spawn_usage_header_recorder`."""
+        from cswap_pin import proxy as pp
+
+        monkeypatch.delenv("CSWAP_PIN_INFERENCE_FOLLOWS", raising=False)
+        (certdir.parent / "settings.json").write_text(
+            json.dumps({"pin": {"desktopFollows": on}}))
+        pp._INFERENCE_CACHE.clear()
+        pp._follow_snap.update(token=None, expires=None, at=-math.inf,
+                               tried=-math.inf, busy=False, stuck=0, gen=0,
+                               failures=0)
+        pp._follow_counts.update(swapped=0, taken_back={}, passthrough={})
+        pp._follow_logged.clear()
+        ctx = types.SimpleNamespace(cell=[token, expires], reads=[])
+
+        def reader():
+            ctx.reads.append(1)
+            return tuple(ctx.cell)
+
+        monkeypatch.setattr(pp, "_active_oauth_credential", reader)
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder",
+                            lambda fn: fn())
+        monkeypatch.setattr(pp, "_note_usage_headers", lambda *a, **k: None)
+        if seed:
+            cls._seed(token, expires)
+        return ctx
+
+    @staticmethod
+    def _proxy(certdir, upstream):
+        from cswap_pin.proxy import PinProxy
+
+        return PinProxy(certdir=certdir,
+                        pin_token_provider=lambda: "PIN-TOKEN",
+                        upstream=("127.0.0.1", upstream.port))
+
+    @staticmethod
+    def _ask(proxy, certdir, path="/v1/messages", bearer="HOST-TOKEN",
+             ua=_DESKTOP_UA, **kw):
+        return _request_through_proxy(proxy.port, certdir / "ca.pem", path,
+                                      bearer=bearer, ua=ua, **kw)
+
+    def case_ua_entrypoint_parses_claude_cli_only(self):
+        from cswap_pin.proxy import ua_entrypoint
+
+        assert ua_entrypoint(_DESKTOP_UA) == "claude-desktop"
+        assert ua_entrypoint(_CLI_UA) == "cli"
+        assert ua_entrypoint(
+            "claude-cli/2.1.281 (external, sdk-ts, agent-sdk/0.9)") == "sdk-ts"
+        # The session-route UA carries no entrypoint; nor does anything else.
+        assert ua_entrypoint("claude-code/2.1.281") is None
+        assert ua_entrypoint("claude-swap/1.0") is None
+        assert ua_entrypoint("") is None
+
+    def case_route_needs_inference_path_and_listed_entrypoint(
+            self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        self._arm(monkeypatch, certdir)
+        headers = [("Authorization", "Bearer HOST-TOKEN")]
+
+        def f(path, ua, on):
+            monkeypatch.setenv("CSWAP_PIN_INFERENCE_FOLLOWS", ",".join(on))
+            return pp._follow_token(certdir, path, ua, headers) is not None
+
+        on = frozenset({"claude-desktop"})
+        assert f("/v1/messages?beta=true", _DESKTOP_UA, on)
+        assert not f("/v1/messages", _CLI_UA, on)
+        assert not f("/v1/messages", _DESKTOP_UA, frozenset())
+        assert not f("/api/oauth/usage", _DESKTOP_UA, on)
+        assert not f("/v1/code/sessions", _DESKTOP_UA, on)
+        assert not f("/v1/messages/batches", _DESKTOP_UA, on)
+        # The wall and grant arms match /v1/messages exactly, so a followed
+        # count_tokens refusal could never be converted: it is not followed.
+        assert not f("/v1/messages/count_tokens", _DESKTOP_UA, on)
+
+    def case_a_request_off_the_route_never_reads_the_switch(
+            self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        self._arm(monkeypatch, certdir)
+        reads = []
+        monkeypatch.setattr(pp, "inference_follow_entrypoints",
+                            lambda c: reads.append(c) or frozenset())
+        headers = [("Authorization", "Bearer HOST-TOKEN")]
+        for path in ("/v1/code/sessions", "/api/oauth/usage",
+                     "/v1/messages/count_tokens"):
+            assert pp._follow_token(certdir, path, _DESKTOP_UA, headers) is None
+        assert not reads, "a route that is not followed read the switch"
+        pp._follow_token(certdir, "/v1/messages", _DESKTOP_UA, headers)
+        assert reads == [certdir]
+
+    def case_a_second_credential_is_left_as_the_client_sent_it(
+            self, certdir, monkeypatch):
+        """An `x-api-key` unlike the bearer is the client's own pair
+        (`_affinity_pick`'s rule): swapping the bearer alone would send two
+        credentials."""
+        from cswap_pin import proxy as pp
+
+        self._arm(monkeypatch, certdir)
+
+        def f(*extra):
+            return pp._follow_token(
+                certdir, "/v1/messages", _DESKTOP_UA,
+                [("Authorization", "Bearer HOST-TOKEN"), *extra])
+
+        assert f(("x-api-key", "OTHER-KEY")) is None
+        assert f(("x-api-key", "HOST-TOKEN")) == "ACTIVE"  # moves with it
+        assert f() == "ACTIVE"
+
+    def case_a_snapshot_older_than_the_stale_bound_is_no_token(
+            self, certdir, monkeypatch):
+        """A reader that hangs leaves the last snapshot in place: it must not
+        keep billing the last account it read."""
+        from cswap_pin import proxy as pp
+
+        self._arm(monkeypatch, certdir)
+        headers = [("Authorization", "Bearer HOST-TOKEN")]
+        assert pp._follow_token(
+            certdir, "/v1/messages", _DESKTOP_UA, headers) == "ACTIVE"
+        pp._follow_snap["at"] -= pp._FOLLOW_STALE_S + 1  # `tried` is recent
+        assert pp._follow_token(
+            certdir, "/v1/messages", _DESKTOP_UA, headers) is None
+        assert pp._follow_counts["passthrough"] == {"stale": 1}
+
+    def case_a_read_still_lands_after_three_abandoned_ones(
+            self, certdir, monkeypatch):
+        """The abandon limit holds back another abandonment only: once a read
+        has landed, the next one is due at the usual period though the three
+        hung ones have not returned (`_affinity_kick`'s rule)."""
+        from cswap_pin import proxy as pp
+
+        ctx = self._arm(monkeypatch, certdir, seed=False)
+        clock = {"t": 1000.0}
+        monkeypatch.setattr(pp.time, "monotonic", lambda: clock["t"])
+        queued = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+        snap = pp._follow_snap
+        pp._follow_kick()
+        for stuck in (1, 2, 3):
+            clock["t"] += pp._FOLLOW_STALE_S
+            pp._follow_kick()
+            assert snap["stuck"] == stuck and len(queued) == stuck + 1
+        clock["t"] += pp._FOLLOW_STALE_S
+        pp._follow_kick()
+        assert len(queued) == 4, "a fourth hung read was abandoned"
+        queued[3]()
+        assert snap["token"] == "ACTIVE" and not snap["busy"]
+        clock["t"] += pp._FOLLOW_REFRESH_S
+        ctx.cell[0] = "NEXT"
+        pp._follow_kick()
+        assert len(queued) == 5, "no read was due after the three abandoned"
+        queued[4]()
+        assert snap["token"] == "NEXT"
+        for hung in queued[:3]:  # they return at last: each is dropped
+            hung()
+        assert snap["token"] == "NEXT" and snap["stuck"] == 0
+
+    def case_clears_over_hung_reads_start_no_more_than_the_limit(
+            self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        self._arm(monkeypatch, certdir, seed=False)
+        monkeypatch.setenv("CSWAP_PIN_INFERENCE_FOLLOWS", "claude-desktop")
+        queued = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+        clock = {"t": 1000.0}
+        monkeypatch.setattr(pp.time, "monotonic", lambda: clock["t"])
+        snap = pp._follow_snap
+        pp._follow_kick()
+        for _ in range(10):  # a storm of clears while the reads hang
+            clock["t"] += 1
+            pp._follow_clear(None)
+        assert snap["stuck"] == pp._FOLLOW_STUCK_MAX
+        assert len(queued) == pp._FOLLOW_STUCK_MAX + 1, len(queued)
+        for fn in queued:  # all return: none lands, none is left busy
+            fn()
+        assert snap["token"] is None and snap["stuck"] == 0
+        assert not snap["busy"]
+        clock["t"] += pp._FOLLOW_REFRESH_S
+        pp._follow_kick()
+        assert len(queued) == pp._FOLLOW_STUCK_MAX + 2
+
+    def case_the_setting_arms_it_and_the_env_var_wins(
+            self, certdir, monkeypatch):
+        from claude_swap import settings as cs_settings
+        from cswap_pin import proxy as pp
+
+        settings = certdir.parent / "settings.json"
+
+        def f(text=None, env=None):
+            settings.unlink(missing_ok=True)
+            if text is not None:
+                settings.write_text(text)
+            if env is None:
+                monkeypatch.delenv("CSWAP_PIN_INFERENCE_FOLLOWS", raising=False)
+            else:
+                monkeypatch.setenv("CSWAP_PIN_INFERENCE_FOLLOWS", env)
+            pp._INFERENCE_CACHE.clear()
+            return pp.inference_follow_entrypoints(certdir)
+
+        def on(value):
+            return json.dumps({"pin": {"desktopFollows": value}})
+
+        desktop, off = frozenset({"claude-desktop"}), frozenset()
+        assert f() == off                      # no settings file
+        assert f(on(True)) == desktop
+        assert f(on(False)) == off
+        assert f(on("true")) == off            # only a real true arms it
+        assert f(json.dumps({"pin": True})) == off
+        assert f("{not json") == off
+        # read through cswap's own reader (its settings.local.json overlay),
+        # never settings.json parsed here
+        with monkeypatch.context() as m:
+            m.setattr(cs_settings, "_read_raw",
+                      lambda path: {"pin": {"desktopFollows": True}})
+            assert f() == desktop
+        # the env var overrides the setting both ways, "" included
+        assert f(on(False), env="claude-desktop") == desktop
+        assert f(on(True), env="") == off
+        # a change reaches a daemon that is already serving, after the recheck
+        assert f(on(True)) == desktop
+        settings.write_text(on(False))
+        assert pp.inference_follow_entrypoints(certdir) == desktop  # cached
+        pp._INFERENCE_CACHE.clear()
+        assert pp.inference_follow_entrypoints(certdir) == off
+
+    def case_a_host_without_cswap_reads_off(self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+        from cswap_pin._host import HostMissing
+
+        self._arm(monkeypatch, certdir)
+
+        def missing(name):
+            raise HostMissing("no claude-swap")
+
+        monkeypatch.setattr(pp, "require", missing)
+        assert pp.inference_follow_entrypoints(certdir) == frozenset()
+
+    def case_the_old_switch_file_is_retired(self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        self._arm(monkeypatch, certdir, on=False)
+        (certdir / "inference-follows").write_text("claude-desktop\n")
+        assert pp.inference_follow_entrypoints(certdir) == frozenset()
+        assert not hasattr(pp, "_INFERENCE_SWITCH_FILE")
+
+    def case_desktop_inference_gets_active_bearer(self, certdir, monkeypatch):
+        self._arm(monkeypatch, certdir)
+        upstream = _FakeUpstream(certdir)
+        proxy = self._proxy(certdir, upstream)
+        proxy.start()
+        try:
+            assert self._ask(proxy, certdir, "/v1/messages?beta=true") == 200
+            assert upstream.seen_auth == "Bearer ACTIVE"
+            # The CLI already reads the active account; it is left alone.
+            assert self._ask(proxy, certdir, bearer="CLI-TOKEN",
+                             ua=_CLI_UA) == 200
+            assert upstream.seen_auth == "Bearer CLI-TOKEN"
+            # Ownership routes keep the PIN, whoever asks.
+            assert self._ask(proxy, certdir, "/v1/code/sessions") == 200
+            assert upstream.seen_auth == "Bearer PIN-TOKEN"
+            health = _health_of(proxy)
+            assert health["swapped"] == 1, health
+            assert health["entrypoints"] == ["claude-desktop"], health
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_off_by_default_changes_no_request(self, certdir, monkeypatch):
+        ctx = self._arm(monkeypatch, certdir, on=False)
+        upstream = _FakeUpstream(certdir)
+        proxy = self._proxy(certdir, upstream)
+        proxy.start()
+        try:
+            assert self._ask(proxy, certdir) == 200
+            assert upstream.seen_auth == "Bearer HOST-TOKEN"
+            proxy._follow_refresh_tick()
+            assert not ctx.reads, "a switch that is off read the credential"
+            health = _health_of(proxy)
+            assert health["entrypoints"] == [] and health["swapped"] == 0
+            assert health["passthrough"] == {}, health
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_refused_swap_is_resent_on_host_bearer(self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        self._arm(monkeypatch, certdir)
+        upstream = _FakeUpstream(certdir, reject_bearer="ACTIVE")
+        proxy = self._proxy(certdir, upstream)
+        proxy.start()
+        try:
+            assert self._ask(proxy, certdir) == 200
+            assert upstream.auths_seen == ["Bearer ACTIVE", "Bearer HOST-TOKEN"]
+            assert _health_of(proxy)["taken_back"] == {"403": 1}
+            assert pp._follow_snap["gen"] == 1, (
+                "a refused token was kept for the next request")
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_expiring_or_same_token_passes_through(self, certdir, monkeypatch):
+        self._arm(monkeypatch, certdir, expires=(time.time() + 10) * 1000)
+        upstream = _FakeUpstream(certdir)
+        proxy = self._proxy(certdir, upstream)
+        proxy.start()
+        try:
+            assert self._ask(proxy, certdir) == 200
+            assert upstream.seen_auth == "Bearer HOST-TOKEN"
+            self._seed("ACTIVE")
+            assert self._ask(proxy, certdir, bearer="ACTIVE") == 200
+            assert upstream.seen_auth == "Bearer ACTIVE"
+            health = _health_of(proxy)
+            assert health["swapped"] == 0, health
+            assert health["passthrough"] == {"expiring": 1, "same-token": 1}
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_the_request_thread_never_reads_the_active_credential(
+            self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        ctx = self._arm(monkeypatch, certdir, seed=False)
+        queued = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+        upstream = _FakeUpstream(certdir)
+        proxy = self._proxy(certdir, upstream)
+        proxy.start()
+        try:
+            # no snapshot yet: both go out on the host's bearer, and one read
+            # is queued for a thread of its own
+            assert self._ask(proxy, certdir) == 200
+            assert self._ask(proxy, certdir) == 200
+            assert upstream.auths_seen == ["Bearer HOST-TOKEN"] * 2
+            assert not ctx.reads, "the request thread read the credential"
+            assert len(queued) == 1, "a second read started while one ran"
+            assert _health_of(proxy)["passthrough"] == {"no-token": 2}
+            queued[0]()
+            assert len(ctx.reads) == 1
+            assert self._ask(proxy, certdir) == 200
+            assert upstream.seen_auth == "Bearer ACTIVE"
+            assert len(ctx.reads) == 1
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_the_tick_reads_it_with_no_request(self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        self._arm(monkeypatch, certdir, seed=False)
+        queued = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+        upstream = _FakeUpstream(certdir)
+        proxy = self._proxy(certdir, upstream)
+        proxy.start()
+        try:
+            proxy._follow_refresh_tick()
+            assert len(queued) == 1
+            queued[0]()
+            assert pp._follow_snap["token"] == "ACTIVE"
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_an_unreadable_active_credential_passes_through(
+            self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        ctx = self._arm(monkeypatch, certdir, token=None, seed=False)
+        upstream = _FakeUpstream(certdir)
+        proxy = self._proxy(certdir, upstream)
+        proxy.start()
+        try:
+            assert self._ask(proxy, certdir) == 200
+            assert self._ask(proxy, certdir) == 200
+            assert upstream.auths_seen == ["Bearer HOST-TOKEN"] * 2
+            assert pp._follow_snap["failures"] == 1 and ctx.reads
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_a_warm_desktop_session_keeps_its_slot_after_a_switch(
+            self, certdir, monkeypatch):
+        """Desktop's own bearer never changes across a cswap switch, so the
+        follow swap runs first and affinity rules on the followed bearer: the
+        session bound on slot 1's token stays there when the active account
+        moves to slot 2, and a new session follows the move."""
+        from cswap_pin import proxy as pp
+
+        _A = TestSessionAffinityOnMessages
+        _A._wire(monkeypatch, certdir)
+        self._arm(monkeypatch, certdir, token="tok-A")
+
+        def ask(session):
+            return _A._send(certdir, [dict(
+                bearer="HOST-TOKEN", ua=_DESKTOP_UA,
+                extra_headers={"x-claude-code-session-id": session})])[1]
+
+        assert ask("S") == ["Bearer tok-A"]
+        self._seed("tok-B")  # cswap moved to slot 2
+        assert ask("S") == ["Bearer tok-A"], "the warm session was moved"
+        assert ask("S2") == ["Bearer tok-B"], "a new session did not follow"
+
+    def case_a_double_refusal_walks_the_kept_then_the_followed_then_the_host(
+            self, certdir, monkeypatch):
+        """A kept AND followed request refused on both: each take-back undoes
+        only its own swap (A, then B, then the host's bearer), and the pinned
+        refetch, which returns the PINNED token, is never reached."""
+        from cswap_pin import proxy as pp
+
+        _A = TestSessionAffinityOnMessages
+        _A._wire(monkeypatch, certdir)
+        self._arm(monkeypatch, certdir, token="tok-B")
+        refetched = []
+        monkeypatch.setattr(pp.PinProxy, "_refetch_swap_token",
+                            lambda self, refused: refetched.append(refused))
+        _A._seed("S", "tok-A")
+        statuses, auths = _A._send(
+            certdir,
+            [dict(bearer="HOST-TOKEN", ua=_DESKTOP_UA,
+                  extra_headers={"x-claude-code-session-id": "S"})],
+            reject_bearer={"tok-A", "tok-B"})
+        assert auths == ["Bearer tok-A", "Bearer tok-B", "Bearer HOST-TOKEN"]
+        assert statuses == [200]
+        assert not refetched, "a followed refusal reached the pinned refetch"
+
+    def case_a_followed_404_is_relayed(self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        self._arm(monkeypatch, certdir)
+        upstream = _FakeUpstream(certdir, reject_bearer="ACTIVE",
+                                 reject_status=404)
+        proxy = self._proxy(certdir, upstream)
+        proxy.start()
+        try:
+            assert self._ask(proxy, certdir) == 404
+            assert upstream.auths_seen == ["Bearer ACTIVE"], (
+                "a 404 is not an account refusal: it was resent")
+            assert pp._follow_counts["taken_back"] == {}
+            assert pp._follow_snap["gen"] == 0
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_a_followed_grant_403_becomes_a_401_and_clears_the_snapshot(
+            self, certdir, monkeypatch):
+        """The grant check runs BEFORE the follow take-back: a grant-shaped
+        403 on the active account is the 401 conversion's (no resend on the
+        host's bearer), and the snapshot is cleared. A 403 that is not
+        grant-shaped is still taken back."""
+        from cswap_pin import proxy as pp
+
+        ctx = self._arm(monkeypatch, certdir)
+        queued, switched = [], []
+
+        def switch(reset, retry_after, auth="", session="", kind="wall"):
+            switched.append((auth, kind))
+            ctx.cell[0] = "NEXT"
+            return True
+
+        monkeypatch.setattr(pp, "_switch_off_walled_account", switch)
+        monkeypatch.setattr(pp, "_switch_takes_refused", lambda: True)
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+        upstream = _FakeUpstream(certdir, reject_bearer="ACTIVE",
+                                 reject_body=_GRANT_403)
+        proxy = self._proxy(certdir, upstream)
+        proxy.start()
+        try:
+            assert self._ask(proxy, certdir) == 401
+            assert upstream.auths_seen == ["Bearer ACTIVE"]
+            assert switched == [("Bearer ACTIVE", "grant")], switched
+            assert pp._follow_snap["token"] is None
+            assert pp._follow_snap["gen"] == 1 and len(queued) == 1
+            queued.pop()()
+            assert pp._follow_snap["token"] == "NEXT"
+        finally:
+            proxy.stop()
+            upstream.stop()
+        ctx.cell[0] = "ACTIVE"
+        self._seed("ACTIVE")
+        upstream = _FakeUpstream(certdir, reject_bearer="ACTIVE",
+                                 reject_body=_OTHER_403)
+        proxy = self._proxy(certdir, upstream)
+        proxy.start()
+        try:
+            assert self._ask(proxy, certdir) == 200
+            assert upstream.auths_seen == ["Bearer ACTIVE", "Bearer HOST-TOKEN"]
+            assert len(switched) == 1, "a 403 that is no grant switched"
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_a_followed_429_wall_clears_the_snapshot(
+            self, certdir, monkeypatch):
+        """The wall moves the active account. A snapshot left holding the
+        walled token would send the retry back onto it."""
+        from cswap_pin import proxy as pp
+
+        ctx = self._arm(monkeypatch, certdir, token="WALLED")
+
+        def switch(reset, retry_after, auth="", session="", kind="wall"):
+            ctx.cell[0] = "NEXT"
+            return True
+
+        monkeypatch.setattr(pp, "_switch_off_walled_account", switch)
+        upstream = _FakeUpstream(
+            certdir, reject_bearer="WALLED", reject_status=429,
+            reject_headers=b"anthropic-ratelimit-unified-reset: 1788925200\r\n")
+        proxy = self._proxy(certdir, upstream)
+        proxy.start()
+        try:
+            assert self._ask(proxy, certdir) == 401
+            assert self._ask(proxy, certdir) == 200
+            assert upstream.auths_seen == ["Bearer WALLED", "Bearer NEXT"]
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_a_read_started_before_a_clear_does_not_land(
+            self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        ctx = self._arm(monkeypatch, certdir, token="OLD", seed=False)
+        monkeypatch.setenv("CSWAP_PIN_INFERENCE_FOLLOWS", "claude-desktop")
+        queued = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+        pp._follow_kick()
+        pp._follow_clear(None)  # the account moved while that read ran
+        assert len(queued) == 2, "the clear did not start a fresh read"
+        queued[0]()
+        assert pp._follow_snap["token"] is None, "a pre-clear read landed"
+        ctx.cell[0] = "NEW"
+        queued[1]()
+        assert pp._follow_snap["token"] == "NEW"
+        pp._follow_snap["tried"] = -math.inf
+        pp._follow_kick()
+        pp._follow_clear(None)
+        ctx.cell[0] = "FRESH"
+        queued[-1]()
+        ctx.cell[0] = "STALE"
+        queued[-2]()
+        assert pp._follow_snap["token"] == "FRESH", (
+            "a read that began before the clear landed after the fresh one")
+
+    def case_health_reports_the_counters_and_writes_no_stats_file(
+            self, certdir, monkeypatch):
+        self._arm(monkeypatch, certdir)
+        upstream = _FakeUpstream(certdir, reject_bearer="ACTIVE")
+        proxy = self._proxy(certdir, upstream)
+        proxy.start()
+        try:
+            assert self._ask(proxy, certdir) == 200
+            assert self._ask(proxy, certdir, bearer="CLI-TOKEN",
+                             ua=_CLI_UA) == 200
+            health = _health_of(proxy)
+        finally:
+            proxy.stop()
+            upstream.stop()
+        assert health["entrypoints"] == ["claude-desktop"]
+        assert health["swapped"] == 1 and health["taken_back"] == {"403": 1}
+        assert health["since"] and health["snapshot"]["failures"] == 0
+        assert isinstance(health["snapshot"]["age_s"], float)
+        assert not list(certdir.glob("inference-follow*")), (
+            "a counter was written to a file")
+
+
+# ---------------------------------------------------------------------------
+# claude.ai connectors follow the pin (opt-in): the list on api.anthropic.com
+# and the calls on mcp-proxy.anthropic.com go out as the same account.
+# ---------------------------------------------------------------------------
+
+_MCP_HOST = "mcp-proxy.anthropic.com"
+
+
+class TestConnectorsFollowPin:
+    """Claude Code lists connectors with `GET /v1/mcp_servers` and calls one at
+    `mcp-proxy.anthropic.com/v1/mcp/<server_id>`, both on the OAuth bearer; the
+    id comes from the list, so the two must be one account. Off by default:
+    nothing about either host changes until the switch is turned on."""
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    @staticmethod
+    def _proxy(certdir, upstream, token="PINNED"):
+        from cswap_pin.proxy import PinProxy
+
+        return PinProxy(certdir=certdir, pin_token_provider=lambda: token,
+                        upstream=("127.0.0.1", upstream.port))
+
+    @staticmethod
+    def _via_mcp_proxy(monkeypatch, upstream):
+        """mcp-proxy's dial lands on the fake; what the pin asked to dial is
+        returned, so a case can say it was the real host."""
+        from cswap_pin import proxy as pp
+
+        dialled = []
+        monkeypatch.setattr(
+            pp, "_dial_with_no_chain",
+            lambda target, timeout=15: (
+                dialled.append(target),
+                socket.create_connection(("127.0.0.1", upstream.port),
+                                         timeout=10))[1])
+        return dialled
+
+    def case_off_the_list_keeps_the_active_bearer(self, certdir, monkeypatch):
+        monkeypatch.delenv("CSWAP_PIN_CONNECTORS_FOLLOW_PIN", raising=False)
+        upstream = _FakeUpstream(certdir)
+        proxy = self._proxy(certdir, upstream)
+        proxy.start()
+        try:
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem",
+                "/v1/mcp_servers?limit=1000&include_additional_installs=true",
+                bearer="ACTIVE", method="GET")
+        finally:
+            proxy.stop()
+            upstream.stop()
+        assert status == 200 and upstream.auths_seen == ["Bearer ACTIVE"]
+
+    def case_on_the_list_goes_out_as_the_pin_and_only_that_path(
+            self, certdir, monkeypatch):
+        monkeypatch.setenv("CSWAP_PIN_CONNECTORS_FOLLOW_PIN", "1")
+        upstream = _FakeUpstream(certdir)
+        proxy = self._proxy(certdir, upstream)
+        proxy.start()
+        try:
+            for path in ("/v1/mcp_servers", "/v1/mcp_servers?limit=1000",
+                         "/v1/mcp_serversX", "/v1/mcp_server",
+                         "/v1/mcp_servers/abc"):
+                _request_through_proxy(proxy.port, certdir / "ca.pem", path,
+                                       bearer="ACTIVE", method="GET")
+        finally:
+            proxy.stop()
+            upstream.stop()
+        assert upstream.auths_seen == ["Bearer PINNED"] * 2 + [
+            "Bearer ACTIVE"] * 3
+
+    def case_off_mcp_proxy_is_the_blind_tunnel(self, certdir, monkeypatch):
+        monkeypatch.delenv("CSWAP_PIN_CONNECTORS_FOLLOW_PIN", raising=False)
+        upstream = _FakeUpstream(certdir)
+        proxy = self._proxy(certdir, upstream)
+        tunnelled = []
+        proxy._capped_tunnel = lambda target, conn: (
+            tunnelled.append(target), conn.close())
+        proxy.start()
+        try:
+            raw = socket.create_connection(("127.0.0.1", proxy.port),
+                                           timeout=10)
+            raw.sendall(f"CONNECT {_MCP_HOST}:443 HTTP/1.1\r\n"
+                        f"Host: {_MCP_HOST}:443\r\n\r\n".encode())
+            assert raw.recv(4096) == b""  # the stub closed it, nothing MITM'd
+            raw.close()
+        finally:
+            proxy.stop()
+            upstream.stop()
+        assert tunnelled == [f"{_MCP_HOST}:443"]
+
+    def case_on_mcp_proxy_calls_carry_the_pinned_bearer(
+            self, certdir, monkeypatch):
+        monkeypatch.setenv("CSWAP_PIN_CONNECTORS_FOLLOW_PIN", "on")
+        upstream = _FakeUpstream(certdir)
+        proxy = self._proxy(certdir, upstream)
+        dialled = self._via_mcp_proxy(monkeypatch, upstream)
+        proxy.start()
+        try:
+            for path in ("/v1/mcp/srv_01", "/v1/mcp/srv_01?x=1",
+                         "/v1/other"):
+                status = _request_through_proxy(
+                    proxy.port, certdir / "ca.pem", path, bearer="ACTIVE",
+                    host=_MCP_HOST)
+                assert status == 200, path
+        finally:
+            proxy.stop()
+            upstream.stop()
+        assert dialled == [(_MCP_HOST, 443)] * 3
+        assert upstream.auths_seen == ["Bearer PINNED"] * 2 + [
+            "Bearer ACTIVE"], "only the calls under /v1/mcp/ are swapped"
+        assert all(f"Host: {_MCP_HOST}" in h for h in upstream.heads_seen)
+        assert upstream.heads_seen[0].startswith("POST /v1/mcp/srv_01 ")
+
+    def case_on_without_a_pin_token_mcp_proxy_relays_untouched(
+            self, certdir, monkeypatch):
+        """No token to swap, a stalled mint included: the call goes out as it
+        came (never a 503 of our own), and nothing marks the pin unpinnable."""
+        monkeypatch.setenv("CSWAP_PIN_CONNECTORS_FOLLOW_PIN", "1")
+        upstream = _FakeUpstream(certdir)
+        stalled = lambda: None  # noqa: E731
+        stalled.mint_stalled = lambda: True
+        proxy = self._proxy(certdir, upstream)
+        self._via_mcp_proxy(monkeypatch, upstream)
+        proxy.start()
+        try:
+            for provider in (stalled, lambda: None):
+                proxy._pin_token_provider = provider
+                assert _request_through_proxy(
+                    proxy.port, certdir / "ca.pem", "/v1/mcp/srv_01",
+                    bearer="ACTIVE", host=_MCP_HOST) == 200
+        finally:
+            proxy.stop()
+            upstream.stop()
+        assert upstream.auths_seen == ["Bearer ACTIVE"] * 2
+        assert not getattr(proxy, "_warned_unpinnable", False)
+
+    def case_on_an_event_stream_from_mcp_proxy_passes_through(
+            self, certdir, monkeypatch):
+        monkeypatch.setenv("CSWAP_PIN_CONNECTORS_FOLLOW_PIN", "1")
+        events = b"event: message\ndata: {\"id\":1}\n\nevent: message\ndata: {\"id\":2}\n\n"
+        upstream = _FakeUpstream(certdir, reply=(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+            b"Cache-Control: no-cache\r\n\r\n" + events))
+        proxy = self._proxy(certdir, upstream)
+        self._via_mcp_proxy(monkeypatch, upstream)
+        body, hdrs = [], {}
+        proxy.start()
+        try:
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem", "/v1/mcp/srv_01",
+                bearer="ACTIVE", host=_MCP_HOST, body_out=body,
+                headers_out=hdrs)
+        finally:
+            proxy.stop()
+            upstream.stop()
+        assert status == 200 and body == [events]
+        assert hdrs["content-type"] == "text/event-stream"
+
+    @staticmethod
+    def _stale_then_fresh_provider(certdir, monkeypatch):
+        """The real provider over a store whose first read is a stale token
+        and every later one a fresh one: the rotated-under-the-cache shape
+        `_refetch_swap_token` exists for."""
+        import cswap_pin.proxy as pp
+
+        monkeypatch.setattr(
+            pp, "pin_profile_for",
+            lambda token: {"emailAddress": "pin@example.com"})
+        pp.save_pin(certdir, "pin@example.com", "org")
+        return pp.make_pin_token_provider(
+            _refetch_switcher(
+                certdir,
+                lambda n: "stale-token" if n == 1 else "fresh-token"),
+            "2", "pin@example.com")
+
+    def case_a_refused_connector_route_never_falls_back_to_the_active_account(
+            self, certdir, monkeypatch):
+        """THE ARTIFACT SHAPE (T1592, T1596), on the list and on an mcp-proxy
+        call: 404 is "session expired" and 401 "needs re-auth" in MCP
+        streamable HTTP, and the id came from the pinned account's list, so
+        the take-back every other pinned route keeps (4e8fcd3) is never the
+        answer. A refused pin is refetched ONCE, then sent again as the pin,
+        and every bearer the upstream sees is a pinned one. The client gets the
+        pin's status, a 401 as a 403 (a relayed 401 makes Claude Code refresh
+        the ACTIVE account's token). The log names the connector path, not an
+        artifact one. A refetched token the upstream accepts is the answer."""
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import PinProxy
+
+        monkeypatch.setenv("CSWAP_PIN_CONNECTORS_FOLLOW_PIN", "1")
+        both = {"stale-token", "fresh-token"}
+        routes = [  # method, host, asked, as logged
+            ("GET", "api.anthropic.com", "/v1/mcp_servers?limit=1000",
+             "/v1/mcp_servers"),
+            ("POST", _MCP_HOST, "/v1/mcp/srv_01", "/v1/mcp/srv_01"),
+        ]
+        stale, fresh = "Bearer stale-token", "Bearer fresh-token"
+        rows = [  # refused code, refused bearers, client status, auths, outcomes
+            (403, both, 403, [stale, fresh, fresh],
+             ["retried-fresh", "relayed as the pin"]),
+            (404, both, 404, [stale, fresh, fresh],
+             ["retried-fresh", "relayed as the pin"]),
+            (401, both, 403, [stale, fresh],
+             ["retried-fresh", "relayed as the pin as 403"]),
+            (401, {"stale-token"}, 200, [stale, fresh], ["retried-fresh"]),
+        ]
+        for method, host, asked, logged in routes:
+            for code, refused, want, auths, outcomes in rows:
+                upstream = _FakeUpstream(certdir, reject_bearer=refused,
+                                         reject_status=code)
+                proxy = PinProxy(
+                    certdir=certdir,
+                    pin_token_provider=self._stale_then_fresh_provider(
+                        certdir, monkeypatch),
+                    upstream=("127.0.0.1", upstream.port))
+                self._via_mcp_proxy(monkeypatch, upstream)
+                lines = []
+                monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
+                proxy.start()
+                try:
+                    status = _request_through_proxy(
+                        proxy.port, certdir / "ca.pem", asked,
+                        bearer="ACTIVE", method=method, host=host)
+                finally:
+                    proxy.stop()
+                    upstream.stop()
+                row = (method, host, code, sorted(refused))
+                assert status == want, (row, status)
+                assert upstream.auths_seen == auths, (row, upstream.auths_seen)
+                assert [ln for ln in lines if ln.startswith("swap refused")
+                        ] == [f"swap refused ({code}) on {method} {logged}: {o}"
+                              for o in outcomes], (row, lines)
+
+    def case_an_absolute_form_refused_connector_list_never_falls_back(
+            self, certdir, monkeypatch):
+        """The absolute-form twin (`_plain_relay_request`, Claude Code through
+        an HTTPS proxy it does not CONNECT through): the same artifact shape.
+        Refetched once, sent again as the pin, a 401 answered 403 from here,
+        and no request carrying the arrived (active) bearer reaches the hop."""
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        monkeypatch.setenv("CSWAP_PIN_CONNECTORS_FOLLOW_PIN", "1")
+        for code, want, sent, outcomes in (
+                (403, b"403", 3, ["retried-fresh", "relayed as the pin"]),
+                (404, b"404", 3, ["retried-fresh", "relayed as the pin"]),
+                (401, b"403", 2,
+                 ["retried-fresh", "relayed as the pin as 403"])):
+            chain = _RecordingChain(
+                lambda req: (b"HTTP/1.1 %d X\r\nContent-Length: 0\r\n\r\n"
+                             % code if (b"Bearer stale-token" in req
+                                        or b"Bearer fresh-token" in req) else
+                             b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"))
+            lines = []
+            monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
+            write_upstream_hint(certdir, f"http://127.0.0.1:{chain.port}")
+            proxy = PinProxy(
+                certdir=certdir,
+                pin_token_provider=self._stale_then_fresh_provider(
+                    certdir, monkeypatch),
+                rediscover_chain=True)
+            proxy.start()
+            try:
+                c = socket.create_connection(("127.0.0.1", proxy.port),
+                                             timeout=10)
+                try:
+                    c.sendall(
+                        b"GET https://api.anthropic.com/v1/mcp_servers"
+                        b"?limit=1000 HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                        b"Authorization: Bearer ACTIVE\r\n\r\n")
+                    got = c.recv(256)
+                finally:
+                    c.close()
+            finally:
+                proxy.stop()
+                chain.stop()
+            assert got.startswith(b"HTTP/1.1 " + want), (code, got[:60])
+            assert len(chain.seen) == sent and not any(
+                b"ACTIVE" in r for r in chain.seen), (code, chain.seen)
+            assert b"Bearer fresh-token" in chain.seen[1], code
+            assert [ln for ln in lines if ln.startswith("swap refused")
+                    ] == [f"swap refused ({code}) on GET /v1/mcp_servers: {o}"
+                          for o in outcomes], (code, lines)
+
+    def case_off_a_refused_list_is_unchanged(self, certdir, monkeypatch):
+        """THE CONTROL: switch off, the list is no pinned route. It goes out as
+        the active account, once, and the account's own answer comes back with
+        no `swap refused` line."""
+        import cswap_pin.proxy as pp
+
+        monkeypatch.delenv("CSWAP_PIN_CONNECTORS_FOLLOW_PIN", raising=False)
+        upstream = _FakeUpstream(certdir, reject_bearer="ACTIVE",
+                                 reject_status=403)
+        proxy = self._proxy(certdir, upstream)
+        lines = []
+        monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
+        proxy.start()
+        try:
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem", "/v1/mcp_servers?limit=1000",
+                bearer="ACTIVE", method="GET")
+        finally:
+            proxy.stop()
+            upstream.stop()
+        assert status == 403 and upstream.auths_seen == ["Bearer ACTIVE"]
+        assert not [ln for ln in lines if ln.startswith("swap refused")], lines
+
+    def case_an_mcp_proxy_5xx_is_not_evidence_about_the_pins_hop(
+            self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        monkeypatch.setenv("CSWAP_PIN_CONNECTORS_FOLLOW_PIN", "1")
+        upstream = _FakeUpstream(certdir, reply=(
+            b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"))
+        proxy = self._proxy(certdir, upstream)
+        self._via_mcp_proxy(monkeypatch, upstream)
+        proxy.start()
+        try:
+            ask = lambda host, path: _request_through_proxy(  # noqa: E731
+                proxy.port, certdir / "ca.pem", path, bearer="ACTIVE",
+                host=host)
+            assert ask(_MCP_HOST, "/v1/mcp/srv_01") == 502
+            assert pp._hop_trouble_at == 0.0, "mcp-proxy's 5xx marked the hop"
+            assert ask("api.anthropic.com", "/v1/messages") == 502
+            assert pp._hop_trouble_at, "premise: api.anthropic.com's does"
+        finally:
+            proxy.stop()
+            upstream.stop()

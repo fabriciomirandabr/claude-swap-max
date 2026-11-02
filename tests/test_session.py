@@ -405,6 +405,29 @@ class TestBootstrap:
         assert (session_dir / ".credentials.json").read_text() == CREDS
         assert "Could not refresh" in capsys.readouterr().out
 
+    def test_a_refresh_in_flight_on_the_slot_refuses_to_seed_the_profile(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch
+    ):
+        """`consume-busy` means another gate has the backup's refresh token on
+        the wire. Falling through to "continue with the stored credentials"
+        seeds the profile with the grant being spent, and claude's first
+        refresh gets invalid_grant."""
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "consume_backup_grant",
+            lambda self, num, email, snap: oauth.RefreshOutcome(
+                None, "consume-busy"
+            ),
+        )
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+
+        with pytest.raises(SessionError, match="refresh in flight"):
+            manager.setup_session("2", share=False)
+
+        seeded = session_dir / ".credentials.json"
+        assert not seeded.exists() or seeded.read_text() != CREDS
+
     def test_setup_token_account_skips_refresh_silently(
         self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch, capsys
     ):

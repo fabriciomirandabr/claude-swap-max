@@ -338,7 +338,7 @@ Swapping accounts moves *everything*, including things that are not inference:
 
 Chrome needs no setup beyond `cswap pin <n>`. Spend follows the session's active account; the pinned account only identifies the browser. Measured on 01/10/2026: driving Chrome from another account left the pinned account's 5-hour window at 0%.
 
-Chrome limits: proven with Claude Code 2.1.287. Anthropic does not document the browser bridge, so a Claude Code update can change it. The proxy intercepts only `bridge.claudeusercontent.com:443`; with no pin, no pinned token or a TLS failure it falls back to a plain tunnel (the old behaviour), and two refused connections in a row leave the bridge untouched for 15 minutes. Details in `vendor/cswap-pin/src/cswap_pin/proxy.py` (`_CHROME_BRIDGE_*`) and the commit message of `8a4268a`.
+Chrome limits: proven with Claude Code 2.1.287. Anthropic does not document the browser bridge, so a Claude Code update can change it. The proxy intercepts only `bridge.claudeusercontent.com:443`, and on that host rewrites only the `oauth_token` in the connect frame of the `/chrome/` WebSocket upgrade (everything else on the host is relayed unchanged); with no pin or no pinned token it opens a plain capped tunnel instead. This is cswap-pin's own Chrome bridge (`_chrome_bridge` in `vendor/cswap-pin/src/cswap_pin/proxy.py`, described in `vendor/cswap-pin/README.md`).
 
 The pin keeps those on one account of your choosing while `cswap switch` / [`cswap auto`](#automatic-switching) keep steering inference. `/v1/messages` is never touched, so usage still bills the account you swapped onto.
 
@@ -364,7 +364,7 @@ If the pin's daemon dies, `.claude.json` keeps naming its dead port and every ne
 
 Agent shells inherit the proxy variables; if a tool complains about the local CA, add `set -e HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy NODE_EXTRA_CA_CERTS` to your fish config (or the `unset` equivalent in `~/.zshenv`). Claude Code keeps the pin, the agents don't see it.
 
-Implemented in [cswap-pin](https://github.com/codeslake/cswap-pin) (Junyong Lee / codeslake, MIT), vendored in this fork as version 0.1.306.1 with the Chrome patch.
+Implemented in [cswap-pin](https://github.com/codeslake/cswap-pin) (Junyong Lee / codeslake, MIT), vendored in this fork as version 0.1.395.1 with the rate-limit hold patch.
 
 </details>
 

@@ -30,7 +30,9 @@ throws it away.
 import json
 import re
 import pathlib
+import signal
 import sys
+import threading
 import warnings
 
 import pytest
@@ -251,6 +253,7 @@ def _redirect_everything_to(tmp_path, monkeypatch):
     for name in ("CSWAP_PIN_PORT", "CSWAP_PIN_WIRED", "CSWAP_PIN_FIFO",
                  "CSWAP_PIN_REFCOUNT_FD", "CSWAP_PIN_SELF_HEAL",
                  "CSWAP_PIN_DEBUG", "CSWAP_PIN_SHAPE", "CSWAP_PIN_SLOW_MS",
+                 "CSWAP_PIN_INFERENCE_FOLLOWS", "CSWAP_PIN_CONNECTORS_FOLLOW_PIN",
                  "CSWAP_PIN_LISTEN_FD", "CSWAP_PIN_LISTEN_FROM",
                  # Set BY a case that wants it, never inherited: a developer
                  # who exported it would make every holder in the suite die
@@ -261,7 +264,13 @@ def _redirect_everything_to(tmp_path, monkeypatch):
                  # The standby's hand-down source. Same hazard as the two
                  # LISTEN vars above: a stale value from a shell makes a test
                  # adopt a descriptor that is not the one under test.
-                 "CSWAP_PIN_STANDBY_FROM"):
+                 "CSWAP_PIN_STANDBY_FROM",
+                 # The relocation's opt-in and its marks (T2939): a stale
+                 # RELOCATE from a developer's shell would pull from a
+                 # namespace the case never made, and a stale RELOCATED or
+                 # HANDS_ACROSS would change what `/health` publishes.
+                 "CSWAP_PIN_RELOCATE", "CSWAP_PIN_RELOCATED",
+                 "CSWAP_PIN_HOLDER_HANDS_ACROSS"):
         monkeypatch.delenv(name, raising=False)
 
     store = tmp_path / "data-home"
@@ -602,7 +611,7 @@ def _reap_pin_processes(certdir, timeout: float = 20.0) -> None:
             out = subprocess.run(["ps", "-ww", "-eo", "pid=,command="],
                                  capture_output=True, text=True, timeout=5).stdout
         except (OSError, subprocess.SubprocessError):
-            return [], []
+            return [], [], []
         standbys, holders, daemons = [], [], []
         for line in out.splitlines():
             pid_s, _, cmd = line.strip().partition(" ")
@@ -660,8 +669,22 @@ def _reap_pin_processes(certdir, timeout: float = 20.0) -> None:
         time.sleep(0.2)
 
 
-def _root_owner_alive(root) -> bool:
+def _pin_standby_pids(certdir) -> list[int]:
+    """Pids of the standbys for ``certdir`` (the LAST argv token), read only."""
+    import subprocess
+
+    out = subprocess.run(["ps", "-ww", "-eo", "pid=,command="],
+                         capture_output=True, text=True, timeout=5).stdout
+    return [int(ln.split()[0]) for ln in out.splitlines()
+            if "cswap_pin.proxy" in ln and f" {_STANDBY_ARG} " in ln
+            and ln.rstrip().endswith(" " + str(certdir))]
+
+
+def _root_owner_alive(root, mark: str = ".lock") -> bool:
     """Whether ``root`` is CLAIMED by a session this sweep must not touch.
+
+    The claim is the pid in ``root/<mark>``: pytest's ``.lock`` by default, or
+    ``short_root``'s own stamp.
 
     Every numbered root pytest makes for a session (``.../pytest-of-<user>/
     pytest-N``) carries a ``.lock`` file stamped with that session's own pid
@@ -700,7 +723,7 @@ def _root_owner_alive(root) -> bool:
     """
     import os
 
-    lock = pathlib.Path(root) / ".lock"
+    lock = pathlib.Path(root) / mark
     try:
         pid = int(lock.read_text().strip())
     except (OSError, ValueError):
@@ -714,6 +737,61 @@ def _root_owner_alive(root) -> bool:
     except Exception:
         return True
     return True
+
+
+_SHORT_ROOT_DIR = "/tmp"
+_OWNER_MARK = ".cswap-pin-test-owner"
+
+
+def short_root() -> pathlib.Path:
+    """A `/tmp/r*` root short enough for an AF_UNIX path, stamped with its creator.
+
+    The stamp is what lets `_sweep_dead_short_roots` tell this suite's root
+    from any other `/tmp/r*` directory (`r1.txt`, `rc-six-gate-hdr-*`): the
+    prefix alone selects nothing.
+    """
+    import os
+    import tempfile
+
+    root = pathlib.Path(tempfile.mkdtemp(prefix="r", dir=_SHORT_ROOT_DIR))
+    (root / _OWNER_MARK).write_text(str(os.getpid()))
+    return root
+
+
+def _sweep_dead_short_roots() -> None:
+    """Reap and remove every stamped short root whose creator is gone.
+
+    `_root_owner_alive` reads a missing or unreadable stamp as owned, so an
+    unstamped directory, or a root whose stamp is still being written, stays.
+    """
+    import shutil
+
+    for root in pathlib.Path(_SHORT_ROOT_DIR).glob("r*"):
+        if _root_owner_alive(root, _OWNER_MARK):
+            continue
+        _reap_pin_processes(root, timeout=5.0)
+        shutil.rmtree(root, ignore_errors=True)
+
+
+_term_seen = False
+
+
+def _unwind_on_term(signum, frame):
+    """SIGTERM unwinds pytest like Ctrl-C, so every test's `finally` runs.
+
+    Python's default SIGTERM exit skips them, and a real-holder case reaps its
+    standbys there (a standby ignores SIGTERM; its pid is on no disk). ONCE:
+    `timeout` delivers TERM twice, and a second raise would land inside the
+    `finally` the first is running and abandon the reap. The second is
+    swallowed and puts the default back, so a hung `finally` still dies to a
+    third.
+    """
+    global _term_seen
+    if _term_seen:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        return
+    _term_seen = True
+    raise KeyboardInterrupt
 
 
 def pytest_sessionstart(session) -> None:
@@ -732,6 +810,7 @@ def pytest_sessionstart(session) -> None:
     (`_root_owner_alive`), which itself fails toward "owned" on anything it
     can't read.
     """
+    signal.signal(signal.SIGTERM, _unwind_on_term)
     # ponytail: two ceilings from that same "fail toward owned" rule, both
     # acceptable: (1) under xdist (this project's default, `-n 4`) each
     # WORKER's own sweep is a no-op — its siblings are unlocked `popen-gw*`
@@ -750,6 +829,10 @@ def pytest_sessionstart(session) -> None:
         if _root_owner_alive(sibling):
             continue
         _reap_pin_processes(sibling, timeout=5.0)
+    # Not under pytest's tree: a case that needs an AF_UNIX path short enough
+    # for macOS roots itself at /tmp/r*, where no sweep looked and a killed
+    # run left its daemons.
+    _sweep_dead_short_roots()
 
 
 def pytest_sessionfinish(session) -> None:
@@ -843,6 +926,21 @@ def run_cases(instance, request, tmp_path_factory, extra=None):
     )
     failures = []
     skipped = []
+
+    def stop_accept_loops():
+        """Stop and join every live proxy accept loop; return those still serving."""
+        import cswap_pin.proxy as pp
+
+        serving = []
+        for t in threading.enumerate():
+            target = getattr(t, "_target", None)
+            if getattr(target, "__func__", None) is pp.PinProxy._accept_loop:
+                if not target.__self__._stop:
+                    serving.append(t)
+                target.__self__._stop = True
+                t.join(timeout=2)
+        return serving
+
     for i, (instance, name, method) in enumerate(work):
         wants = [
             a
@@ -862,6 +960,11 @@ def run_cases(instance, request, tmp_path_factory, extra=None):
 
         with _pp._hop_trouble_lock:
             _pp._hop_trouble_at = 0.0
+        # AND A PROXY ACCEPT LOOP, BEFORE TOO. One that predates this case (a
+        # plain test leaked it; on macOS `_close_sockets_the_test_left_open`
+        # cannot close a listener) would pop `_ADOPTED_BACKLOG` under this case
+        # and then be blamed on it. Stopped here, it can do neither.
+        stop_accept_loops()
         try:
             # The autouse guards ran once for the DRIVER's tmp_path. Re-point
             # them at this case's dir, or a case's config writes land in the
@@ -902,6 +1005,16 @@ def run_cases(instance, request, tmp_path_factory, extra=None):
             failures.append(f"--- {name} ---\n{traceback.format_exc()}")
         finally:
             mp.undo()
+            # A PROXY ACCEPT LOOP STILL SERVING, stopped FIRST: it keeps
+            # popping the module-global `_ADOPTED_BACKLOG` (and accepting on
+            # its socket) under every later case, and a dying loop or its
+            # `_serve_client` threads could rewrite the globals reset below.
+            # `case_adopting_a_socket_does_not_drop_the_client_already_queued_
+            # on_it` read `kept == []` on macOS CI, where all cases share one
+            # process. Fail THIS case, which leaked it. A loop whose `_stop` is
+            # already set is just slow to exit.
+            if stop_accept_loops():
+                failures.append(f"--- {name} ---\nleft a proxy accept loop serving")
             # A MODULE GLOBAL IS OUTSIDE MONKEYPATCH'S REACH, and this one
             # decides how the relay frames replies. `this_process_is_draining`
             # matches the marker BASENAME — the pid — so a drain announced

@@ -982,11 +982,8 @@ class TestConversionsDoNotEatTheClientsRetryBudget:
         assert locked == [False]
 
     def test_a_draining_process_ends_the_hold_at_once(self, pp, monkeypatch):
-        def never_sleep(seconds):
-            raise AssertionError(f"slept {seconds}s while draining")
-
         monkeypatch.setattr(pp, "this_process_is_draining", lambda: True)
-        monkeypatch.setattr(time, "sleep", never_sleep)
+        monkeypatch.setattr(time, "sleep", _never_sleep_on_this_thread())
         pp._test_real_hold_reply(120.0)
 
     def test_a_process_that_starts_draining_mid_hold_stops_sleeping(
@@ -1012,13 +1009,9 @@ class TestConversionsDoNotEatTheClientsRetryBudget:
         self, pp, fleet, monkeypatch,
     ):
         fleet()
-
-        def never_sleep(seconds):
-            raise AssertionError(f"slept {seconds}s while draining")
-
         monkeypatch.setattr(pp, "_hold_reply", pp._test_real_hold_reply)
         monkeypatch.setattr(pp, "this_process_is_draining", lambda: True)
-        monkeypatch.setattr(time, "sleep", never_sleep)
+        monkeypatch.setattr(time, "sleep", _never_sleep_on_this_thread())
         for n in range(4):
             got = self._convert(pp, n)
             assert got.startswith(b"HTTP/1.1 401"), (n, got[:60])
@@ -1077,10 +1070,26 @@ class TestARepeatInsideTheTtlGetsTheWaitingRelayAndASiblingItsOwn401:
             assert got.startswith(b"HTTP/1.1 401"), (session, got[:60])
 
 
+_REAL_SLEEP = time.sleep
+
+
+def _never_sleep_on_this_thread():
+    owner = threading.get_ident()
+
+    def never_sleep(seconds: float) -> None:
+        if threading.get_ident() != owner:
+            _REAL_SLEEP(0.005)
+            return
+        raise AssertionError(f"slept {seconds}s while draining")
+
+    return never_sleep
+
+
 class _VirtualClock:
     def __init__(self) -> None:
         self.t = time.time()
         self.m = 1000.0
+        self._owner = threading.get_ident()
 
     def time(self) -> float:
         return self.t
@@ -1089,6 +1098,9 @@ class _VirtualClock:
         return self.m
 
     def sleep(self, seconds: float) -> None:
+        if threading.get_ident() != self._owner:
+            _REAL_SLEEP(0.005)
+            return
         step = max(seconds, 0.0)
         self.t += step
         self.m += step

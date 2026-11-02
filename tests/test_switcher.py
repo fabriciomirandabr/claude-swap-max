@@ -7759,6 +7759,83 @@ class TestCurrentAtLimitProbe:
         assert "validated" not in result
         assert seen == []
 
+    @staticmethod
+    def _short_lock_waits(monkeypatch):
+        from claude_swap import locking
+
+        monkeypatch.setattr(locking.FileLock.__init__, "__defaults__", (0.3,))
+
+    def test_a_target_whose_grant_is_in_flight_is_skipped_not_landed_on(
+        self, temp_home, monkeypatch
+    ):
+        """A consume on the target's slot holds its refresh token on the wire
+        for up to the POST budget, longer than the gate's own wait. The probe
+        then answers `consume-busy`, which is no verdict on the credential: the
+        old code landed on it, copying the grant being spent into the live
+        login, and the consumer's successor went to the backup only."""
+        from claude_swap.locking import FileLock
+
+        self._short_lock_waits(monkeypatch)
+        s = self._fleet(temp_home)
+        before = s._read_credentials()
+        consumer = FileLock(s.credentials_dir / ".consume-3.lock")
+        assert consumer.acquire()
+        try:
+            result, seen = self._run(
+                s, {"sk-3": [False], "sk-2": [True]}, current_at_limit=True
+            )
+        finally:
+            consumer.release()
+        assert result["to"]["number"] == 2
+        assert result["validated"] is True
+        assert seen == ["sk-3", "sk-2"]
+        assert s._read_credentials() != before
+        assert "sk-3" not in s._read_credentials()
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_a_consume_that_starts_after_the_probe_stops_the_switch(
+        self, temp_home, monkeypatch
+    ):
+        from claude_swap.exceptions import ConsumeInFlightError
+        from claude_swap.locking import FileLock
+
+        self._short_lock_waits(monkeypatch)
+        s = self._fleet(temp_home)
+        before = s._read_credentials()
+        consumer = FileLock(s.credentials_dir / ".consume-3.lock")
+        assert consumer.acquire()
+        try:
+            with patch.object(s, "list_accounts"), \
+                 pytest.raises(ConsumeInFlightError, match="in flight"):
+                s.switch_to("3")
+        finally:
+            consumer.release()
+        assert s._read_credentials() == before
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+
+    def test_every_target_in_flight_is_candidates_exhausted(
+        self, temp_home, monkeypatch
+    ):
+        from claude_swap.locking import FileLock
+
+        self._short_lock_waits(monkeypatch)
+        s = self._fleet(temp_home)
+        consumers = [
+            FileLock(s.credentials_dir / f".consume-{n}.lock") for n in (2, 3)
+        ]
+        for consumer in consumers:
+            assert consumer.acquire()
+        try:
+            result, _ = self._run(
+                s, {"sk-3": [False], "sk-2": [False]}, current_at_limit=True
+            )
+        finally:
+            for consumer in consumers:
+                consumer.release()
+        assert result["switched"] is False
+        assert result["reason"] == "candidates-exhausted"
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+
     def test_no_lock_is_held_while_probing(self, temp_home):
         from claude_swap.locking import FileLock
 
