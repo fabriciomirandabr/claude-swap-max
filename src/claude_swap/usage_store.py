@@ -117,6 +117,10 @@ BACKOFF_CAP_S = 600.0
 # that is behaviour-preserving.
 BACKOFF_MAX_SHIFT = 32
 
+REFUSED_STRIKES = 3
+REFUSED_BACKOFF_S = 1800.0
+REFUSED_ERRORS = frozenset({"http-403", "oauth_not_allowed_for_organization"})
+
 # The usage endpoint enforces a request budget on non-first-party
 # User-Agents (proven 2026-07-11: an idle token, polling alone trips it;
 # poll_policy documents the measured shape — an hour-scale window, exact edge
@@ -590,12 +594,24 @@ def _failure_backoff_s(
     retry_after_s: float | None,
     *,
     rate_limited: bool = True,
+    refused: bool = False,
 ) -> float:
-    """Seconds to stay in backoff after a failed fetch."""
+    """Seconds to stay in backoff after a failed fetch.
+
+    ``refused`` marks a standing refusal (REFUSED_STRIKES consecutive
+    REFUSED_ERRORS on a non-active row) and floors the wait at
+    REFUSED_BACKOFF_S. A 403, or the organization refusal, answers for the
+    identity rather than the moment (a plan that lapsed, an organization
+    policy, a scope the credential lacks), so polling it at the transient cap
+    only spends request budget; 1800s still notices a change within half an
+    hour.
+    """
     computed = min(
         BACKOFF_BASE_S * (2 ** min(max(0, consecutive_failures - 1), BACKOFF_MAX_SHIFT)),
         BACKOFF_CAP_S,
     )
+    if refused:
+        computed = max(computed, REFUSED_BACKOFF_S)
     if retry_after_s is None:
         return computed
     if retry_after_s == 0:
@@ -1117,8 +1133,14 @@ class UsageStore:
         identities: dict[str, Identity],
         claims: dict[str, str] | None = None,
         plans: dict[str, tuple[float | None, float | None]] | None = None,
+        active: frozenset[str] = frozenset(),
     ) -> set[str]:
         """Merge outcomes fenced by the leases that produced them.
+
+        ``active`` names the slots of the live account: a failure recorded for
+        them never takes the REFUSED_BACKOFF_S floor. A floor a slot took while
+        inactive stays in its ``backoffUntil`` until it expires, even if the
+        slot has since become the live account.
 
         A late writer whose lease or slot identity was replaced is ignored
         without touching the newer row. Success and failure are mutually
@@ -1160,6 +1182,7 @@ class UsageStore:
                 row["backoffUntil"] = _rejection_backoff_until(rec.usage, now)
                 row["rejectedFingerprint"] = None
                 row["authDeadStrikes"] = 0  # a success proves the token is alive
+                row["refusedStrikes"] = 0
             else:
                 failures = int(row.get("consecutiveFailures") or 0) + 1
                 row["consecutiveFailures"] = failures
@@ -1168,10 +1191,17 @@ class UsageStore:
                     # Kept across later successes: the poll planner floors the
                     # cadence while a 429 is recent (see UsageEntry.last_429_at).
                     row["last429At"] = now
+                if rec.error in REFUSED_ERRORS:
+                    refused_strikes = int(row.get("refusedStrikes") or 0) + 1
+                else:
+                    refused_strikes = 0
+                row["refusedStrikes"] = refused_strikes
                 row["backoffUntil"] = now + _failure_backoff_s(
                     failures,
                     rec.retry_after_s,
                     rate_limited=rec.error == "http-429",
+                    refused=refused_strikes >= REFUSED_STRIKES
+                    and num not in active,
                 )
                 # Only a permanent-auth failure advances the dead-token count; a
                 # transient error (429/timeout) leaves it as-is — it is no
@@ -1319,6 +1349,7 @@ class UsageStore:
             row["claimId"] = None
             row["claimUntil"] = 0.0
             row["authDeadStrikes"] = 0
+            row["refusedStrikes"] = 0
             row["struckFingerprint"] = None
             row["consecutiveFailures"] = 0
             row["lastError"] = None

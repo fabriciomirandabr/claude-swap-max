@@ -1,4 +1,4 @@
-"""``CredentialStore``: the active-credential read must stay on one profile.
+"""``CredentialStore``: the active credential must stay on one profile.
 
 The identity read honors ``CLAUDE_CONFIG_DIR`` (``paths.get_claude_config_home``)
 while the Keychain read used a hardcoded service name that does not. Pairing one
@@ -11,6 +11,11 @@ session read and capture already use) rather than skipping the Keychain under a
 custom profile. Skipping would trade a wrong answer for a missing one: claude
 writes rotations keychain-only on macOS, so a custom profile frequently has no
 plaintext file at all and would render as "no credentials" while logged in.
+
+The write side has the same split (#206) and is answered the other way round:
+cswap does not author claude's hashed item, so under a custom profile it stops
+writing the unsuffixed one — which belongs to a login it was not asked to touch
+— and seeds the profile's own ``.credentials.json`` instead.
 """
 
 from __future__ import annotations
@@ -21,9 +26,11 @@ from pathlib import Path
 
 import pytest
 
+from claude_swap import macos_keychain
 from claude_swap.credentials import (
     CLAUDE_CODE_KEYCHAIN_SERVICE,
     CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE,
+    SECURITY_SERVICE,
     CredentialStore,
 )
 from claude_swap.models import Platform
@@ -60,6 +67,14 @@ SECURE_PROFILE_CREDS = json.dumps({
     "claudeAiOauth": {
         "accessToken": "sk-secure-profile",
         "refreshToken": "rt-secure-profile",
+        "expiresAt": 9999999999000,
+    }
+})
+
+TARGET_SLOT_CREDS = json.dumps({
+    "claudeAiOauth": {
+        "accessToken": "sk-target-slot",
+        "refreshToken": "rt-target-slot",
         "expiresAt": 9999999999000,
     }
 })
@@ -214,6 +229,218 @@ class TestActiveReadStaysOnOneProfile:
         ]
 
 
+class TestActiveWriteStaysOnOneProfile:
+    """The write has to land in the profile the read resolves, and nowhere else.
+
+    The read was redirected to the active profile's own item while the write
+    kept the fixed ``Claude Code-credentials`` name, so under a custom profile
+    the two halves of the store addressed different accounts (#206).
+    """
+
+    def test_a_write_round_trips_through_the_read_under_a_custom_profile(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, block_real_keychain
+    ):
+        """Write X, read X — the store's most basic contract."""
+        custom = tmp_path / "custom-profile"
+        custom.mkdir()  # keychain-only profile: claude writes rotations there
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+
+        account = macos_keychain.keychain_account_name()
+        block_real_keychain.data[
+            (keychain_service_name(str(custom)), account)
+        ] = CUSTOM_PROFILE_CREDS
+
+        store = CredentialStore(_Host(tmp_path / "backups"))
+        store._write_credentials(TARGET_SLOT_CREDS)
+
+        assert store._read_credentials() == TARGET_SLOT_CREDS
+
+    def test_a_write_under_a_custom_profile_leaves_the_default_login_alone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, block_real_keychain
+    ):
+        """The default profile's Keychain item is another account's only copy.
+
+        The switch backs up the credential it displaces by reading the ACTIVE
+        profile, so the unsuffixed item was never copied anywhere before being
+        overwritten — a refresh token destroyed with nothing to restore from.
+        """
+        custom = tmp_path / "custom-profile"
+        custom.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+
+        account = macos_keychain.keychain_account_name()
+        block_real_keychain.data[
+            (CLAUDE_CODE_KEYCHAIN_SERVICE, account)
+        ] = DEFAULT_PROFILE_CREDS
+        block_real_keychain.data[
+            (keychain_service_name(str(custom)), account)
+        ] = CUSTOM_PROFILE_CREDS
+
+        store = CredentialStore(_Host(tmp_path / "backups"))
+        store._write_credentials(TARGET_SLOT_CREDS)
+
+        assert (
+            block_real_keychain.data.get((CLAUDE_CODE_KEYCHAIN_SERVICE, account))
+            == DEFAULT_PROFILE_CREDS
+        ), "the default profile's login was overwritten by another profile's switch"
+
+    def test_a_custom_profile_gets_a_seed_file_with_no_item_shadowing_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, block_real_keychain
+    ):
+        """Claude reads its hashed item before the seed, so leaving the profile's
+        own item in place would keep serving the outgoing account however
+        correct the seed is — the switch has to retire it and reseed."""
+        custom = tmp_path / "custom-profile"
+        custom.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+
+        account = macos_keychain.keychain_account_name()
+        hashed = keychain_service_name(str(custom))
+        block_real_keychain.data[(hashed, account)] = CUSTOM_PROFILE_CREDS
+
+        store = CredentialStore(_Host(tmp_path / "backups"))
+        store._write_credentials(TARGET_SLOT_CREDS)
+
+        seed = custom / ".credentials.json"
+        assert seed.read_text(encoding="utf-8") == TARGET_SLOT_CREDS
+        assert (hashed, account) not in block_real_keychain.data
+        assert store._last_active_credentials_backend == "file"
+
+    def test_config_dir_equal_to_the_default_does_not_write_the_unsuffixed_item(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, block_real_keychain
+    ):
+        """Claude hashes whatever is exported, so an explicit ``CLAUDE_CONFIG_DIR``
+        naming the default profile reads the hashed item first. The unsuffixed
+        item survives as the read's compatibility fallback, which must not be
+        mistaken for "this environment's store"."""
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        default = tmp_path / ".claude"
+        default.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(default))
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+
+        account = macos_keychain.keychain_account_name()
+        block_real_keychain.data[
+            (keychain_service_name(str(default)), account)
+        ] = DEFAULT_PROFILE_CREDS
+
+        store = CredentialStore(_Host(tmp_path / "backups"))
+        store._write_credentials(TARGET_SLOT_CREDS)
+
+        assert store._read_credentials() == TARGET_SLOT_CREDS
+        assert (CLAUDE_CODE_KEYCHAIN_SERVICE, account) not in block_real_keychain.data
+
+    def test_the_default_profile_still_writes_the_unsuffixed_item(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, block_real_keychain
+    ):
+        """The common case is unchanged: with no ``CLAUDE_CONFIG_DIR`` the
+        unsuffixed item IS this environment's store, so the Keychain stays the
+        primary backend and no plaintext credential appears on disk."""
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        (tmp_path / ".claude").mkdir(exist_ok=True)
+
+        account = macos_keychain.keychain_account_name()
+        store = CredentialStore(_Host(tmp_path / "backups"))
+        store._write_credentials(TARGET_SLOT_CREDS)
+
+        assert (
+            block_real_keychain.data[(CLAUDE_CODE_KEYCHAIN_SERVICE, account)]
+            == TARGET_SLOT_CREDS
+        )
+        assert store._last_active_credentials_backend == "keychain"
+        assert not (tmp_path / ".claude" / ".credentials.json").exists()
+
+
+class TestCustomProfileFileSeedDoesNotMoveTheBackupBackend:
+    """Seeding a custom profile's file is the profile's choice, not a Keychain
+    failure, so it must not change where per-account backups are written."""
+
+    def test_backups_stay_in_the_keychain_after_a_custom_profile_write(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, block_real_keychain
+    ):
+        custom = tmp_path / "custom-profile"
+        custom.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+
+        account = macos_keychain.keychain_account_name()
+        hashed = keychain_service_name(str(custom))
+        block_real_keychain.data[(hashed, account)] = CUSTOM_PROFILE_CREDS
+
+        host = _Host(tmp_path / "backups")
+        store = CredentialStore(host)
+        store._write_credentials(TARGET_SLOT_CREDS)
+
+        assert (custom / ".credentials.json").read_text(
+            encoding="utf-8"
+        ) == TARGET_SLOT_CREDS
+        assert not store._uses_file_backup_backend()
+        assert not store._keychain_unreadable
+
+        store._write_account_credentials("1", "a@example.com", CUSTOM_PROFILE_CREDS)
+
+        assert not store._backup_enc_path("1", "a@example.com").exists()
+        assert (
+            block_real_keychain.data[
+                (SECURITY_SERVICE, store._backup_username("1", "a@example.com"))
+            ]
+            == CUSTOM_PROFILE_CREDS
+        )
+
+    def test_the_active_read_returns_the_seed_after_a_custom_profile_write(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, block_real_keychain
+    ):
+        custom = tmp_path / "custom-profile"
+        custom.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+
+        account = macos_keychain.keychain_account_name()
+        block_real_keychain.data[
+            (keychain_service_name(str(custom)), account)
+        ] = CUSTOM_PROFILE_CREDS
+
+        store = CredentialStore(_Host(tmp_path / "backups"))
+        store._write_credentials(TARGET_SLOT_CREDS)
+
+        result = store._read_active_credentials()
+        assert result.value == TARGET_SLOT_CREDS
+        assert not result.degraded
+
+    def test_a_failed_delete_of_the_profile_item_is_a_keychain_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, block_real_keychain
+    ):
+        """The profile's own item survives and claude reads it before the seed,
+        so the file is not the authority. That is a Keychain op that failed:
+        routing drops to file mode and the active read is degraded."""
+        custom = tmp_path / "custom-profile"
+        custom.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+
+        account = macos_keychain.keychain_account_name()
+        hashed = keychain_service_name(str(custom))
+        block_real_keychain.data[(hashed, account)] = CUSTOM_PROFILE_CREDS
+
+        def failing_delete(service: str, account: str) -> None:
+            raise macos_keychain.KeychainError("locked")
+
+        monkeypatch.setattr(macos_keychain, "delete_password", failing_delete)
+
+        store = CredentialStore(_Host(tmp_path / "backups"))
+        store._write_credentials(TARGET_SLOT_CREDS)
+
+        assert (hashed, account) in block_real_keychain.data
+        assert store._keychain_unreadable
+        assert store._uses_file_backup_backend()
+        assert store._read_active_credentials().degraded
+
+
 class TestSecureStorageOverride:
     """``CLAUDE_SECURESTORAGE_CONFIG_DIR`` takes precedence when *defined*.
 
@@ -244,6 +471,40 @@ class TestSecureStorageOverride:
         store = CredentialStore(_Host(tmp_path / "backups"))
         assert store._read_active_credentials().value == DEFAULT_PROFILE_CREDS
         assert seen == [CLAUDE_CODE_KEYCHAIN_SERVICE]
+
+    def test_an_active_write_lands_in_the_secure_store_and_nowhere_else(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, block_real_keychain
+    ):
+        """The write resolves the plaintext file by the same criterion as the
+        Keychain item: a defined, non-empty override names the only store
+        claude reads, so the default profile's file and item stay untouched
+        and the secure store ends up holding the new credential."""
+        default_home = Path.home() / ".claude"
+        default_home.mkdir(parents=True, exist_ok=True)
+        secure = tmp_path / "secure-profile"
+        secure.mkdir()
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(secure))
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+        account = macos_keychain.keychain_account_name()
+        hashed = keychain_service_name(str(secure))
+        block_real_keychain.data[(hashed, account)] = SECURE_PROFILE_CREDS
+        block_real_keychain.data[
+            (CLAUDE_CODE_KEYCHAIN_SERVICE, account)
+        ] = DEFAULT_PROFILE_CREDS
+
+        store = CredentialStore(_Host(tmp_path / "backups"))
+        store._write_credentials(TARGET_SLOT_CREDS)
+
+        assert not (default_home / ".credentials.json").exists()
+        assert (
+            block_real_keychain.data[(CLAUDE_CODE_KEYCHAIN_SERVICE, account)]
+            == DEFAULT_PROFILE_CREDS
+        )
+        assert store._read_credentials() == TARGET_SLOT_CREDS
+        seed = secure / ".credentials.json"
+        assert seed.read_text(encoding="utf-8") == TARGET_SLOT_CREDS
+        assert (hashed, account) not in block_real_keychain.data
 
     def test_defined_and_set_selects_that_stores_hashed_item(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

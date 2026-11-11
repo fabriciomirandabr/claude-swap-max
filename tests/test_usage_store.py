@@ -12,6 +12,8 @@ from claude_swap.usage_store import (
     BACKOFF_CAP_S,
     CLAIM_TTL_S,
     RATE_LIMIT_TRUST_MAX_AGE_S,
+    REFUSED_BACKOFF_S,
+    REFUSED_STRIKES,
     SERVE_TTL_S,
     STALE_OK_S,
     TRUST_MAX_AGE_S,
@@ -316,6 +318,105 @@ class TestBackoff:
 
     def test_backoff_cap(self):
         assert usage_store._failure_backoff_s(50, None) == BACKOFF_CAP_S
+
+    def test_a_standing_refusal_backs_off_past_the_cap(self):
+        assert usage_store._failure_backoff_s(50, None, refused=True) == (
+            REFUSED_BACKOFF_S
+        )
+        assert usage_store._failure_backoff_s(50, None) == BACKOFF_CAP_S
+
+    def test_the_refusal_floor_stays_inside_the_park_bound(self):
+        assert "http-429" not in usage_store.REFUSED_ERRORS
+        for ask in (None, 0.0, 300.0, 3600.0, 99999.0):
+            wait = usage_store._failure_backoff_s(
+                50, ask, rate_limited=False, refused=True
+            )
+            assert REFUSED_BACKOFF_S <= wait <= TRUST_MAX_AGE_S, (
+                f"ask={ask} left the park bound"
+            )
+
+    def test_the_organization_refusal_is_a_standing_refusal(self):
+        assert "oauth_not_allowed_for_organization" in usage_store.REFUSED_ERRORS
+
+    @pytest.mark.parametrize("error", ["http-403", "oauth_not_allowed_for_organization"])
+    def test_the_third_consecutive_refusal_takes_the_floor(self, store, clock, error):
+        for n in range(1, REFUSED_STRIKES + 1):
+            store.record({"1": FetchRecord(error=error)}, IDENT)
+            entry = store.entries(IDENT)["1"]
+            if n < REFUSED_STRIKES:
+                assert entry.backoff_until == pytest.approx(
+                    clock.now + BACKOFF_BASE_S * 2 ** (n - 1)
+                )
+            clock.advance(1)
+        assert entry.backoff_until == pytest.approx(clock.now - 1 + REFUSED_BACKOFF_S)
+
+    def test_other_failures_before_a_refusal_do_not_count_as_strikes(
+        self, store, clock
+    ):
+        store.record({"1": FetchRecord(error="timeout")}, IDENT)
+        store.record({"1": FetchRecord(error="timeout")}, IDENT)
+        store.record({"1": FetchRecord(error="http-403")}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        assert entry.consecutive_failures == REFUSED_STRIKES
+        assert entry.backoff_until == pytest.approx(clock.now + BACKOFF_BASE_S * 4)
+        assert entry.backoff_until - clock.now < REFUSED_BACKOFF_S
+
+    def test_a_different_failure_between_refusals_restarts_the_strikes(
+        self, store, clock
+    ):
+        store.record({"1": FetchRecord(error="http-403")}, IDENT)
+        store.record({"1": FetchRecord(error="http-403")}, IDENT)
+        store.record({"1": FetchRecord(error="timeout")}, IDENT)
+        store.record({"1": FetchRecord(error="http-403")}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        assert entry.consecutive_failures == REFUSED_STRIKES + 1
+        assert entry.backoff_until == pytest.approx(clock.now + BACKOFF_BASE_S * 8)
+        assert entry.backoff_until - clock.now < REFUSED_BACKOFF_S
+
+    def test_a_row_without_refused_strikes_counts_from_zero(self, store, clock):
+        store.record({"1": FetchRecord(error="timeout")}, IDENT)
+        rows = store._read_rows()
+        del rows["1"]["refusedStrikes"]
+        store._write_rows(rows)
+        store.record({"1": FetchRecord(error="http-403")}, IDENT)
+        assert store._read_rows()["1"]["refusedStrikes"] == 1
+
+    def test_the_active_account_never_takes_the_refusal_floor(self, store, clock):
+        for _ in range(REFUSED_STRIKES + 4):
+            store.record(
+                {"1": FetchRecord(error="http-403")}, IDENT, active=frozenset({"1"})
+            )
+        entry = store.entries(IDENT)["1"]
+        assert entry.backoff_until == pytest.approx(clock.now + BACKOFF_CAP_S)
+        store.record({"1": FetchRecord(error="http-403")}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        assert entry.backoff_until == pytest.approx(clock.now + REFUSED_BACKOFF_S)
+
+    def test_a_refused_row_is_not_quarantined_as_a_dead_token(self, store, clock):
+        for _ in range(REFUSED_STRIKES + 1):
+            store.record({"1": FetchRecord(error="http-403")}, IDENT)
+            clock.advance(REFUSED_BACKOFF_S + 1)
+        entry = store.entries(IDENT)["1"]
+        assert entry.auth_dead_strikes == 0
+        assert not entry.token_dead()
+
+    def test_clearing_a_dead_token_restarts_the_refusal_strikes(self, store, clock):
+        for _ in range(REFUSED_STRIKES):
+            store.record({"1": FetchRecord(error="http-403")}, IDENT)
+        store.clear_dead_token(["1"], IDENT)
+        store.record({"1": FetchRecord(error="http-403")}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        assert entry.backoff_until == pytest.approx(clock.now + BACKOFF_BASE_S)
+
+    def test_a_success_lifts_the_refusal_floor(self, store, clock):
+        for _ in range(REFUSED_STRIKES):
+            store.record({"1": FetchRecord(error="http-403")}, IDENT)
+            clock.advance(REFUSED_BACKOFF_S + 1)
+        store.record({"1": FetchRecord(usage={})}, IDENT)
+        assert store.entries(IDENT)["1"].consecutive_failures == 0
+        store.record({"1": FetchRecord(error="http-403")}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        assert entry.backoff_until == pytest.approx(clock.now + BACKOFF_BASE_S)
 
     def test_huge_failure_count_does_not_overflow(self):
         # A permanently failing account increments consecutiveFailures forever;

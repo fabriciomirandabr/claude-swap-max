@@ -5198,6 +5198,55 @@ class TestDeadTokenQuarantine:
             "bound"
         )
 
+    def test_refusal_floor_skips_the_active_account_through_the_collector(
+        self, temp_home
+    ):
+        from claude_swap.usage_store import (
+            BACKOFF_CAP_S,
+            REFUSED_BACKOFF_S,
+            REFUSED_STRIKES,
+            FetchRecord,
+        )
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        store = switcher._usage_store
+        clock = {"now": time.time()}
+        store.clock = lambda: clock["now"]
+        live = json.dumps({"claudeAiOauth": {
+            "accessToken": "at", "refreshToken": "rt",
+            "expiresAt": (clock["now"] + 86400 * 30) * 1000,
+        }})
+        info = [
+            (1, "active@example.com", "Org", "", True, live, ""),
+            (2, "idle@example.com", "Org", "", False, live, ""),
+        ]
+        ident = {
+            "1": ("active@example.com", ""),
+            "2": ("idle@example.com", ""),
+        }
+        refusal = {
+            "1": FetchRecord(error="http-403"),
+            "2": FetchRecord(error="http-403"),
+        }
+        for _ in range(REFUSED_STRIKES):
+            if store.path.exists():
+                with store.path.open() as fh:
+                    table = json.load(fh)
+                for row in table["accounts"].values():
+                    row["backoffUntil"] = None
+                store.path.write_text(json.dumps(table))
+            with patch.object(
+                switcher, "_run_usage_fetches", return_value=refusal
+            ) as run:
+                switcher._collect_usage_entries(info, fetch={"1", "2"})
+            run.assert_called_once()
+
+        entries = store.entries(ident)
+        assert entries["1"].consecutive_failures == REFUSED_STRIKES
+        assert entries["1"].backoff_until - clock["now"] <= BACKOFF_CAP_S
+        assert entries["2"].backoff_until - clock["now"] == REFUSED_BACKOFF_S
+
     def test_readd_clears_quarantine(self, temp_home):
         # Re-adding an account (fresh credential) must lift the quarantine, so
         # the disabled fetches don't leave it stuck at "re-login needed" forever.
