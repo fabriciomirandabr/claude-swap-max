@@ -1,6 +1,6 @@
 [project]
 name = "cswap-pin"
-version = "0.1.395.1"
+version = "0.1.403.1"
 description = "Keep Claude Code's Remote Control and Artifacts on one account while inference follows cswap's account swap"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -69,7 +69,6 @@ packages = ["src/cswap_pin"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
 # PARALLEL BY DEFAULT. 12.2s -> ~5.0s on 4 workers, measured; 8 and 12 workers
 # were no faster, because the floor is the single longest test (the real
 # spawned-successor handover, 3.1s) and no number of workers splits that.
@@ -92,3 +91,4 @@ markers = [
     # expression in the workflow instead of a silent skip nobody reads.
     "needs_host_seam: requires an unreleased claude_swap seam",
 ]
+pythonpath = ["src"]

@@ -39,6 +39,16 @@ from cswap_pin.proxy import pin_profile_for as _real_pin_profile_for
 
 from conftest import PIN_STAMP, run_cases, short_root
 
+# A pid no process can hold, for a record the code under test probes with a
+# real `os.kill(pid, 0)`. A bare 999999 is below this box's pid_max (4194304)
+# and the pid counter wraps through it, so it is sometimes a live process.
+# Without /proc (macOS, pid_max 99998) 999999 is already out of range.
+try:
+    DEAD_PID = max(999999, int(
+        pathlib.Path("/proc/sys/kernel/pid_max").read_text()) + 1)
+except (OSError, ValueError):
+    DEAD_PID = 999999
+
 # A REAL zero-serial root CA (GoDaddy Root Certificate Authority - G2),
 # extracted from this box's ambient `/etc/ssl/certs/ca-certificates.crt`.
 # Embedded rather than read from the ambient store so the guard tests below
@@ -11281,7 +11291,7 @@ class TestEnsureProxy:
         pin_proxy.save_pin(tmp_path, "pin@example.com", "org-1")
         certdir = tmp_path / "pin-proxy"
         certdir.mkdir()
-        pin_proxy.write_daemon_state(certdir, 1, 999999, "OTHER-FINGERPRINT")
+        pin_proxy.write_daemon_state(certdir, 1, DEAD_PID, "OTHER-FINGERPRINT")
         monkeypatch.setattr(pin_proxy, "_pin_daemon_pids", lambda cd: [])
         spawned = []
         monkeypatch.setattr(
@@ -13410,7 +13420,7 @@ class TestDaemonPortStability:
         s.bind(("127.0.0.1", 0))
         recorded = s.getsockname()[1]
         s.close()
-        write_daemon_state(tmp_path, recorded, 999999, "fp")
+        write_daemon_state(tmp_path, recorded, DEAD_PID, "fp")
 
         proxy = PinProxy(certdir=tmp_path, pin_token_provider=lambda: "T")
         proxy.start()
@@ -15483,7 +15493,7 @@ print("OK", port)
         squatter.bind(("127.0.0.1", 0))
         squatter.listen(1)
         taken = squatter.getsockname()[1]
-        write_daemon_state(tmp_path, taken, 999999, "fp")
+        write_daemon_state(tmp_path, taken, DEAD_PID, "fp")
 
         proxy = PinProxy(certdir=tmp_path, pin_token_provider=lambda: "T")
         proxy.start()
@@ -20196,7 +20206,7 @@ class TestUnwireWhenDead:
         cfg, certdir = self._cfg(tmp_path, monkeypatch,
                                  {"HTTPS_PROXY": "http://127.0.0.1:59999"})
         (certdir / "proxy.json").write_text(
-            json.dumps({"pid": 999999, "port": 59999, "fingerprint": "x"}))
+            json.dumps({"pid": DEAD_PID, "port": 59999, "fingerprint": "x"}))
         assert unwire_if_dead(certdir) is True
         assert json.loads(cfg.read_text()).get("env", {}) == {}
 
@@ -22123,7 +22133,7 @@ class TestHealRestoresWithoutRestart:
             certdir, pin_proxy._SUCCESSOR_FLIGHT_FILE,
             {"holder": os.getpid(), "successor": None, "predecessor": 1,
              "port": 4100, "spawned_at": time.time()})
-        for record in (None, 999999):
+        for record in (None, DEAD_PID):
             if record:
                 pin_proxy.write_daemon_state(certdir, 1, record, "FP")
             assert pin_proxy.heal(root) is False
@@ -29201,7 +29211,7 @@ class TestTheSweepClosesADeadCreatorsTwin:
         (home / "jobs" / "jdead").mkdir(parents=True)
         (home / "jobs" / "jdead" / "state.json").write_text(json.dumps({
             "bridgeSessionId": "cse_dead_creator",
-            pin_proxy._CREATOR_PID_KEY: 999999,  # not a real pid on this box
+            pin_proxy._CREATOR_PID_KEY: DEAD_PID,
         }))
         monkeypatch.setattr("claude_swap.paths.get_claude_config_home",
                             lambda: home)
@@ -29279,7 +29289,7 @@ class TestTheSweepClosesAReplacedTwin:
         home = self._home(tmp_path, monkeypatch)
         self._live_job(home, "j1", os.getpid(), "s1-new")
         (home / "sessions" / "s1-old.json").write_text(json.dumps({
-            "pid": 999999,  # not a real pid on this box
+            "pid": DEAD_PID,
             "jobId": "j1", "sessionId": "s1-old",
             "bridgeSessionId": "cse_twin"}))
         monkeypatch.setattr(pin_proxy, "_live_bridge_ids",
@@ -29364,7 +29374,7 @@ class TestTheSweepClosesAReplacedTwin:
         # Names cse_twin, but for an UNRELATED job -- proof 1 must not
         # reach for it just because the bridge id happens to match.
         (home / "sessions" / "s-other.json").write_text(json.dumps({
-            "pid": 999999,  # not a real pid on this box
+            "pid": DEAD_PID,
             "jobId": "j-other", "sessionId": "s-other",
             "bridgeSessionId": "cse_twin"}))
         # Names cse_twin too, but in an UNRELATED session's transcript --
@@ -29677,7 +29687,7 @@ class TestTheSweepArchivesATranscriptProvenTwin:
         scan. Negative row for the `_pid_alive` guard."""
         home = self._home(tmp_path, monkeypatch)
         (home / "sessions" / "s-dead.json").write_text(json.dumps({
-            "pid": 999999,  # not a real pid on this box
+            "pid": DEAD_PID,
             "sessionId": "s-dead", "name": "work",
             "bridgeSessionId": "cse_local_new"}))
         (home / "projects" / "proj" / "s-dead.jsonl").write_text(
@@ -30950,7 +30960,8 @@ class TestASlowRequestSaysSo:
 
         P, lines = self._proxy(monkeypatch)
         stages = {"target": 1.0, "probe": 8400.0, "lock": 3.0, "store": 2.0,
-                  "refresh": 4.0, "bridge": 5.0, "retry": 6.0}
+                  "refresh": 4.0, "cfglock": 5.0, "splice": 5.0, "carry": 5.0,
+                  "deaf": 5.0, "retry": 6.0}
         P._note_slow_request("POST", "/v1/code/sessions/cse_AB/worker/events",
                              9000.0, 8451.0, wait_ms=100.0, stages=stages)
         P._last_slow_report -= 61.0
@@ -31054,8 +31065,10 @@ class TestTheSpliceHoldsTheConfigLock:
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)
 
-    def _wire(self, tmp_path, monkeypatch, here):
-        """Point the splice at a scratch config and record lock acquisition."""
+    def _wire(self, tmp_path, monkeypatch, here, tick=None):
+        """Point the splice at a scratch config and record lock acquisition.
+
+        ``tick`` runs as the lock is entered: a case spends its wait on it."""
         import types
 
         from cswap_pin import proxy as pin_proxy
@@ -31071,6 +31084,8 @@ class TestTheSpliceHoldsTheConfigLock:
             # invisibly. Snapshotting inside proves the write happened while
             # the lock was held.
             def __enter__(self):
+                if tick:
+                    tick()
                 taken.append(cfg.read_text())
                 return self
 
@@ -31197,6 +31212,191 @@ class TestTheSpliceHoldsTheConfigLock:
             "the file was unchanged for the whole time the lock was held, so "
             "the read-modify-write happened outside it")
         assert json.loads(cfg.read_text())["oauthAccount"] == self.PIN
+
+    def case_a_config_that_already_names_the_pin_never_takes_the_lock(
+        self, tmp_path, monkeypatch
+    ):
+        """T3209: THE LOCK WAS A WAIT BOUGHT TO LEARN THERE WAS NOTHING TO DO.
+
+        Every create asks, and on a healthy machine the answer is "already
+        named". The lock is a cross-process wait (retries sleep 0.25 to 0.5 s,
+        budget `_SPLICE_LOCK_S`) taken before the file is even read. A config
+        that names the pin with an equal or newer stamp is decided from a
+        read alone.
+        """
+        fresh = dict(self.PIN, profileFetchedAt=2000)
+        for here, ident in ((dict(self.PIN), dict(self.PIN)),
+                            (fresh, dict(self.PIN, profileFetchedAt=1000)),
+                            (fresh, dict(fresh))):
+            pin_proxy, cfg, taken = self._wire(tmp_path, monkeypatch, here)
+            before = cfg.read_text()
+            assert pin_proxy.splice_config_identity(ident) is False
+            assert taken == [], (
+                "the lock was taken to learn that the config already names "
+                "the pin: " + repr(ident))
+            assert cfg.read_text() == before
+
+    def case_CONTROL_every_other_state_still_goes_through_the_lock(
+        self, tmp_path, monkeypatch
+    ):
+        """Without this the read above could become "never lock", which
+        removes the repair. A drifted field (97e907f), a strictly newer stamp
+        to carry, and a config this cannot parse each decide again UNDER the
+        lock, as before."""
+        pin_proxy, cfg, taken = self._wire(
+            tmp_path, monkeypatch, {"accountUuid": "OTHER"})
+        assert pin_proxy.splice_config_identity(self.PIN) is True
+        assert taken, "a drifted field was written without the lock"
+
+        pin_proxy, cfg, taken = self._wire(
+            tmp_path, monkeypatch, dict(self.PIN, profileFetchedAt=1000))
+        newer = dict(self.PIN, profileFetchedAt=2000)
+        assert pin_proxy.splice_config_identity(newer) is True
+        assert taken, "a fresher stamp was written without the lock"
+        assert json.loads(cfg.read_text())["oauthAccount"] == newer
+
+        for bad in ("[]", "{torn"):
+            pin_proxy, cfg, taken = self._wire(tmp_path, monkeypatch, None)
+            cfg.write_text(bad)
+            assert pin_proxy.splice_config_identity(self.PIN) is False
+            assert taken, "a config this cannot parse skipped the lock: " + bad
+            assert cfg.read_text() == bad
+
+    def _reassert(self, tmp_path, monkeypatch, here, tick=None, carry=None):
+        """Run the mint re-assert over ``here``: (carried, log lines).
+
+        The pin is remembered in a scratch certdir, so `_pointer_owner` names
+        it and the carry, when it runs, is handed ("PIN", "ORG")."""
+        import types as _t
+
+        pin_proxy, _cfg, _taken = self._wire(tmp_path, monkeypatch, here, tick)
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        pin_proxy.remember_pin_identity(certdir, self.PIN)
+        carried, lines = [], []
+
+        def _carry(login):
+            carried.append(login)
+            return carry(login) if carry else 0
+
+        monkeypatch.setattr(pin_proxy, "carry_live_pointers", _carry)
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle",
+                            lambda msg, *a, **k: lines.append(msg))
+        pin_proxy.PinProxy._reassert_pin_identity(
+            _t.SimpleNamespace(_certdir=certdir))
+        return carried, lines
+
+    def case_a_create_whose_splice_changed_nothing_does_not_carry(
+        self, tmp_path, monkeypatch
+    ):
+        """T3209: THE CARRY EXISTS BECAUSE THE SPLICE MOVES THE FIELD (e54f4fc)
+        that running sessions' pointers are compared against. A splice that
+        wrote nothing did not move it, and the carry was two registry passes
+        and a transcript glob per create to find that out. The 0.5 s login
+        tick and the 300 s beat still carry on any real move."""
+        carried, lines = self._reassert(tmp_path, monkeypatch, dict(self.PIN))
+        assert carried == [], (
+            "a create that changed nothing still carried every live session")
+        assert lines == [], lines
+
+    def case_CONTROL_a_drifted_field_is_spliced_and_the_carry_follows(
+        self, tmp_path, monkeypatch
+    ):
+        """e54f4fc's `case_the_mint_time_reassert_carries_live_pointers`,
+        which 32b49a1 deleted with the recycle code that shared its file.
+        Without it the skip above could become "never carry"."""
+        carried, lines = self._reassert(
+            tmp_path, monkeypatch, {"accountUuid": "DRIFTED"})
+        assert carried == [("PIN", "ORG")], (
+            "the splice moved the field and the sessions already running "
+            "were left pointing at the old one: " + repr(carried))
+        assert lines and "splicing the pin" in lines[0], lines
+
+    def case_a_skipped_splice_on_a_drifted_field_is_still_logged_at_the_mint(
+        self, tmp_path, monkeypatch
+    ):
+        """e5c8061: the lock cannot be taken, the write is skipped, and the
+        verify must say so with what the field holds. The read that spares the
+        lock on a healthy config must not have swallowed the state that
+        needs it."""
+        import types
+
+        def _refuses(**_kw):
+            raise TimeoutError("held by someone else")
+
+        pin_proxy, cfg, _ = self._wire(
+            tmp_path, monkeypatch, {"accountUuid": "OTHERUUID0000"})
+        real = pin_proxy.require
+        fakes = {
+            "claude_locks": types.SimpleNamespace(claude_config_lock=_refuses),
+            "paths": types.SimpleNamespace(get_global_config_path=lambda: cfg),
+        }
+        monkeypatch.setattr(pin_proxy, "require",
+                            lambda name: fakes.get(name) or real(name))
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        pin_proxy.remember_pin_identity(certdir, self.PIN)
+        lines, carried = [], []
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle",
+                            lambda msg, *a, **k: lines.append(msg))
+        monkeypatch.setattr(pin_proxy, "carry_live_pointers",
+                            lambda login: carried.append(login) or 0)
+        pin_proxy.PinProxy._reassert_pin_identity(
+            types.SimpleNamespace(_certdir=certdir))
+        assert any(pin_proxy.PIN_NOT_NAMED_AT_MINT in m
+                   and "OTHERUUID000" in m for m in lines), lines
+        assert carried == [], "nothing was written, so nothing moved"
+
+    def case_a_slow_create_names_where_the_bridge_time_went(
+        self, tmp_path, monkeypatch
+    ):
+        """T3209: "bridge 1720ms" could not say a lock wait from file IO from
+        the carry. And the stages must not nest, because `_note_slow_request`
+        prints `other = pin_ms - sum(stages)`: a stage counted inside another
+        shows as a NEGATIVE share. A fake clock spends 1.2 s waiting for the
+        lock, 0.2 s in the verify read and 0.3 s in the carry, and the stages
+        must add up to exactly the 1.7 s the create spent."""
+        from cswap_pin import proxy as pin_proxy
+
+        clock = [1000.0]
+
+        def wait(s):
+            clock[0] += s
+
+        monkeypatch.setattr(pin_proxy.time, "monotonic", lambda: clock[0])
+        monkeypatch.setattr(pin_proxy._PIN_STAGES, "d", {}, raising=False)
+        monkeypatch.setattr(pin_proxy, "live_pin_identity_state",
+                            lambda ident: wait(0.2) or (True, "PIN"))
+        self._reassert(tmp_path, monkeypatch, {"accountUuid": "DRIFTED"},
+                       tick=lambda: wait(1.2), carry=lambda login: wait(0.3))
+        stages = pin_proxy._PIN_STAGES.d
+        assert {n: round(ms) for n, ms in stages.items()} == {
+            "cfglock": 1200, "splice": 200, "carry": 300}, stages
+
+        lines = []
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle",
+                            lambda msg, *a, **k: lines.append(msg))
+        monkeypatch.setattr(pin_proxy, "slow_report_ms", lambda c: 1500.0)
+        P = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        P._note_slow_request("POST", "/v1/code/sessions", 2068.0,
+                             (clock[0] - 1000.0) * 1000, wait_ms=100.0,
+                             stages=stages)
+        for part in ("cfglock 1200ms", "carry 300ms", "splice 200ms"):
+            assert part in lines[0], lines[0]
+        assert "other" not in lines[0], lines[0]
+
+    def case_the_deaf_report_is_its_own_stage_beside_the_reassert(self):
+        """The handler stamps `deaf` around `_report_deaf_bridges` and nothing
+        else, and the old catch-all `bridge` stage is gone, so the sum of the
+        stages cannot count the reassert twice."""
+        import inspect
+
+        from cswap_pin import proxy as pin_proxy
+
+        src = inspect.getsource(pin_proxy.PinProxy._handle_one_request_inner)
+        assert '_stage("bridge")' not in src
+        after = src.split('with _stage("deaf"):', 1)[1].lstrip()
+        assert after.startswith("self._report_deaf_bridges()"), after[:80]
 
     def case_a_lock_that_cannot_be_taken_skips_the_write(
         self, tmp_path, monkeypatch
@@ -34659,7 +34859,7 @@ class TestADeadMarkerIsReapedOnALivePath:
     def case_a_drain_start_reaps_a_dead_marker(self, tmp_path, monkeypatch):
         import cswap_pin.proxy as m
         cd = tmp_path
-        stale = m.draining_marker_path(cd, 999999)
+        stale = m.draining_marker_path(cd, DEAD_PID)
         stale.write_text("dead\n")
         import os, time
         old = time.time() - (m._DRAINING_MARKER_TTL + 60)
@@ -39627,3 +39827,37 @@ class TestASuccessorInFlightIsNamedByASidecar:
         (certdir / pp._SUCCESSOR_FLIGHT_FILE).unlink()
         assert pp.ensure_proxy(sw)[0] == 9955 and len(spawned) == 1, (
             "CONTROL: with no sidecar the launch spawns")
+
+
+def test_the_host_has_every_hook_session_affinity_reads():
+    """`_affinity_rebuild` reads these off cswap through `getattr` with a
+    fallback, so a cswap that loses one runs on the fallback and nothing
+    fails. T3312: a cswap merge deleted `account_switch_thresholds`, the pin
+    fell back to `dict()` for three weeks, and its test faked the hook on a
+    SimpleNamespace. This one asks the installed claude-swap itself."""
+    import dataclasses
+
+    from claude_swap import models, poll_policy, switcher
+
+    host = switcher.ClaudeAccountSwitcher
+    missing = [f"ClaudeAccountSwitcher.{n}" for n in (
+        "account_policies", "is_account_disabled", "usage_entries_by_account",
+        "read_account_credentials", "_get_sequence_data")
+        if not callable(getattr(host, n, None))]
+    if not callable(getattr(poll_policy, "parse_reset_ts", None)):
+        missing.append("poll_policy.parse_reset_ts")
+    if "threshold" not in {f.name for f in dataclasses.fields(
+            models.AccountPolicy)}:
+        missing.append("AccountPolicy.threshold")
+    assert not missing, f"the host lacks what session affinity reads: {missing}"
+
+
+# `proactive_switch_bar_pct` and `last_engine_switch` are the fork's (#321), on
+# neither upstream/main nor the released host; the pin falls back to the
+# threshold, and to honouring no switch, without them.
+@pytest.mark.needs_host_seam
+def test_the_host_has_the_strategy_bar_hook():
+    from claude_swap import autoswitch
+
+    assert callable(getattr(autoswitch, "proactive_switch_bar_pct", None))
+    assert callable(getattr(autoswitch, "last_engine_switch", None))

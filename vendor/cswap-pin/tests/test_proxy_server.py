@@ -62,10 +62,14 @@ class _FakeUpstream:
                  reject_missing_auth: bool = False,
                  reject_headers: bytes = b"", reject_body: bytes = b"",
                  reject_two_credentials: bool = False,
-                 replies: "list[bytes] | None" = None):
+                 replies: "list[bytes] | None" = None,
+                 by_bearer: "dict[str, int] | None" = None):
         # replies: one whole response per request, in order (then `reply`, or
         # the 200): a conversation whose every turn is answered differently.
         self.replies = list(replies or [])
+        # by_bearer: the bodiless status each named bearer is answered, the
+        # 200 for any other: one fleet whose accounts answer differently.
+        self._by_bearer = dict(by_bearer or {})
         # reject_two_credentials: also answer `reject_status` to a request whose
         # `x-api-key` is not the bearer it carries ("more than one credential").
         # reject_bearer: answer `reject_status` to exactly this credential
@@ -97,6 +101,8 @@ class _FakeUpstream:
         self.seen_head: str = ""
         # seconds a reply's connection stays open after its last byte
         self.linger = 0.0
+        # hangup: read the whole request, answer nothing, close
+        self.hangup = False
         self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self._ctx.load_cert_chain(str(certdir / "leaf.pem"), str(certdir / "leaf.key"))
         self._srv = socket.socket()
@@ -143,8 +149,19 @@ class _FakeUpstream:
                 self.auths_seen.append(self.seen_auth)
                 self.bodies_seen.append(bytes(rest))
                 self.heads_seen.append(head)
+                if self.hangup:
+                    tls.close()
+                    continue
                 key = next((l.split(":", 1)[1].strip() for l in lines[1:]
                             if l.lower().startswith("x-api-key:")), None)
+                named = self._by_bearer.get(
+                    (self.seen_auth or "").removeprefix("Bearer "))
+                if named:
+                    tls.sendall(
+                        f"HTTP/1.1 {named} Named\r\nContent-Length: 0\r\n"
+                        "Connection: close\r\n\r\n".encode("latin1"))
+                    tls.close()
+                    continue
                 if (self.seen_auth in {f"Bearer {b}" for b in self._reject}
                         or (self.seen_auth is None
                             and self._reject_missing_auth)
@@ -2317,13 +2334,14 @@ class _LoopbackConnectProxy:
         self._srv.listen(5)
         self.port = self._srv.getsockname()[1]
         self.connects = 0
+        self.head = b""   # the CONNECT it took, request line and headers
         self._stopped = threading.Event()
         self._thr = threading.Thread(target=self._loop, daemon=True)
         self._thr.start()
 
     def _loop(self):
         try:
-            conn, _ = _accept_head(self._srv, stop=self._stopped)
+            conn, self.head = _accept_head(self._srv, stop=self._stopped)
             self.connects += 1
             up = socket.create_connection(self._target, timeout=10)
             conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -20734,8 +20752,9 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
     @classmethod
     def _relay(cls, path="/v1/messages", reset=None, status=b"429 Too Many Requests",
                auth="", session="", extra_headers=b"", body=b"no", withhold=0,
-               framed=True, method="POST", retry_after=None):
-        """``withhold`` holds back that many trailing body bytes and sends
+               framed=True, method="POST", retry_after=None, ua=""):
+        """``ua`` is the request's User-Agent, as `_forward` hands it on.
+        ``withhold`` holds back that many trailing body bytes and sends
         them after a delay, so the head read ends before the body does.
         ``framed=False`` omits `Content-Length`.
 
@@ -20798,7 +20817,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             reader.start()
             st0 = _os.fstat(cl_a.fileno())
             pp._relay_response(up_a, cl_a, 0, method=method, path=path,
-                               auth=auth, session=session)
+                               auth=auth, session=session, ua=ua)
             cl_a.shutdown(_s.SHUT_WR)
             reader.join(cls.EOF_GRACE)
             if reader.is_alive():
@@ -21179,6 +21198,41 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         got = self._relay(auth="Bearer stale-account-token")
         assert got.startswith(b"HTTP/1.1 401"), got[:40]
         assert pp._fleet_held_until == 0.0, pp._fleet_held_until
+
+    def case_a_cswap_probe_429_is_relayed_as_upstream_sent_it(
+        self, monkeypatch,
+    ):
+        """cswap's usage-header probe (`claude-swap/` User-Agent, no session
+        header) reads the upstream's own `rejected` and rate-limit headers. The
+        wall logic is a live session's, so a probe's 429 changes no pin state
+        and is relayed untouched, for a bearer that is not the live one and
+        for the live one alike. The control is the case above: the same
+        request under any other User-Agent is converted."""
+        from cswap_pin import proxy as pp
+        rejected = b"anthropic-ratelimit-unified-status: rejected"
+        monkeypatch.setattr(type(self), "UNIFIED_STATUS", rejected)
+        real = pp._switch_off_walled_account
+        for bearer in ("stale-account-token", self.LIVE):
+            self._wire(monkeypatch, switched=True,
+                       live_token=self.LIVE, usage=self.HEADROOM)
+            asked = []
+            monkeypatch.setattr(
+                pp, "_switch_off_walled_account",
+                lambda *a, **k: asked.append(a) or real(*a, **k))
+            fleet = (time.time() + 500, "seven_day")
+            pp._fleet_exhausted = fleet
+            got = self._relay(auth="Bearer " + bearer, ua="claude-swap/1.0")
+            assert got.startswith(b"HTTP/1.1 429"), (bearer, got[:60])
+            low = got.lower()
+            for header in (self.RESET_HEADER, self.RETRY_AFTER,
+                           self.SHOULD_RETRY, rejected):
+                assert header in low, (bearer, header, got[:300])
+            assert low.count(b"unified-status") == 1, (bearer, got[:300])
+            assert not asked, (bearer, asked)
+            assert pp._fleet_exhausted == fleet, pp._fleet_exhausted
+            assert not pp._walled_switch_seen, pp._walled_switch_seen
+            assert not pp._walled_switch_seen_by_session
+            assert not pp._walled_slots, pp._walled_slots
 
     def case_a_debounced_repeat_of_an_exhausted_wall_gets_the_same_waiting_relay(
         self, monkeypatch,
@@ -23751,6 +23805,23 @@ class TestAnAccessGrant403OnMessagesBecomesA401:
             assert self._r403(path=path) == self._untouched(), path
         assert not log, f"a switch() was asked for a non-grant 403: {log}"
 
+    def case_a_cswap_probe_grant_403_is_relayed_untouched(self, monkeypatch):
+        """The same client-blind predicate as the 429 arm: cswap's own probe
+        (`claude-swap/` User-Agent) is not a session the grant conversion can
+        rebuild, so its 403 is relayed byte for byte and nothing is read,
+        switched or remembered. The control is
+        `case_a_grant_403_becomes_a_401_after_exactly_one_switch`: the same
+        403 under any other User-Agent converts."""
+        from cswap_pin import proxy as pp
+        log = []
+        self._wire(monkeypatch, log=log)
+        got = self._r403(ua="claude-swap/1.0")
+        assert got == self._untouched(), got[:200]
+        assert got.startswith(b"HTTP/1.1 403"), got[:60]
+        assert not log, f"a switch() was asked for a probe's 403: {log}"
+        assert not pp._walled_switch_seen, pp._walled_switch_seen
+        assert not pp._walled_switch_seen_by_session
+
     def case_an_older_cswap_relays_the_grant_403_unchanged_and_reads_no_body(
         self, monkeypatch,
     ):
@@ -25045,6 +25116,35 @@ class TestTheEvidenceSurvivesAHandover:
             pp._worker_alive), (len(pp._worker_alive_written),
                                 len(pp._worker_alive))
 
+    def _write_beside_a_stamp(self, certdir, age):
+        """Another session's stamp `age` s old sits in the file; this
+        session's heartbeat then writes it. Returns what the file holds."""
+        import json
+        import time as _t
+        from cswap_pin import proxy as pp
+        self._cold()
+        other = "cse_anidlesession0000000"
+        pp._alive_path(certdir).write_text(json.dumps(
+            {other: _t.time() - age, f"{other}@4242": _t.time() - age}))
+        pp._note_worker_status(self.BEAT, b"HTTP/1.1 200 OK", certdir)
+        return other, pp._alive_load(certdir)
+
+    def case_an_idle_sessions_stamp_survives_anothers_write(self, certdir):
+        """THE FILE'S RETENTION IS NOT THE READERS' WINDOW. An idle session's
+        worker 2xx arrives every ~280 s, so a prune at the 90 s liveness window
+        emptied its key between heartbeats and a reader outside the pin saw no
+        evidence. Every reader cuts at its own age, so keeping the stamp longer
+        changes no verdict."""
+        other, got = self._write_beside_a_stamp(certdir, 300)
+        assert other in got and f"{other}@4242" in got, sorted(got)
+
+    def case_CONTROL_a_stamp_past_the_retention_is_still_pruned(self, certdir):
+        from cswap_pin import proxy as pp
+        other, got = self._write_beside_a_stamp(
+            certdir, pp._ALIVE_KEEP_SECONDS + 60)
+        assert other not in got and f"{other}@4242" not in got, sorted(got)
+        assert self.SID in got, sorted(got)
+
     def case_concurrent_stampers_never_tear_the_file_or_lose_a_stamp(
             self, certdir):
         """EVERY RELAY THREAD WRITES THIS FILE. One shared temp name let two
@@ -25377,6 +25477,266 @@ class TestTheVerifyingContextTrustsTheHop:
 
         monkeypatch.setattr(ssl, "create_default_context", strict_like_3_13)
         assert not proxy._verifying_context().verify_flags & ssl.VERIFY_X509_STRICT
+
+
+class TestTheRefreshPostFollowsTheRecordedHop:
+    """T3212: the fork's refresh POST is a context-less `urlopen`, so its route
+    was the proxy env the daemon's spawner had. Spawned with none, it went
+    direct into a TLS-decrypting network and failed verification every 120 s,
+    while the pin's own API traffic, routed by upstream.json, was fine. The
+    daemon installs `_HopOpener`, which sends it through the recorded hop and
+    verifies with the pin's own context."""
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    CREDS = json.dumps({"claudeAiOauth": {"refreshToken": "rt-old",
+                                          "accessToken": "at-old"}})
+    TOKEN = json.dumps({"access_token": "at-new", "refresh_token": "rt-new",
+                        "expires_in": 3600}).encode()
+
+    @contextlib.contextmanager
+    def _world(self, tmp_path, monkeypatch, certdir=None):
+        """A daemon-shaped PinProxy with `_HopOpener` installed and an EMPTY
+        proxy env, the token host (a leaf `signer` signed) and a CONNECT hop
+        in front of it. Nothing may dial anything but loopback: a refresh that
+        misses its route shows as a hop that saw nothing, not as traffic."""
+        import urllib.request
+
+        from cswap_pin import proxy
+
+        for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                    "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy",
+                    "NODE_EXTRA_CA_CERTS"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setattr(urllib.request, "_opener", None)
+        real = socket.create_connection
+
+        def loopback_only(address, *a, **k):
+            assert address[0] == "127.0.0.1", f"dialled {address} directly"
+            return real(address, *a, **k)
+
+        monkeypatch.setattr(socket, "create_connection", loopback_only)
+        signer = tmp_path / "hop"
+        signer.mkdir()
+        ensure_ca(signer, "platform.claude.com")
+        upstream = _FakeUpstream(signer, reply=(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            b"Content-Length: %d\r\n\r\n" % len(self.TOKEN) + self.TOKEN))
+        hop = _LoopbackConnectProxy(("127.0.0.1", upstream.port))
+        daemon = proxy.PinProxy(certdir or _pin_dir(), lambda: None,
+                                rediscover_chain=True)
+        urllib.request.install_opener(proxy._HopOpener(daemon))
+        try:
+            yield daemon, signer, upstream, hop
+        finally:
+            hop.stop()
+            upstream.stop()
+
+    def _refresh(self):
+        from cswap_pin import proxy
+
+        return proxy.oauth.try_refresh_oauth_credentials(self.CREDS)
+
+    def case_the_refresh_goes_through_the_recorded_hop(
+        self, tmp_path, monkeypatch
+    ):
+        import base64
+
+        from cswap_pin import proxy
+
+        with self._world(tmp_path, monkeypatch) as (_, signer, upstream, hop):
+            proxy.write_upstream_hint(
+                _pin_dir(), f"http://alice:s3cr3t@127.0.0.1:{hop.port}",
+                str(signer / "ca.pem"))
+            out = self._refresh()
+        assert out.error is None, out
+        assert json.loads(out.credentials)["claudeAiOauth"]["accessToken"] == "at-new"
+        assert hop.connects == 1
+        assert hop.head.startswith(b"CONNECT platform.claude.com:443 "), hop.head
+        auth = base64.b64encode(b"alice:s3cr3t").decode()
+        assert f"Proxy-Authorization: Basic {auth}".encode() in hop.head, hop.head
+
+    def case_a_hop_that_re_signs_without_its_ca_recorded_is_transient(
+        self, tmp_path, monkeypatch
+    ):
+        from cswap_pin import proxy
+
+        with self._world(tmp_path, monkeypatch) as (_, _signer, upstream, hop):
+            proxy.write_upstream_hint(_pin_dir(), f"http://127.0.0.1:{hop.port}")
+            out = self._refresh()
+        assert (out.credentials, out.error) == (None, "transient"), out
+        assert hop.connects == 1, "the refresh did not go through the hop"
+        assert upstream.heads_seen == [], "a request crossed an unverified hop"
+
+    @staticmethod
+    def _dead_port():
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    def case_a_dead_hop_falls_through_to_the_next(self, tmp_path, monkeypatch):
+        from cswap_pin import proxy
+
+        with self._world(tmp_path, monkeypatch) as (_, signer, upstream, hop):
+            proxy.write_upstream_hint(
+                _pin_dir(), f"http://alice:s3cr3t@127.0.0.1:{self._dead_port()}",
+                str(signer / "ca.pem"), next_hop=f"http://127.0.0.1:{hop.port}")
+            out = self._refresh()
+        assert out.error is None, out
+        assert hop.connects == 1, "the refresh did not fall through to `next`"
+        assert hop.head.startswith(b"CONNECT platform.claude.com:443 "), hop.head
+        assert b"Proxy-Authorization" not in hop.head, "the dead hop's credential"
+
+    def case_a_hop_that_hangs_up_after_the_post_does_not_fall_through(
+        self, tmp_path, monkeypatch
+    ):
+        from cswap_pin import proxy
+
+        with self._world(tmp_path, monkeypatch) as (_, signer, upstream, hop):
+            upstream.hangup = True
+            behind = _LoopbackConnectProxy(("127.0.0.1", upstream.port))
+            try:
+                proxy.write_upstream_hint(
+                    _pin_dir(), f"http://127.0.0.1:{hop.port}",
+                    str(signer / "ca.pem"), next_hop=f"http://127.0.0.1:{behind.port}")
+                out = self._refresh()
+            finally:
+                behind.stop()
+        assert (out.credentials, out.error) == (None, "transient"), out
+        assert (hop.connects, behind.connects) == (1, 0), "re-POSTed a spent grant"
+        assert len(upstream.heads_seen) == 1, upstream.heads_seen
+
+    def case_a_failed_send_does_not_fall_through(self, tmp_path, monkeypatch):
+        # urllib wraps only the connect and the send in URLError (a failed
+        # `getresponse`, the case above, escapes raw), and a send that failed
+        # may have left bytes: a re-POST of a spent grant invalid_grants a slot.
+        import urllib.error
+        import urllib.request
+
+        from cswap_pin import proxy
+
+        with self._world(tmp_path, monkeypatch) as (_, signer, _, hop):
+            proxy.write_upstream_hint(
+                _pin_dir(), f"http://127.0.0.1:{hop.port}", str(signer / "ca.pem"),
+                next_hop=f"http://127.0.0.1:{self._dead_port()}")
+            for exc in (ConnectionResetError, BrokenPipeError, TimeoutError):
+                sent = []
+
+                def open_(self, fullurl, *a, _exc=exc, **k):
+                    sent.append(fullurl)
+                    raise urllib.error.URLError(_exc())
+
+                monkeypatch.setattr(urllib.request.OpenerDirector, "open", open_)
+                with pytest.raises(urllib.error.URLError):
+                    urllib.request.urlopen("https://platform.claude.com/x", timeout=5)
+                assert len(sent) == 1, f"{exc.__name__}: sent twice"
+
+    def case_a_hop_that_fails_verification_does_not_fall_through(
+        self, tmp_path, monkeypatch
+    ):
+        from cswap_pin import proxy
+
+        with self._world(tmp_path, monkeypatch) as (_, _signer, upstream, hop):
+            behind = _LoopbackConnectProxy(("127.0.0.1", upstream.port))
+            try:
+                proxy.write_upstream_hint(
+                    _pin_dir(), f"http://127.0.0.1:{hop.port}",
+                    next_hop=f"http://127.0.0.1:{behind.port}")
+                out = self._refresh()
+            finally:
+                behind.stop()
+        assert (out.credentials, out.error) == (None, "transient"), out
+        assert (hop.connects, behind.connects) == (1, 0), "walked past a TLS failure"
+
+    def case_a_hop_whose_server_answered_does_not_fall_through(
+        self, tmp_path, monkeypatch
+    ):
+        import urllib.error
+        import urllib.request
+
+        from cswap_pin import proxy
+
+        with self._world(tmp_path, monkeypatch) as (_, signer, upstream, hop):
+            upstream.reply = (b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+            behind = _LoopbackConnectProxy(("127.0.0.1", upstream.port))
+            try:
+                proxy.write_upstream_hint(
+                    _pin_dir(), f"http://127.0.0.1:{hop.port}",
+                    str(signer / "ca.pem"), next_hop=f"http://127.0.0.1:{behind.port}")
+                with pytest.raises(urllib.error.HTTPError):
+                    urllib.request.urlopen("https://platform.claude.com/x", timeout=5)
+            finally:
+                behind.stop()
+        assert (hop.connects, behind.connects) == (1, 0), "walked past an answer"
+
+    def case_no_proxy_in_the_env_does_not_bypass_the_hop(
+        self, tmp_path, monkeypatch
+    ):
+        from cswap_pin import proxy
+
+        with self._world(tmp_path, monkeypatch) as (_, signer, upstream, hop):
+            monkeypatch.setenv("NO_PROXY", "*")
+            proxy.write_upstream_hint(
+                _pin_dir(), f"http://127.0.0.1:{hop.port}", str(signer / "ca.pem"))
+            out = self._refresh()
+        assert out.error is None, out
+        assert hop.connects == 1, "NO_PROXY sent the refresh around the hop"
+
+    def case_the_hop_and_its_ca_come_from_the_daemons_own_certdir(
+        self, tmp_path, monkeypatch
+    ):
+        from cswap_pin import proxy
+
+        own = _mkdir(tmp_path / "own-certdir")
+        with self._world(tmp_path, monkeypatch, certdir=own) as (_, signer, _, hop):
+            proxy.write_upstream_hint(
+                own, f"http://127.0.0.1:{hop.port}", str(signer / "ca.pem"))
+            out = self._refresh()
+        assert out.error is None, out
+        assert hop.connects == 1
+
+    def _env_route_unchanged(self, tmp_path, monkeypatch, record, port=None):
+        """The refresh takes the env proxy, because `record` leaves the opener
+        no hop it can use. The env proxy's leaf verifies by the default trust."""
+        from cswap_pin import proxy
+
+        with self._world(tmp_path, monkeypatch) as (daemon, signer, _, hop):
+            monkeypatch.setenv("https_proxy", f"http://127.0.0.1:{hop.port}")
+            monkeypatch.setenv("SSL_CERT_FILE", str(signer / "ca.pem"))
+            if port:
+                daemon.port = port
+            if record:
+                proxy.write_upstream_hint(_pin_dir(), record)
+            out = self._refresh()
+        assert out.error is None, out
+        assert hop.connects == 1, "the env proxy was not used"
+
+    def case_no_hop_recorded_keeps_the_env_proxy(self, tmp_path, monkeypatch):
+        self._env_route_unchanged(tmp_path, monkeypatch, None)
+
+    def case_a_hop_that_is_the_daemon_is_dropped(self, tmp_path, monkeypatch):
+        self._env_route_unchanged(
+            tmp_path, monkeypatch, "http://127.0.0.1:59123", port=59123)
+
+    def case_a_tls_hop_is_left_to_the_env_proxy(self, tmp_path, monkeypatch):
+        # urllib CONNECTs in the clear, which an https:// hop would not take.
+        self._env_route_unchanged(tmp_path, monkeypatch, "https://127.0.0.1:59123")
+
+    def case_daemon_main_installs_the_opener(self):
+        import ast
+        import inspect
+        import textwrap
+
+        from cswap_pin import proxy
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(proxy.daemon_main)))
+        installs = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                    and getattr(n.func, "attr", "") == "install_opener"]
+        assert any(
+            c.args and isinstance(c.args[0], ast.Call)
+            and getattr(c.args[0].func, "id", "") == "_HopOpener"
+            for c in installs), "daemon_main never installs a _HopOpener"
 
 
 class TestPumpBackpressure:
@@ -25764,13 +26124,14 @@ class TestSessionAffinityOnMessages:
 
     @classmethod
     def _wire(cls, monkeypatch, certdir, armed=True, pct=10.0, walled=False,
-              expires=None, thresholds=None, disabled=None, fail=False,
+              expires=None, policies=None, disabled=None, fail=False,
               no_expiry=False, carry=False):
         """A fake switcher over two slots; returns what it was asked.
         ``pct`` is slot 1's usage on both windows (None: no reading).
-        ``thresholds`` / ``disabled`` give the switcher the per-slot threshold
-        and disabled-slot methods; left None it has neither, as an older
-        claude-swap host. ``fail``: the usage read raises. ``no_expiry``:
+        ``policies`` (slot -> an object with `threshold` and maybe
+        `weekly_cap`, cswap's `account_policies()`) / ``disabled`` (slots)
+        say what the switcher's per-slot methods answer; left None they
+        answer for no slot. ``fail``: the usage read raises. ``no_expiry``:
         slot 1's stored credential carries no `expiresAt`. ``carry``: a
         started pin's tick writes the bindings for a successor; off, so that
         the next pin built in this process (a stand-in for a handover only in
@@ -25834,7 +26195,7 @@ class TestSessionAffinityOnMessages:
         sw = types.SimpleNamespace(
             _get_sequence_data=lambda: {"accounts": {
                 n: {"email": cls.EMAIL.format(n)} for n in cls.TOKENS}},
-            read_account_credentials=_creds,
+            backup_dir=certdir, read_account_credentials=_creds,
             usage_entries_by_account=_entries,
             record_usage_headers=_record,
             consume_backup_grant=lambda *a, **k: seen.consumed.append(a),
@@ -25844,10 +26205,8 @@ class TestSessionAffinityOnMessages:
                 {"claudeAiOauth": {"accessToken": cls.TOKENS["2"]}}),
             resolve_account=lambda n: (n, cls.EMAIL.format(n), "org"),
         )
-        if thresholds is not None:
-            sw.account_switch_thresholds = lambda: dict(thresholds)
-        if disabled is not None:
-            sw.is_account_disabled = lambda n: n in disabled
+        sw.account_policies = lambda: dict(policies or {})
+        sw.is_account_disabled = lambda n: n in (disabled or ())
         real_require = pp.require
         monkeypatch.setattr(pp, "require", lambda name: (
             types.SimpleNamespace(ClaudeAccountSwitcher=lambda: sw)
@@ -25862,13 +26221,13 @@ class TestSessionAffinityOnMessages:
                       pp._affinity_dropped, pp._affinity_why,
                       pp._affinity_declined, pp._AFFINITY_CACHE,
                       pp._affinity_last, pp._affinity_carried,
-                      pp._affinity_unseen,
+                      pp._affinity_unseen, pp._affinity_hooks_warned,
                       pp._usage_header_seen, pp._usage_header_spawn_seen):
             state.clear()
         (certdir / pp._AFFINITY_CARRY_FILE).unlink(missing_ok=True)
         pp._affinity_snap.update(
             tried=float("-inf"), at=float("-inf"), busy=False, stuck=0,
-            failures=0, ms=None)
+            failures=0, ms=None, switch=None)
         pp._affinity_pings.update(sent=0, hit=0)
         pp._affinity_ping_cost.update(dict.fromkeys(pp._affinity_ping_cost, 0))
         pp._affinity_pings["refused"].clear()
@@ -25893,6 +26252,9 @@ class TestSessionAffinityOnMessages:
         # means to the installed claude-swap
         monkeypatch.setattr(autoswitch, "proactive_switch_bar_pct",
                             lambda _strategy, t: t, raising=False)
+        # cswap's last engine switch (T3320): none unless a case says
+        monkeypatch.setattr(autoswitch, "last_engine_switch",
+                            lambda _dir: None, raising=False)
         return seen
 
     @staticmethod
@@ -26093,7 +26455,7 @@ class TestSessionAffinityOnMessages:
         from cswap_pin import proxy as pp
         seen = self._wire(monkeypatch, certdir)
         for pct, want, why in ((30.0, "tok-A", None),
-                               (95.0, "tok-B", "at its bar")):
+                               (95.0, "tok-B", "at its keep bar, 90%")):
             seen.usage1 = seen.last_good1 = {
                 "seven_day": {"pct": pct}, "scoped": [{"name": "Fable", "pct": 5.0}]}
             pp._affinity_snap.update(tried=float("-inf"), at=float("-inf"))
@@ -26429,17 +26791,79 @@ class TestSessionAffinityOnMessages:
         assert auths == ["Bearer tok-A"], auths
         assert seen.recorded == ["1"], seen.recorded
 
+    @staticmethod
+    def _pol(threshold=None, weekly_cap=None):
+        """One slot of cswap's `account_policies()`. The released host's has
+        no `weekly_cap`; the fork's does."""
+        return types.SimpleNamespace(threshold=threshold, weekly_cap=weekly_cap)
+
     def case_the_slots_own_switch_threshold_applies(self, monkeypatch, certdir):
-        """The engine leaves a slot at its own `switchThreshold`, whichever
+        """The engine leaves a slot at its own policy `threshold`, whichever
         side of the global 90 that is, so the pin keeps a session there only
         under that slot's own bar."""
-        for thresholds, pct, want in (
-                ({"1": 60.0}, 70.0, "tok-B"), ({"1": 60.0}, 50.0, "tok-A"),
-                ({"1": 95.0}, 92.0, "tok-A"), ({"2": 60.0}, 70.0, "tok-A")):
-            self._wire(monkeypatch, certdir, pct=pct, thresholds=thresholds)
+        for policies, pct, want in (
+                ({"1": self._pol(60.0)}, 70.0, "tok-B"),
+                ({"1": self._pol(60.0)}, 50.0, "tok-A"),
+                ({"1": self._pol(95.0)}, 92.0, "tok-A"),
+                ({"2": self._pol(60.0)}, 70.0, "tok-A")):
+            self._wire(monkeypatch, certdir, pct=pct, policies=policies)
             self._seed("S", "tok-A")
             _, auths = self._send(certdir, [("tok-B", "S")])
-            assert auths == [f"Bearer {want}"], (thresholds, pct, auths)
+            assert auths == [f"Bearer {want}"], (policies, pct, auths)
+
+    def case_a_slot_policy_sets_the_bar_it_is_kept_under(
+            self, monkeypatch, certdir):
+        """cswap's one policy store (`account_policies`, T3312): a slot's
+        `threshold` is its bar, else the global 90; a `weekly_cap` under 100
+        lowers it, 100 or none does not, and a slot the store does not name
+        has the global bar. Read off the snapshot, which holds the bar."""
+        from cswap_pin import proxy as pp
+        ident = ("1", self.EMAIL.format("1"))
+        for policies, pct, bar, said in (
+                ({"1": self._pol(70.0)}, 65.0, 70.0, None),
+                ({"1": self._pol(70.0)}, 75.0, None, 70),
+                ({"1": self._pol(weekly_cap=80.0)}, 75.0, 80.0, None),
+                ({"1": self._pol(weekly_cap=80.0)}, 85.0, None, 80),
+                ({"1": self._pol(95.0, weekly_cap=80.0)}, 85.0, None, 80),
+                ({"1": self._pol(weekly_cap=100.0)}, 85.0, 90.0, None),
+                ({"1": self._pol()}, 85.0, 90.0, None),
+                ({"2": self._pol(60.0)}, 85.0, 90.0, None)):
+            self._wire(monkeypatch, certdir, pct=pct, policies=policies)
+            pp._affinity_kick(90.0, "dynamic")
+            got = pp._affinity_kept.get(ident, (None, None, None))[2]
+            assert got == bar, (policies, pct, got, pp._affinity_why)
+            # a drop names the bar it was judged at (T3406), not "at its bar"
+            assert pp._affinity_why[ident] == (
+                said and f"at its keep bar, {said}%"), pp._affinity_why
+
+    def case_a_hook_the_host_lacks_is_said_once_and_falls_back(
+            self, monkeypatch, certdir):
+        """A cswap that dropped or renamed a hook the snapshot reads looks like
+        an older host and used to fall back in silence (T3312: three weeks of
+        every slot on the global bar). One line per daemon names the hooks; the
+        fallbacks still run."""
+        from claude_swap import autoswitch, poll_policy
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir, pct=75.0,
+                          policies={"1": self._pol(70.0)})
+        sw = pp.require("switcher").ClaudeAccountSwitcher()
+        del sw.account_policies, sw.is_account_disabled
+        monkeypatch.delattr(poll_policy, "parse_reset_ts")
+        monkeypatch.delattr(autoswitch, "last_engine_switch")
+        for _ in range(3):
+            pp._affinity_snap.update(tried=float("-inf"), busy=False)
+            pp._affinity_kick(90.0, "dynamic")
+        (line,) = [l for l in seen.logs if "WARNING" in l]
+        for hook, fallback in (
+                ("account_policies", "the global bar for every slot"),
+                ("is_account_disabled", "no slot disabled"),
+                ("parse_reset_ts", "no window roll known"),
+                ("last_engine_switch", "no switch is honoured")):
+            assert f"{hook} (falls back to {fallback})" in line, line
+        assert "proactive_switch_bar_pct" not in line, line
+        assert "threshold as the bar" not in line, line
+        assert ("1", self.EMAIL.format("1")) in pp._affinity_kept, (
+            "the global bar keeps it: the fallback ran")
 
     def case_the_dynamic_strategys_bar_applies(self, monkeypatch, certdir):
         """Under `dynamic` the engine switches at 97, not at the configured
@@ -26460,6 +26884,50 @@ class TestSessionAffinityOnMessages:
             self._seed("S", "tok-A")
             _, auths = self._send(certdir, [("tok-B", "S")])
             assert auths == [f"Bearer {want}"], (strategy, pct, auths)
+
+    def case_an_engine_or_hand_switch_moves_the_warm_session(
+            self, monkeypatch, certdir):
+        """A cswap switch chosen by its `expiring-window` rule, or made by
+        hand (`manual`), is meant to move the work: the session warm on slot 1
+        follows a client that sends the target slot's bearer (T3321; measured
+        on lmd42, the keep held 2375 replies on the old slot and 48 on the
+        new after a hand switch). Any other trigger, a target that is not the
+        client's slot, and no switch keep it. The decline line names the
+        trigger."""
+        from claude_swap import autoswitch
+        for pair, want, why in (
+                (("2", "expiring-window"), "tok-B",
+                 "the engine moved to slot 2 for an expiring window"),
+                (("2", "manual"), "tok-B", "a hand switch moved to slot 2"),
+                (("2", "alternation"), "tok-A", None),
+                (("1", "expiring-window"), "tok-A", None),
+                (("1", "manual"), "tok-A", None),
+                (None, "tok-A", None)):
+            seen = self._wire(monkeypatch, certdir)
+            monkeypatch.setattr(autoswitch, "last_engine_switch",
+                                lambda _dir: pair, raising=False)
+            self._seed("S", "tok-A")
+            _, auths = self._send(certdir, [("tok-B", "S")])
+            assert auths == [f"Bearer {want}"], (pair, auths)
+            lines = [l for l in seen.logs if "a warm session was not kept" in l]
+            assert (len(lines) == 1 and why in lines[0]) if why else (
+                not lines), (pair, seen.logs)
+
+    def case_a_last_switch_hook_that_raises_keeps_the_session(
+            self, monkeypatch, certdir):
+        from claude_swap import autoswitch
+        from cswap_pin import proxy as pp
+
+        def boom(_dir):
+            raise OSError("state file")
+
+        self._wire(monkeypatch, certdir)
+        monkeypatch.setattr(autoswitch, "last_engine_switch", boom,
+                            raising=False)
+        self._seed("S", "tok-A")
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-A"], auths
+        assert pp._affinity_snap["failures"] == 0, "the rebuild raised"
 
     def case_a_disabled_slot_is_not_kept(self, monkeypatch, certdir):
         for disabled, want in (({"1"}, "tok-B"), ({"2"}, "tok-A")):
@@ -27126,17 +27594,18 @@ class TestSessionAffinityOnMessages:
         """The snapshot lags a crossing by up to a rebuild cycle. A reply's own
         utilization header, already in hand, is read in memory: no store
         read, no wait for the next snapshot."""
-        for thresholds, util, want in (
+        for policies, util, want in (
                 (None, 0.95, "tok-B"), (None, 0.90, "tok-B"),
-                (None, 0.89, "tok-A"), ({"1": 60.0}, 0.65, "tok-B"),
-                ({"1": 60.0}, 0.55, "tok-A"), ({"2": 60.0}, 0.65, "tok-A")):
-            seen = self._wire(monkeypatch, certdir, thresholds=thresholds)
+                (None, 0.89, "tok-A"), ({"1": self._pol(60.0)}, 0.65, "tok-B"),
+                ({"1": self._pol(60.0)}, 0.55, "tok-A"),
+                ({"2": self._pol(60.0)}, 0.65, "tok-A")):
+            seen = self._wire(monkeypatch, certdir, policies=policies)
             self._seed("S", "tok-A")
             _, auths = self._send(
                 certdir, [("tok-A", "S"), ("tok-B", "S")],
                 reply=self._util(util))
             assert auths == ["Bearer tok-A", f"Bearer {want}"], (
-                thresholds, util, auths)
+                policies, util, auths)
             assert len(seen.fetches) == 1, "the drop read the store"
 
     def case_a_drop_at_the_bar_names_itself_in_the_decline_line(
@@ -27146,15 +27615,22 @@ class TestSessionAffinityOnMessages:
         for the drop, and its line says so (the slot's reason in the snapshot
         is None, it was kept, and a None must not print or key the fold)."""
         from cswap_pin import proxy as pp
-        seen = self._wire(monkeypatch, certdir)
-        self._seed("S", "tok-A")
-        _, auths = self._send(
-            certdir, [("tok-A", "S"), ("tok-B", "S")], reply=self._util(0.95))
-        assert auths == ["Bearer tok-A", "Bearer tok-B"], auths
-        lines = [l for l in seen.logs if "a warm session was not kept" in l]
-        assert len(lines) == 1 and "dropped at its bar" in lines[0], seen.logs
-        assert "None" not in lines[0] and None not in pp._affinity_declined, (
-            lines, pp._affinity_declined)
+        for policies, util, bar in ((None, 0.95, "90"),
+                                    ({"1": self._pol(60.0)}, 0.65, "60")):
+            seen = self._wire(monkeypatch, certdir, policies=policies)
+            self._seed("S", "tok-A")
+            _, auths = self._send(
+                certdir, [("tok-A", "S"), ("tok-B", "S")],
+                reply=self._util(util))
+            assert auths == ["Bearer tok-A", "Bearer tok-B"], auths
+            lines = [l for l in seen.logs if "a warm session was not kept" in l]
+            # the bar the slot was judged at (T3406), not "at its bar"
+            assert len(lines) == 1 and (
+                f"dropped at its keep bar, {bar}%, no newer reading since"
+                in lines[0]), seen.logs
+            assert "None" not in lines[0] and (
+                None not in pp._affinity_declined), (
+                lines, pp._affinity_declined)
 
     def case_a_snapshot_started_before_a_drop_does_not_undo_it(
             self, monkeypatch, certdir):
@@ -27212,7 +27688,8 @@ class TestSessionAffinityOnMessages:
             _, auths = self._send(certdir, [("tok-B", "S")])
             assert len(seen.fetches) == 2, "no rebuild started after the drop"
             assert auths == [f"Bearer {want}"], (age, auths)
-            assert any("dropped at its bar" in l for l in seen.logs) == (
+            assert any("dropped at its keep bar, 90%, no newer" in l
+                       for l in seen.logs) == (
                 want == "tok-B"), (age, seen.logs)
 
     def case_a_drop_on_the_slots_own_bearer_records_to_that_slot(
@@ -27353,7 +27830,8 @@ class TestSessionAffinityOnMessages:
             self, monkeypatch, certdir):
         from cswap_pin import proxy as pp
         for opts, why in (
-                (dict(pct=95.0), "at its bar"), (dict(walled=True), "walled"),
+                (dict(pct=95.0), "(at its keep bar, 90%)"),
+                (dict(walled=True), "walled"),
                 (dict(disabled={"1"}), "disabled"),
                 (dict(no_expiry=True), "no expiry"),
                 (dict(pct=None), "too old to trust"),
@@ -29392,8 +29870,9 @@ class TestSessionAffinityOnMessages:
         refused = {"its slot is not kept": 1}
         for make, slot, why in (
                 (lambda: (pp._affinity_kept.pop(ident),
-                          pp._affinity_why.update({ident: "at its bar"})),
-                 "1", "at its bar"),
+                          pp._affinity_why.update(
+                              {ident: "at its keep bar, 90%"})),
+                 "1", "at its keep bar, 90%"),
                 (lambda: pp._affinity_rest.update(
                     {ident: time.monotonic() + 99}), "1", "resting"),
                 (lambda: pp._affinity_kept.update(
@@ -31031,3 +31510,322 @@ class TestConnectorsFollowPin:
         finally:
             proxy.stop()
             upstream.stop()
+
+
+class TestAThirdAccountsSessionIsReachedWithItsOwnersToken:
+    """T3415. A Remote Control session is owned by whichever account made it,
+    and that is neither the pinned account nor, after a slot alternation, the
+    bearer the client arrives with. The take-back resent as the arriving bearer
+    (4e8fcd3) and took that bearer for the owner: true only while the owner was
+    the active slot. Measured on a work mac 2026-11-09: a lid-wake `POST
+    .../bridge` went pinned 404, arriving (slot 7) 401, and the pin relayed the
+    401, which Claude Code reads as a credentials verdict and never retries.
+
+    The owner is remembered when it is MEASURED (the pinned attempt refused, the
+    arriving bearer answered 2xx), in `session-owners.json` by account identity.
+    A double refusal then gets one more attempt with the owner's STORED token
+    (no refresh, no consume); an owner whose token is expired but refreshable
+    gets a local 503 on `POST .../bridge` and `.../unarchive`, which Claude Code
+    retries until cswap's poller has refreshed it."""
+
+    SID = "cse_01OwnedByASlotThatIsNeitherPinnedNorActive"
+    BRIDGE = f"/v1/code/sessions/{SID}/bridge"
+    UNARCHIVE = f"/v1/sessions/{SID}/unarchive"
+    BY_ID = f"/v1/code/sessions/{SID}"
+    OWNER = ("c@example.com", "org-c")
+    FAR = 4102444800000
+    # the pinned account's bearer is refused, the arriving ones are another
+    # account's, and the owner's own is the one the server accepts
+    FLEET = {"PIN-TOKEN": 404, "B-token": 401, "D-token": 401}
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(
+            self, request, tmp_path_factory,
+            extra={"certdir": lambda t: _make_certdir(_mkdir(t / "pin-proxy"))})
+
+    def _store(self, monkeypatch, owner_expires=FAR, owner_refresh="rt-c",
+               quarantined=()):
+        """cswap's account store: four slots, the owner's (3) the one a case
+        varies. Every credential read is recorded in `.reads`, and anything
+        that could refresh, consume or write a slot in `.touched`."""
+        import cswap_pin.proxy as pp
+
+        real_require, store = pp.require, types.SimpleNamespace(
+            reads=[], touched=[])
+        slots = {
+            "1": ("a@example.com", "org-a", "A-stored", self.FAR, "rt-a"),
+            "3": (*self.OWNER, "C-token", owner_expires, owner_refresh),
+            "5": ("b@example.com", "org-b", "B-token", self.FAR, "rt-b"),
+            "7": ("d@example.com", "org-d", "D-token", self.FAR, "rt-d"),
+        }
+
+        def creds(num, email):
+            store.reads.append(num)
+            _, _, tok, exp, rt = slots[num]
+            return json.dumps({"claudeAiOauth": {
+                "accessToken": tok, "expiresAt": exp,
+                **({"refreshToken": rt} if rt else {})}})
+
+        def touched(name):
+            return lambda *a, **k: store.touched.append(name)
+
+        switcher = types.SimpleNamespace(
+            _get_sequence_data=lambda: {"accounts": {
+                n: {"email": e, "organizationUuid": o}
+                for n, (e, o, *_r) in slots.items()}},
+            read_account_credentials=creds,
+            _engine_quarantined=lambda num, fp: num in quarantined,
+            consume_backup_grant=touched("consume_backup_grant"),
+            write_account_credentials=touched("write_account_credentials"),
+            _write_account_credentials=touched("_write_account_credentials"))
+        monkeypatch.setattr(pp, "require", lambda name: (
+            types.SimpleNamespace(ClaudeAccountSwitcher=lambda: switcher)
+            if name == "switcher" else real_require(name)))
+        monkeypatch.setattr(pp.oauth, "try_refresh_oauth_credentials",
+                            touched("try_refresh_oauth_credentials"))
+        return store
+
+    @staticmethod
+    def _provider(pinned=("1", "a@example.com")):
+        def provider():
+            return "PIN-TOKEN"
+        provider.current_target = lambda: pinned
+        return provider
+
+    def _fleet(self, certdir, monkeypatch, **store_kw):
+        """(proxy, upstream, lifecycle lines, store spy), started."""
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import PinProxy
+
+        store = self._store(monkeypatch, **store_kw)
+        upstream = _FakeUpstream(certdir, by_bearer=self.FLEET)
+        proxy = PinProxy(certdir=certdir, pin_token_provider=self._provider(),
+                         upstream=("127.0.0.1", upstream.port))
+        lines = []
+        monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
+        proxy.start()
+        return proxy, upstream, lines, store
+
+    @staticmethod
+    def _memo(certdir, sid):
+        """The memo of ``sid``, once written: it is written AFTER the answer
+        has reached the client, so a case that has just read the answer waits."""
+        import cswap_pin.proxy as pp
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if pp._owner_memo(certdir, sid):
+                break
+            time.sleep(0.02)
+        return pp._owner_memo(certdir, sid)
+
+    @staticmethod
+    def _saw(lines, text):
+        """Whether a lifecycle line holding ``text`` was written, waited for for
+        the same reason as `_memo`."""
+        deadline = time.time() + 5
+        while time.time() < deadline and not any(text in ln for ln in lines):
+            time.sleep(0.02)
+        return any(text in ln for ln in lines)
+
+    def _ask(self, proxy, certdir, path, bearer, method="POST", hdrs=None):
+        return _request_through_proxy(
+            proxy.port, certdir / "ca.pem", path, bearer=bearer,
+            method=method, headers_out=hdrs)
+
+    def case_a_fall_back_2xx_remembers_the_owner_and_a_later_double_refusal_reaches_it(
+            self, certdir, monkeypatch):
+        import cswap_pin.proxy as pp
+
+        proxy, upstream, lines, store = self._fleet(certdir, monkeypatch)
+        try:
+            # the owner (slot 3) is the active slot: pinned 404, it answers 200
+            assert self._ask(proxy, certdir, self.BRIDGE, "C-token") == 200
+            assert self._memo(certdir, self.SID) == self.OWNER
+            assert self._saw(lines, "owner remembered, slot 3"), lines
+            # the alternation: the arriving bearer is slot 7's and is refused
+            upstream.auths_seen.clear()
+            assert self._ask(proxy, certdir, self.BRIDGE, "D-token") == 200
+            assert upstream.auths_seen == [
+                "Bearer PIN-TOKEN", "Bearer D-token", "Bearer C-token"]
+            assert self._saw(lines, "owner's slot 3 answered 200"), lines
+            assert store.touched == [], store.touched
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_a_new_daemon_reads_the_memo_a_predecessor_wrote(
+            self, certdir, monkeypatch):
+        import cswap_pin.proxy as pp
+
+        pp._owner_remember(certdir, self.SID, self.OWNER)
+        proxy, upstream, lines, store = self._fleet(certdir, monkeypatch)
+        try:
+            assert self._ask(proxy, certdir, self.UNARCHIVE, "D-token") == 200
+            assert upstream.auths_seen[-1] == "Bearer C-token"
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_an_owner_with_an_expired_refreshable_token_holds_a_503_on_the_two_posts(
+            self, certdir, monkeypatch):
+        import cswap_pin.proxy as pp
+
+        pp._owner_remember(certdir, self.SID, self.OWNER)
+        proxy, upstream, lines, store = self._fleet(
+            certdir, monkeypatch, owner_expires=1)
+        try:
+            for path in (self.BRIDGE, self.UNARCHIVE):
+                hdrs = {}
+                assert self._ask(proxy, certdir, path, "D-token",
+                                 hdrs=hdrs) == 503, path
+                assert hdrs.get("retry-after"), hdrs
+            assert "Bearer C-token" not in upstream.auths_seen
+            assert any("held 503, owner's slot 3 token expired" in ln
+                       for ln in lines), lines
+            # every other route relays the real answer: the arriving 401
+            upstream.auths_seen.clear()
+            assert self._ask(proxy, certdir, self.BY_ID, "D-token",
+                             method="GET") == 401
+            assert upstream.auths_seen == ["Bearer PIN-TOKEN", "Bearer D-token"]
+            assert store.touched == [], store.touched
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_an_owner_cswap_cannot_refresh_gets_the_real_answer(
+            self, certdir, monkeypatch):
+        import cswap_pin.proxy as pp
+
+        pp._owner_remember(certdir, self.SID, self.OWNER)
+        for kw in ({"owner_refresh": ""}, {"quarantined": ("3",)}):
+            proxy, upstream, lines, store = self._fleet(
+                certdir, monkeypatch, owner_expires=1, **kw)
+            try:
+                assert self._ask(proxy, certdir, self.BRIDGE, "D-token") == 401, kw
+                assert upstream.auths_seen == [
+                    "Bearer PIN-TOKEN", "Bearer D-token"], (kw, upstream.auths_seen)
+            finally:
+                proxy.stop()
+                upstream.stop()
+
+    def case_with_no_memo_nothing_changes(self, certdir, monkeypatch):
+        proxy, upstream, lines, store = self._fleet(certdir, monkeypatch)
+        try:
+            assert self._ask(proxy, certdir, self.BRIDGE, "D-token") == 401
+            assert upstream.auths_seen == ["Bearer PIN-TOKEN", "Bearer D-token"]
+            assert store.reads == [], "a store read with no owner to find"
+            assert [ln for ln in lines if ln.startswith("swap refused")] == [
+                f"swap refused (404) on POST {self.BRIDGE}: fell-back"], lines
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_an_owner_that_is_the_pinned_account_is_not_a_third_attempt(
+            self, certdir, monkeypatch):
+        import cswap_pin.proxy as pp
+
+        pp._owner_remember(certdir, self.SID, ("a@example.com", "org-a"))
+        proxy, upstream, lines, store = self._fleet(certdir, monkeypatch)
+        try:
+            assert self._ask(proxy, certdir, self.BRIDGE, "D-token") == 401
+            assert upstream.auths_seen == ["Bearer PIN-TOKEN", "Bearer D-token"]
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_the_memo_is_bounded_and_two_writers_keep_each_others_entries(
+            self, certdir, monkeypatch):
+        import threading
+        import cswap_pin.proxy as pp
+
+        old = {"cse_old": [*self.OWNER, time.time() - pp._OWNERS_KEEP_S - 5]}
+        (certdir / pp._OWNERS_FILE).write_text(json.dumps(
+            {"v": 1, "rows": old}))
+        threads, rounds = 6, 20
+        gate = threading.Barrier(threads)
+
+        def write(t):
+            for r in range(rounds):
+                gate.wait()
+                pp._owner_remember(certdir, f"cse_race{t}x{r}", self.OWNER)
+
+        ts = [threading.Thread(target=write, args=(t,)) for t in range(threads)]
+        for t in ts: t.start()
+        for t in ts: t.join()
+        got = json.loads((certdir / pp._OWNERS_FILE).read_text())["rows"]
+        assert "cse_old" not in got, "a row past its retention was kept"
+        assert len(got) == threads * rounds, (
+            f"a concurrent writer dropped an entry: {len(got)}")
+        monkeypatch.setattr(pp, "_OWNERS_MAX", 10)
+        pp._owner_remember(certdir, "cse_newest", self.OWNER)
+        got = json.loads((certdir / pp._OWNERS_FILE).read_text())["rows"]
+        assert len(got) == 10 and "cse_newest" in got, sorted(got)
+
+    def case_the_absolute_form_path_remembers_reaches_and_holds_the_same_way(
+            self, certdir, monkeypatch):
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        store = self._store(monkeypatch)
+        lines = []
+        monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
+
+        def answer(req):
+            bearer = re.search(rb"Authorization: Bearer (\S+)", req).group(1)
+            code = self.FLEET.get(bearer.decode(), 200)
+            return (f"HTTP/1.1 {code} X\r\nContent-Length: 0\r\n\r\n").encode()
+
+        def ask(proxy, bearer, path=self.BRIDGE):
+            c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            try:
+                c.sendall(
+                    f"POST https://api.anthropic.com{path} HTTP/1.1\r\n"
+                    f"Host: api.anthropic.com\r\nAuthorization: Bearer {bearer}"
+                    "\r\nContent-Length: 0\r\n\r\n".encode())
+                got = b""
+                while b"\r\n\r\n" not in got:
+                    d = c.recv(4096)
+                    if not d:
+                        break
+                    got += d
+                return got
+            finally:
+                c.close()
+
+        def start():
+            chain = _RecordingChain(answer)
+            write_upstream_hint(certdir, f"http://127.0.0.1:{chain.port}")
+            proxy = PinProxy(certdir=certdir,
+                             pin_token_provider=self._provider(),
+                             rediscover_chain=True)
+            proxy.start()
+            return proxy, chain
+
+        def bearers(chain):
+            return [re.search(rb"Bearer (\S+)", r).group(1).decode()
+                    for r in chain.seen]
+
+        proxy, chain = start()
+        try:
+            assert ask(proxy, "C-token").startswith(b"HTTP/1.1 200")
+            assert self._memo(certdir, self.SID) == self.OWNER, (
+                lines, bearers(chain), store.reads)
+            chain.seen.clear()
+            assert ask(proxy, "D-token").startswith(b"HTTP/1.1 200")
+            assert bearers(chain) == ["PIN-TOKEN", "D-token", "C-token"], (
+                bearers(chain))
+            assert store.touched == [], store.touched
+        finally:
+            proxy.stop()
+            chain.stop()
+        # the owner's token has expired and cswap can refresh it
+        self._store(monkeypatch, owner_expires=1)
+        proxy, chain = start()
+        try:
+            got = ask(proxy, "D-token")
+            assert got.startswith(b"HTTP/1.1 503") and b"Retry-After" in got, got
+            assert bearers(chain) == ["PIN-TOKEN", "D-token"], bearers(chain)
+        finally:
+            proxy.stop()
+            chain.stop()
