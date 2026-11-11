@@ -183,7 +183,7 @@ class TestBalanceWithoutFiveHour:
 class TestBuildUsageResult:
     @pytest.mark.parametrize(
         "five_hour",
-        [None, {}, {"utilization": None, "resets_at": None}],
+        [None, {}],
     )
     def test_missing_or_null_five_hour_yields_no_window(self, five_hour):
         data = {
@@ -199,21 +199,32 @@ class TestBuildUsageResult:
         assert "five_hour" not in data
         assert "five_hour" not in oauth.build_usage_result(data)
 
+    def test_null_utilization_keeps_the_window_as_unknown(self):
+        # Since upstream 1.0: the limit exists, its figure is unavailable.
+        data = {
+            "five_hour": {"utilization": None, "resets_at": None},
+            "seven_day": {"utilization": 10.0, "resets_at": None},
+        }
+        result = oauth.build_usage_result(data)
+        assert result["five_hour"]["pct"] is None
+        assert result["seven_day"]["pct"] == 10.0
+
     @pytest.mark.parametrize("utilization", [True, False])
     def test_bool_utilization_is_not_a_percentage(self, utilization):
         data = {
             "five_hour": {"utilization": utilization, "resets_at": None},
             "seven_day": {"utilization": 10.0},
         }
-        assert "five_hour" not in oauth.build_usage_result(data)
+        with pytest.raises(oauth._InvalidUsageResponse):
+            oauth.build_usage_result(data)
 
-    def test_stored_null_pct_window_renders_nothing(self):
+    def test_stored_null_pct_window_renders_as_unknown(self):
         from claude_swap.switcher import _format_usage_lines
         from claude_swap.tui.widgets import mini_account_text, usage_rows
 
         usage = {"five_hour": {"pct": None}, "seven_day": {"pct": 40.0}}
-        assert [row[0] for row in usage_rows(usage, NOW)] == ["7d"]
-        assert [line.split(":")[0] for line in _format_usage_lines(usage)] == ["7d"]
+        assert [row[:2] for row in usage_rows(usage, NOW)] == [("5h", None), ("7d", 40.0)]
+        assert [line.split(":")[0] for line in _format_usage_lines(usage)] == ["5h", "7d"]
         from tests.test_tui import make_account
 
         from claude_swap.usage_store import UsageEntry
@@ -222,7 +233,7 @@ class TestBuildUsageResult:
             "1", entry=UsageEntry(last_good=usage, fetched_at=NOW, age_s=1.0)
         )
         plain = mini_account_text(acc, NOW).plain
-        assert "5h" not in plain
+        assert "5h ?" in plain
         assert "7d 40%" in plain
 
     def test_present_zero_without_reset_keeps_the_window(self):

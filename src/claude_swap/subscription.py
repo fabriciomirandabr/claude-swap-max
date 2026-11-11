@@ -3,17 +3,22 @@
 The plan comes from ``GET /api/oauth/profile`` — the same endpoint
 :func:`oauth.fetch_oauth_profile` calls to resolve identity. That function
 returns only the identity it needs; the response carries a good deal more, of
-which four ``organization`` fields are kept here.
+which five ``organization`` fields are kept here.
 
 Measured shapes, one account each:
 
     =====================  ==========  ======================  ===================
     state                  status      rate_limit_tier         billing_type
     =====================  ==========  ======================  ===================
-    active Ultra           active     default_claude_max_20x  stripe_subscription
+    active Max             active      default_claude_max_20x  stripe_subscription
     cancelled, in period   active      default_claude_max_20x  stripe_subscription
     lapsed                 canceled    default_claude_ai       none
     =====================  ==========  ======================  ===================
+
+2026-11-07: an Ultra account carries ``default_claude_max_20x``, organization
+type ``claude_max`` and ``plan_display_name`` "Ultra", so the tier alone does
+not name the plan. An Enterprise seat carries ``default_claude_zero`` and no
+plan name, so its organization type claims the label.
 
 ``subscription_status`` does not move at cancellation, only at lapse, so a
 cancelled-but-still-running subscription is indistinguishable from one that
@@ -70,27 +75,39 @@ MAX_RETRY_S = 24 * 3600
 
 FREE_TIER = "default_claude_ai"
 
+# Used when a record carries no planDisplayName (the server sent none, or the
+# record predates the name and is refetched on the next pass allowed to read
+# it), and when the server's name is only a prefix of the table label ("Max"
+# vs "Max 5x").
+# Only values that have actually been observed. An unknown tier falls back to
+# the raw string rather than a guessed label — a wrong "Pro" is worse than an
+# honest "default_claude_pro".
 _TIER_LABELS = {
     "default_claude_ai": "Free",
-    "default_claude_max_5x": "Max",
-    "default_claude_max_20x": "Ultra",
+    "default_claude_max_5x": "Max 5x",
+    "default_claude_max_20x": "Max 20x",
 }
 
-_TIER_KEYWORD_LABELS = (
-    ("ultra", "Ultra"),
-    ("pro", "Pro"),
-)
-
-# A seat on a Team organization is not a personal subscription, whatever rate
-# tier the seat carries, so the organization type wins where it is known.
+# A seat on a Team or Enterprise organization is not a personal subscription,
+# whatever rate tier the seat carries, so the organization type wins where it
+# is known.
+#
+# ``claude_pro`` is the same story with a different label: a paying Pro
+# subscription reports the *default* rate-limit bucket (``default_claude_ai``),
+# which is also what a lapsed account falls back to, so the tier alone would
+# print "Free" for a subscriber who is paying. The organization type is the
+# field that still names the plan.
 _ORG_TYPE_LABELS = {
     "claude_team": "Team",
+    "claude_enterprise": "Enterprise",
+    "claude_pro": "Pro",
 }
 
 _KEPT_FIELDS = (
     ("organization_type", "organizationType"),
     ("billing_type", "billingType"),
     ("subscription_status", "subscriptionStatus"),
+    ("plan_display_name", "planDisplayName"),
 )
 
 
@@ -121,9 +138,7 @@ def fetch_plan(access_token: str, timeout: float = 5.0) -> PlanFetch:
         },
     )
     try:
-        with urllib.request.urlopen(
-            req, timeout=timeout, context=oauth._pin_aware_ssl_context()
-        ) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode())
     except Exception as e:  # noqa: BLE001 — display-only; never let it surface
         _logger.debug("Plan fetch failed: %r", e)
@@ -140,6 +155,8 @@ def fetch_plan(access_token: str, timeout: float = 5.0) -> PlanFetch:
         value = organization.get(source)
         if isinstance(value, str) and value:
             plan[key] = value
+    # Always present (None if unsent): is_due reads a missing key as an old record.
+    plan.setdefault("planDisplayName", None)
     account = data.get("account")
     account_uuid = account.get("uuid") if isinstance(account, dict) else None
     organization_uuid = organization.get("uuid")
@@ -177,22 +194,25 @@ def next_retry_at(now: float, retry_after_s: float | None) -> float:
 
 
 def plan_label(plan: dict | None) -> str | None:
-    """Human label: organization type where known, else the mapped tier, else
-    a tier with an ``ultra`` or ``pro`` ``_``-separated token, else the raw
-    tier."""
+    """Human label: organization type where known, else the server's plan name,
+    else tier, else raw tier."""
     if not plan:
         return None
     org_label = _ORG_TYPE_LABELS.get(plan.get("organizationType"))
     if org_label:
         return org_label
     tier = plan.get("tier")
-    if tier in _TIER_LABELS:
-        return _TIER_LABELS[tier]
-    tokens = tier.lower().split("_")
-    for keyword, label in _TIER_KEYWORD_LABELS:
-        if keyword in tokens:
-            return label
-    return tier
+    label = _TIER_LABELS.get(tier, tier)
+    # The server's name wins unless the table names the same plan more
+    # precisely ("Max" vs "Max 5x"); Ultra shares the Max 20x tier string.
+    name = plan.get("planDisplayName")
+    if (
+        isinstance(name, str)
+        and name
+        and not (isinstance(label, str) and label.startswith(name))
+    ):
+        return name
+    return label
 
 
 def is_expired(plan: dict | None) -> bool:
@@ -250,8 +270,20 @@ def is_due(record: object, now: float, ttl: float = PLAN_TTL_S) -> bool:
             return False
     if not valid_record(record):
         return True
+    if "planDisplayName" not in record["plan"]:  # stored before the name was kept
+        return True
     fetched_at = record["fetchedAt"]
     return fetched_at > now or now - fetched_at >= ttl
+
+
+def _past_stamp(record: dict, key: str, now: float) -> float | None:
+    """A stored stamp that may take part in ordering: a number no later than
+    ``now``. A stamp ahead of the clock was written before the clock was set
+    back; it says nothing about recency, so it is treated as absent."""
+    value = record.get(key)
+    if _is_number(value) and value <= now:
+        return value
+    return None
 
 
 def _merge(existing: object, update: dict, now: float) -> dict:
@@ -259,31 +291,28 @@ def _merge(existing: object, update: dict, now: float) -> dict:
 
     ``update`` is a success (``plan``, ``fetchedAt``) or a failure (``retryAt``,
     ``attemptedAt``). Both are stamped before their request went out, so an
-    answer that was slow to arrive cannot pass for a newer one. A stored stamp
-    later than ``now`` is clock skew and counts as absent.
+    answer that was slow to arrive cannot pass for a newer one, and an older
+    failure cannot shorten the wait a newer one set. A stored stamp ahead of
+    ``now`` is clock skew and never outranks the update: ``is_due`` asks for a
+    fresh read of such a record, and that read has to be allowed to land, or
+    the old label would stand while the endpoint was asked on every pass.
     """
     current = existing if isinstance(existing, dict) else {}
-    fetched_at = (
-        current["fetchedAt"]
-        if valid_record(current) and current["fetchedAt"] <= now
-        else None
-    )
-    attempted_at = current.get("attemptedAt")
-    if not _is_number(attempted_at) or attempted_at > now:
-        attempted_at = None
+    fetched = _past_stamp(current, "fetchedAt", now) if valid_record(current) else None
+    attempted = _past_stamp(current, "attemptedAt", now)
     if "plan" in update:
-        if fetched_at is not None and fetched_at > update["fetchedAt"]:
+        if fetched is not None and fetched > update["fetchedAt"]:
             return current
-        if attempted_at is not None and attempted_at > update["fetchedAt"]:
+        if attempted is not None and attempted > update["fetchedAt"]:
             return {
                 **update,
                 "retryAt": current.get("retryAt"),
-                "attemptedAt": attempted_at,
+                "attemptedAt": attempted,
             }
         return update
-    if fetched_at is not None and fetched_at >= update["attemptedAt"]:
+    if fetched is not None and fetched >= update["attemptedAt"]:
         return current
-    if attempted_at is not None and attempted_at >= update["attemptedAt"]:
+    if attempted is not None and attempted > update["attemptedAt"]:
         return current
     return {**current, **update}
 
@@ -310,8 +339,11 @@ class PlanStore:
     def save(self, updates: dict[str, dict]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with FileLock(self.path.with_name(self.path.name + ".lock")):
-            merged = self.load()
+            # Read the clock under the lock: a record another writer landed
+            # while this one waited carries a stamp later than a clock read
+            # before the wait, and would be mistaken for skew and overwritten.
             now = self.clock()
+            merged = self.load()
             for key, update in updates.items():
                 merged[key] = _merge(merged.get(key), update, now)
             atomic_write_json(self.path, merged)

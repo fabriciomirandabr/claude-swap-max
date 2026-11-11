@@ -440,14 +440,17 @@ EXPECTED_WRITE_SITE_ROSTER: dict[tuple[str, str], int] = {
     ("switcher.py", "persist_backup_credentials"): 1,
     ("switcher.py", "_consume_backup_grant_locked"): 2,
     ("switcher.py", "_adopt_stashed_successor"): 1,
-    ("switcher.py", "_adopt_session_credential"): 1,
+    ("switcher.py", "_adopt_session_credential_locked"): 1,
     ("switcher.py", "add_account"): 2,
     ("switcher.py", "add_account_from_token"): 2,
     ("switcher.py", "_fetch_active_usage"): 2,
     ("switcher.py", "_resync_rotated_backup"): 1,
     ("switcher.py", "_perform_switch_locked"): 1,
+    # Upstream 1.0 (#523/#571): advances the owning slot's backup to a strictly
+    # newer live generation. Not attributed=True, so the chokepoint still
+    # verifies the bytes belong to that slot before writing.
+    ("switcher.py", "_rescue_foreign_successor"): 1,
     ("transfer.py", "import_accounts"): 1,
-    ("migrations.py", "migrate_windows_keyring_to_files"): 1,
 }
 
 # The chokepoint's own forwarding bodies: present in the AST but not

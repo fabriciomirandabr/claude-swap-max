@@ -33,12 +33,12 @@ from claude_swap.autoswitch import (
 from claude_swap import pin
 from claude_swap.identity import masked_email
 from claude_swap.lines import binding_window
-from claude_swap.models import AccountsSnapshot
+from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
 from claude_swap.tui import data
 from claude_swap.tui.modals import ConfirmModal
 from claude_swap.tui.theme import Palette
-from claude_swap.tui.widgets import AccountsPanel
+from claude_swap.tui.widgets import AccountsPanel, fit_login, login_segment
 
 if TYPE_CHECKING:
     from claude_swap.tui.app import CswapApp
@@ -328,8 +328,12 @@ class AutoScreen(Screen):
         models = parse_model_names(settings.model) if settings else ()
         threshold = settings.threshold if settings else 90.0
         weekly = settings.weekly_threshold if settings else None
+        candidates = [
+            acc for acc in snap.accounts
+            if acc.number != active_number and acc.switchable
+        ]
         ranked: list[tuple[float, str]] = []  # (sort key: -policy headroom, number)
-        lines: dict[str, Text] = {}
+        lines: dict[str, tuple[AccountSnapshot, Text, Text]] = {}  # (acc, name, the rest)
         # The badge rides on that account's own row rather than the summary
         # line: naming the pin separately makes you match an email against the
         # list directly below it instead of just reading the list.
@@ -339,9 +343,7 @@ class AutoScreen(Screen):
         # mistake was fixed for the pin lookup itself — see the test that pins
         # its call count.
         pin_applying = pin.pin_is_applying(self.app.switcher) if pinned_identity else None
-        for acc in snap.accounts:
-            if acc.number == active_number or not acc.switchable:
-                continue
+        for acc in candidates:
             line = (
                 acc.policy.threshold if acc.policy.threshold is not None else threshold
             )
@@ -351,9 +353,9 @@ class AutoScreen(Screen):
                 weekly,
                 scale=threshold,
             )
-            entry = Text()
-            entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
-            entry.append(
+            head, entry = Text(), Text()
+            head.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
+            head.append(
                 masked_email(acc.alias, acc.email, show_email=self.app.show_email),
                 style=palette.foreground,
             )
@@ -395,13 +397,22 @@ class AutoScreen(Screen):
                     entry.append("⚠ cloud UNPINNED", style=f"bold {palette.sev_crit}")
                 else:
                     entry.append("○ cloud", style=f"bold {palette.sev_warn}")
-            lines[acc.number] = entry
+            lines[acc.number] = (acc, head, entry)
 
         text = Text()
         text.append("Next best", style=palette.muted)
         if not ranked:
             text.append("\n  no other switchable accounts", style=palette.muted)
             return text
-        for _pct, number in sorted(ranked):
-            text.append(lines[number])
+        order = [lines[number] for _pct, number in sorted(ranked)]
+        # The box has no width before its first layout; its CSS padding is 2 a side.
+        budget = self.query_one("#candidates", Static).size.width or self.app.size.width - 4
+        for row in fit_login(
+            lambda login: [
+                Text.assemble(head, tail, Text(login_segment(acc, login), style=palette.muted))
+                for acc, head, tail in order
+            ],
+            budget,
+        ):
+            text.append(row)
         return text

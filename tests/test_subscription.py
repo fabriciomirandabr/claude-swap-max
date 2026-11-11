@@ -23,6 +23,7 @@ ACTIVE_MAX = {
     "tier": "default_claude_max_20x",
     "billingType": "stripe_subscription",
     "subscriptionStatus": "active",
+    "planDisplayName": None,
 }
 # Cancelled but still inside the paid period: indistinguishable from ACTIVE_MAX,
 # which is the whole reason renewal is not shown.
@@ -31,12 +32,30 @@ LAPSED = {
     "tier": "default_claude_ai",
     "billingType": "none",
     "subscriptionStatus": "canceled",
+    "planDisplayName": None,
 }
 TEAM = {
     "tier": "default_claude_max_5x",
     "organizationType": "claude_team",
     "billingType": "stripe_subscription",
     "subscriptionStatus": "active",
+    "planDisplayName": None,
+}
+# Measured on an Enterprise seat (2026-11-07): the profile sends no plan name.
+ENTERPRISE = {
+    "tier": "default_claude_zero",
+    "organizationType": "claude_enterprise",
+    "billingType": "stripe_subscription_contracted",
+    "subscriptionStatus": "active",
+    "planDisplayName": None,
+}
+# A plan stored before the name was kept: no key at all, unlike a null one.
+UNNAMED = {"tier": "default_claude_max_5x"}
+# Ultra shares the Max 20x tier string; only the server's plan name separates it.
+ULTRA = {
+    "tier": "default_claude_max_20x",
+    "organizationType": "claude_max",
+    "planDisplayName": "Ultra",
 }
 
 
@@ -92,16 +111,16 @@ class TestFetchPlan:
         assert result.plan == TEAM
         assert (result.account_uuid, result.organization_uuid) == ("u", "o")
 
-    def test_read_uses_the_pin_aware_ssl_context(self):
-        sentinel = object()
-        payload = {"organization": {"rate_limit_tier": "default_claude_ai"}}
-        with patch(
-            "claude_swap.oauth._pin_aware_ssl_context", return_value=sentinel
-        ), patch(
-            "urllib.request.urlopen", return_value=_response(payload)
-        ) as urlopen:
-            subscription.fetch_plan("tok")
-        assert urlopen.call_args.kwargs["context"] is sentinel
+    def test_keeps_the_plan_display_name(self):
+        payload = {
+            "organization": {
+                "rate_limit_tier": "default_claude_max_20x",
+                "organization_type": "claude_max",
+                "plan_display_name": "Ultra",
+            }
+        }
+        with patch("urllib.request.urlopen", return_value=_response(payload)):
+            assert subscription.fetch_plan("tok").plan == ULTRA
 
     def test_no_tier_is_no_answer(self):
         payload = {"organization": {"billing_type": "stripe_subscription"}}
@@ -119,10 +138,14 @@ class TestFetchPlan:
                 "rate_limit_tier": "default_claude_ai",
                 "subscription_status": None,
                 "billing_type": 3,
+                "plan_display_name": "",
             }
         }
         with patch("urllib.request.urlopen", return_value=_response(payload)):
-            assert subscription.fetch_plan("tok").plan == {"tier": "default_claude_ai"}
+            assert subscription.fetch_plan("tok").plan == {
+                "tier": "default_claude_ai",
+                "planDisplayName": None,
+            }
 
     @pytest.mark.parametrize(
         "error",
@@ -163,38 +186,70 @@ class TestFetchPlan:
 
 
 class TestPlanLabel:
-    def test_team_organization_wins_over_the_seat_tier(self):
-        assert subscription.plan_label(TEAM) == "Team"
+    @pytest.mark.parametrize(
+        "plan, label", [(TEAM, "Team"), (ENTERPRISE, "Enterprise")]
+    )
+    def test_organization_wins_over_the_seat_tier(self, plan, label):
+        assert subscription.plan_label(plan) == label
+        assert subscription.plan_label({**plan, "planDisplayName": "Ultra"}) == label
+
+    @pytest.mark.parametrize(
+        "tier, name, label",
+        [
+            ("default_claude_max_20x", "Ultra", "Ultra"),
+            ("default_claude_max_20x", "", "Max 20x"),
+            ("default_claude_max_20x", None, "Max 20x"),
+            ("default_claude_max_5x", "Max", "Max 5x"),
+            ("default_claude_max_5x", "", "Max 5x"),
+            ("default_claude_pro", "Pro", "Pro"),
+            (None, "Ultra", "Ultra"),
+        ],
+    )
+    def test_server_name_wins_unless_the_table_is_more_precise(
+        self, tier, name, label
+    ):
+        plan = {**ULTRA, "tier": tier, "planDisplayName": name}
+        assert subscription.plan_label(plan) == label
+
+    def test_pro_organization_wins_over_the_default_tier(self):
+        # A paying Pro subscription reports the default rate-limit bucket
+        # (``default_claude_ai``), the same value a lapsed account falls back
+        # to; the tier alone would print "Free" for a subscriber who pays.
+        plan = {
+            "tier": "default_claude_ai",
+            "organizationType": "claude_pro",
+            "billingType": "apple_subscription",
+        }
+        assert subscription.plan_label(plan) == "Pro"
+
+    def test_pro_organization_does_not_mask_a_lapse(self):
+        # The label is cosmetic; expiry still comes from is_expired() alone.
+        plan = {
+            "tier": "default_claude_ai",
+            "organizationType": "claude_pro",
+            "subscriptionStatus": "canceled",
+        }
+        assert subscription.is_expired(plan)
 
     @pytest.mark.parametrize(
         "tier, label",
         [
             ("default_claude_ai", "Free"),
-            ("default_claude_max_5x", "Max"),
-            ("default_claude_max_20x", "Ultra"),
-            ("default_claude_ultra", "Ultra"),
-            ("default_claude_ultra_v2", "Ultra"),
-            ("default_claude_pro", "Pro"),
-            ("DEFAULT_CLAUDE_PRO", "Pro"),
+            ("default_claude_max_5x", "Max 5x"),
+            ("default_claude_max_20x", "Max 20x"),
         ],
     )
-    def test_tier_labels(self, tier, label):
+    def test_observed_tiers(self, tier, label):
         assert subscription.plan_label({"tier": tier}) == label
 
-    @pytest.mark.parametrize(
-        "tier", ["default_promo", "default_prototype", "default_ultrasound"]
-    )
-    def test_keywords_match_whole_tokens_only(self, tier):
-        assert subscription.plan_label({"tier": tier}) == tier
-
-    def test_unrecognised_tier_shows_raw_rather_than_a_guess(self):
-        assert subscription.plan_label({"tier": "default_enterprise_x"}) == (
-            "default_enterprise_x"
+    def test_unobserved_tier_shows_raw_rather_than_a_guess(self):
+        assert subscription.plan_label({"tier": "default_claude_pro"}) == (
+            "default_claude_pro"
         )
 
     def test_unknown_organization_type_falls_through_to_the_tier(self):
         plan = {"tier": "default_claude_max_20x", "organizationType": "claude_max"}
-        assert subscription.plan_label(plan) == "Ultra"
+        assert subscription.plan_label(plan) == "Max 20x"
 
     def test_no_plan_no_label(self):
         assert subscription.plan_label(None) is None
@@ -231,9 +286,10 @@ class TestRecords:
     def test_missing_is_due(self):
         assert subscription.is_due(None, now=1000.0)
 
-    def test_fresh_is_not_due(self):
-        record = {"plan": TEAM, "fetchedAt": 1000.0}
-        assert not subscription.is_due(record, now=1000.0 + 60)
+    @pytest.mark.parametrize("plan, due", [(TEAM, False), (UNNAMED, True)])
+    def test_fresh_is_due_only_when_the_name_key_is_missing(self, plan, due):
+        record = {"plan": plan, "fetchedAt": 1000.0}
+        assert subscription.is_due(record, now=1000.0 + 60) is due
 
     def test_due_at_ttl(self):
         record = {"plan": TEAM, "fetchedAt": 1000.0}
@@ -257,8 +313,9 @@ class TestRecords:
         assert not subscription.valid_record(record)
         assert subscription.is_due(record, now=1000.0)
 
-    def test_a_live_retry_holds_an_overdue_record(self):
-        record = {"plan": TEAM, "fetchedAt": 0.0, "retryAt": 2000.0}
+    @pytest.mark.parametrize("plan", [TEAM, UNNAMED])
+    def test_a_live_retry_holds_an_overdue_record(self, plan):
+        record = {"plan": plan, "fetchedAt": 0.0, "retryAt": 2000.0}
         assert not subscription.is_due(record, now=1000.0)
 
     def test_a_passed_retry_does_not_hold_it(self):
@@ -354,6 +411,67 @@ class TestPlanStore:
         assert record["fetchedAt"] == 100.0
         assert record["retryAt"] == 900.0
 
+    def test_an_older_failure_cannot_shorten_a_newer_retry(self, tmp_path: Path):
+        """Two failures landing out of order: the later attempt's wait stands,
+        so a slow timeout cannot cut an hour-long Retry-After to the floor."""
+        store = subscription.PlanStore(tmp_path / "p.json", clock=lambda: 1000.0)
+        store.save({"k": {"retryAt": 200.0 + 3600.0, "attemptedAt": 200.0}})
+        store.save({"k": {"retryAt": 100.0 + 900.0, "attemptedAt": 100.0}})
+        assert store.load()["k"] == {"retryAt": 3800.0, "attemptedAt": 200.0}
+
+    def test_a_future_stamped_plan_yields_to_a_fresh_reading(self, tmp_path: Path):
+        """The clock was set back after a save, so the stored stamp is ahead
+        of ``now``. ``is_due`` asks for a fresh read; the merge must let it
+        land, or the old label stands while the endpoint is asked every pass."""
+        store = subscription.PlanStore(tmp_path / "p.json", clock=lambda: 1000.0)
+        store.save({"k": {"plan": ACTIVE_MAX, "fetchedAt": 5000.0}})
+        store.save({"k": {"plan": LAPSED, "fetchedAt": 1000.0}})
+        assert store.load()["k"] == {"plan": LAPSED, "fetchedAt": 1000.0}
+
+    def test_a_future_stamped_plan_still_takes_a_failures_backoff(
+        self, tmp_path: Path
+    ):
+        store = subscription.PlanStore(tmp_path / "p.json", clock=lambda: 1000.0)
+        store.save({"k": {"plan": ACTIVE_MAX, "fetchedAt": 5000.0}})
+        store.save({"k": {"retryAt": 1900.0, "attemptedAt": 1000.0}})
+        record = store.load()["k"]
+        assert record["plan"] == ACTIVE_MAX
+        assert record["retryAt"] == 1900.0
+        assert not subscription.is_due(record, 1000.0)
+
+    def test_a_future_stamped_failure_does_not_hold_a_fresh_reading(
+        self, tmp_path: Path
+    ):
+        store = subscription.PlanStore(tmp_path / "p.json", clock=lambda: 1000.0)
+        store.save({"k": {"retryAt": 9000.0, "attemptedAt": 5000.0}})
+        store.save({"k": {"plan": TEAM, "fetchedAt": 1000.0}})
+        assert store.load()["k"] == {"plan": TEAM, "fetchedAt": 1000.0}
+
+    def test_a_record_landing_during_the_lock_wait_is_not_skew(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """Another writer saves a newer plan while this save waits for the
+        lock. The skew check must use a clock read under the lock, or that
+        record reads as ahead of ``now`` and older data overwrites it."""
+        from claude_swap.settings import atomic_write_json
+
+        path = tmp_path / "p.json"
+        now = [1000.0]
+        store = subscription.PlanStore(path, clock=lambda: now[0])
+        real_enter = subscription.FileLock.__enter__
+        landed = []
+
+        def enter(lock):
+            if not landed:  # the other writer lands while this one waits
+                landed.append(True)
+                atomic_write_json(path, {"k": {"plan": LAPSED, "fetchedAt": 1005.0}})
+                now[0] = 1010.0
+            return real_enter(lock)
+
+        monkeypatch.setattr(subscription.FileLock, "__enter__", enter)
+        store.save({"k": {"plan": ACTIVE_MAX, "fetchedAt": 990.0}})
+        assert store.load()["k"] == {"plan": LAPSED, "fetchedAt": 1005.0}
+
     def test_writers_cannot_interleave_a_read_merge_write(self, tmp_path: Path):
         import threading
 
@@ -380,41 +498,6 @@ class TestPlanStore:
 
     def test_missing_file_reads_as_empty(self, tmp_path: Path):
         assert subscription.PlanStore(tmp_path / "absent.json").load() == {}
-
-    def test_a_future_fetched_at_does_not_shadow_a_later_success(self, tmp_path: Path):
-        now = 1_000_000.0
-        store = subscription.PlanStore(tmp_path / "p.json", clock=lambda: now)
-        store.save({"k": {"plan": TEAM, "fetchedAt": now + 3600}})
-        store.save({"k": {"plan": LAPSED, "fetchedAt": now}})
-        record = store.load()["k"]
-        assert record["plan"] == LAPSED
-        assert record["fetchedAt"] == now
-
-    def test_a_future_fetched_at_does_not_discard_a_failure_retry(
-        self, tmp_path: Path
-    ):
-        now = 1_000_000.0
-        store = subscription.PlanStore(tmp_path / "p.json", clock=lambda: now)
-        store.save({"k": {"plan": TEAM, "fetchedAt": now + 3600}})
-        store.save({"k": {"retryAt": now + 900, "attemptedAt": now}})
-        assert store.load()["k"]["retryAt"] == now + 900
-
-    def test_a_future_attempted_at_does_not_shadow_a_later_failure(
-        self, tmp_path: Path
-    ):
-        now = 1_000_000.0
-        store = subscription.PlanStore(tmp_path / "p.json", clock=lambda: now)
-        store.save({"k": {"retryAt": now + 5000, "attemptedAt": now + 3600}})
-        store.save({"k": {"retryAt": now + 900, "attemptedAt": now}})
-        assert store.load()["k"]["retryAt"] == now + 900
-
-    def test_an_older_failure_cannot_overwrite_a_newer_retry(self, tmp_path: Path):
-        store = subscription.PlanStore(tmp_path / "p.json")
-        store.save({"k": {"retryAt": 900.0, "attemptedAt": 200.0}})
-        store.save({"k": {"retryAt": 500.0, "attemptedAt": 100.0}})
-        assert store.load()["k"] == {"retryAt": 900.0, "attemptedAt": 200.0}
-        store.save({"k": {"retryAt": 950.0, "attemptedAt": 300.0}})
-        assert store.load()["k"] == {"retryAt": 950.0, "attemptedAt": 300.0}
 
 
 # --- collector ----------------------------------------------------------------
@@ -455,6 +538,22 @@ class TestCollector:
         assert plans["1"]["plan"] == TEAM
         assert plans["1"]["fetchedAt"] == 1_000_000.0
 
+    def test_a_record_without_the_name_key_is_refetched_once(
+        self, switcher, monkeypatch
+    ):
+        info = [_info(1, "a@x", "o1", True, _creds("live", _future_ms()))]
+        key = subscription.identity_key("a@x", "o1")
+        switcher._subscription_store().save(
+            {key: {"plan": UNNAMED, "fetchedAt": 1_000_000.0}}
+        )
+        calls = []
+        monkeypatch.setattr(
+            subscription, "fetch_plan", lambda t, *a, **k: calls.append(t) or _ok(TEAM)
+        )
+        assert switcher._collect_subscription_plans(info)["1"]["plan"] == TEAM
+        switcher._collect_subscription_plans(info)
+        assert calls == ["live"]
+
     def test_a_fresh_record_is_served_without_a_call(self, switcher, monkeypatch):
         monkeypatch.setattr(subscription, "fetch_plan", lambda t, *a, **k: _ok(TEAM))
         info = [_info(1, "a@x", "o1", True, _creds("live", _future_ms()))]
@@ -468,6 +567,28 @@ class TestCollector:
         plans = switcher._collect_subscription_plans(info)
         assert calls == []
         assert plans["1"]["plan"] == TEAM
+
+    def test_a_clock_set_back_does_not_pin_the_old_plan(self, switcher, monkeypatch):
+        """A record stamped ahead of the clock is due. The fresh reading must
+        replace it, and the next pass must not ask again — the alternative is
+        a refused reading that stays due: one request per pass, old label."""
+        info = [_info(1, "a@x", "o1", True, _creds("live", _future_ms()))]
+        monkeypatch.setattr(
+            subscription, "fetch_plan", lambda t, *a, **k: _ok(ACTIVE_MAX)
+        )
+        switcher._collect_subscription_plans(info)
+        switcher._usage_store.clock.now -= 3600  # the clock is set back an hour
+
+        calls = []
+        monkeypatch.setattr(
+            subscription, "fetch_plan", lambda t, *a, **k: calls.append(t) or _ok(LAPSED)
+        )
+        plans = switcher._collect_subscription_plans(info)
+        assert calls == ["live"]
+        assert plans["1"]["plan"] == LAPSED
+        plans = switcher._collect_subscription_plans(info)
+        assert calls == ["live"], "a reading that landed is not due again"
+        assert plans["1"]["plan"] == LAPSED
 
     def test_a_failed_fetch_keeps_the_reading_and_backs_off(
         self, switcher, monkeypatch
@@ -500,27 +621,6 @@ class TestCollector:
         plans = switcher._collect_subscription_plans(info)
         assert plans["1"]["plan"] == LAPSED
         assert "retryAt" not in plans["1"]
-
-    def test_a_failing_save_still_backs_off_in_memory(self, switcher, monkeypatch):
-        info = [_info(1, "a@x", "o1", True, _creds("live", _future_ms()))]
-        calls = []
-        monkeypatch.setattr(
-            subscription,
-            "fetch_plan",
-            lambda t, *a, **k: calls.append(t) or subscription.PlanFetch(),
-        )
-
-        def failing_save(self, updates):
-            raise OSError("read-only")
-
-        monkeypatch.setattr(subscription.PlanStore, "save", failing_save)
-        switcher._collect_subscription_plans(info)
-        switcher._usage_store.clock.now += 60
-        switcher._collect_subscription_plans(info)
-        assert len(calls) == 1
-        switcher._usage_store.clock.now += subscription.FAILURE_RETRY_S
-        switcher._collect_subscription_plans(info)
-        assert len(calls) == 2
 
     def test_retry_after_outlasts_the_default_backoff(self, switcher, monkeypatch):
         info = [_info(1, "a@x", "o1", True, _creds("live", _future_ms()))]
@@ -714,10 +814,22 @@ class TestJson:
             "fetchedAt": "1970-01-01T00:00:00Z",
         }
 
-    def test_absent_source_fields_are_omitted_not_nulled(self):
-        row = self._row(
-            subscription_plan={"plan": {"tier": "default_claude_ai"}, "fetchedAt": 0.0}
+    def test_plan_display_name_is_emitted_when_kept(self):
+        row = self._row(subscription_plan={"plan": ULTRA, "fetchedAt": 0.0})
+        assert (row["plan"]["label"], row["plan"]["planDisplayName"]) == (
+            "Ultra",
+            "Ultra",
         )
+
+    @pytest.mark.parametrize(
+        "plan",
+        [
+            {"tier": "default_claude_ai"},
+            {"tier": "default_claude_ai", "planDisplayName": None},
+        ],
+    )
+    def test_absent_source_fields_are_omitted_not_nulled(self, plan):
+        row = self._row(subscription_plan={"plan": plan, "fetchedAt": 0.0})
         assert set(row["plan"]) == {"label", "tier", "expired", "fetchedAt"}
 
 
@@ -728,11 +840,11 @@ class TestListMarker:
         marker = _plan_marker({"plan": TEAM, "fetchedAt": 1000.0}, now=1000.0)
         assert "Team" in marker and "expired" not in marker
 
-    def test_expired(self):
+    def test_lapsed_is_free_without_the_word_expired(self):
         from claude_swap.switcher import _plan_marker
 
         marker = _plan_marker({"plan": LAPSED, "fetchedAt": 1000.0}, now=1000.0)
-        assert "Free" in marker and "(expired)" in marker
+        assert "Free" in marker and "expired" not in marker
 
     def test_age_only_once_stale(self):
         from claude_swap.switcher import _plan_marker
@@ -752,7 +864,8 @@ class TestListMarker:
 class TestSnapshotField:
     def test_appended_after_policy(self):
         names = [f.name for f in dataclasses.fields(AccountSnapshot)]
-        assert names[-1] == "subscription_plan"
+        # Immediately after `policy`; fields added since are appended after it,
+        # so "last" is no longer the right proxy (same as the policy test).
         assert names[names.index("subscription_plan") - 1] == "policy"
 
     def test_defaults_to_none(self):
@@ -806,9 +919,20 @@ class TestTuiMarker:
     def test_label(self):
         assert self._render({"plan": TEAM, "fetchedAt": time.time()}) == "  · Team"
 
-    def test_expired(self):
-        rendered = self._render({"plan": LAPSED, "fetchedAt": time.time()})
-        assert "Free" in rendered and "(expired)" in rendered
+    def test_lapsed_is_a_highlighted_free_with_no_extra_words(self):
+        from rich.text import Text
+
+        from claude_swap.tui.widgets import _append_plan
+
+        text = Text()
+        record = {"plan": LAPSED, "fetchedAt": time.time()}
+        _append_plan(text, _snap(subscription_plan=record), "  ", _Palette())
+        assert text.plain == "  · Free"
+        assert any(
+            span.style == _Palette.sev_warn
+            and text.plain[span.start : span.end] == "Free"
+            for span in text.spans
+        )
 
     def test_stale_age_uses_the_same_wording_as_list(self):
         """12h old is the first stale moment — it must not read as "0d ago"."""

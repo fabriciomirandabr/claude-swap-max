@@ -2255,6 +2255,16 @@ class TestTheTuiSurfaceSurvivesTheSplit:
             raising=False,
         )
 
+        # The candidates box sizes the login note by its own width (upstream
+        # 1.0); this screen was never mounted, so give it a laid-out box.
+        monkeypatch.setattr(
+            autoview.AutoScreen,
+            "query_one",
+            lambda self, *a, **k: types.SimpleNamespace(
+                size=types.SimpleNamespace(width=200)
+            ),
+            raising=False,
+        )
         monkeypatch.setattr(autoview.pin, "pinned_identity", lambda sw: (pinned, ""))
         with_pin = screen._candidates_text(snap, accounts[0].number).plain
         monkeypatch.setattr(autoview.pin, "pinned_identity", lambda sw: None)
