@@ -122,6 +122,17 @@ class TestFetchPlan:
         with patch("urllib.request.urlopen", return_value=_response(payload)):
             assert subscription.fetch_plan("tok").plan == ULTRA
 
+    def test_read_uses_the_pin_aware_ssl_context(self):
+        sentinel = object()
+        payload = {"organization": {"rate_limit_tier": "default_claude_ai"}}
+        with patch(
+            "claude_swap.oauth._pin_aware_ssl_context", return_value=sentinel
+        ), patch(
+            "urllib.request.urlopen", return_value=_response(payload)
+        ) as urlopen:
+            subscription.fetch_plan("tok")
+        assert urlopen.call_args.kwargs["context"] is sentinel
+
     def test_no_tier_is_no_answer(self):
         payload = {"organization": {"billing_type": "stripe_subscription"}}
         with patch("urllib.request.urlopen", return_value=_response(payload)):
@@ -621,6 +632,27 @@ class TestCollector:
         plans = switcher._collect_subscription_plans(info)
         assert plans["1"]["plan"] == LAPSED
         assert "retryAt" not in plans["1"]
+
+    def test_a_failing_save_still_backs_off_in_memory(self, switcher, monkeypatch):
+        info = [_info(1, "a@x", "o1", True, _creds("live", _future_ms()))]
+        calls = []
+        monkeypatch.setattr(
+            subscription,
+            "fetch_plan",
+            lambda t, *a, **k: calls.append(t) or subscription.PlanFetch(),
+        )
+
+        def failing_save(self, updates):
+            raise OSError("read-only")
+
+        monkeypatch.setattr(subscription.PlanStore, "save", failing_save)
+        switcher._collect_subscription_plans(info)
+        switcher._usage_store.clock.now += 60
+        switcher._collect_subscription_plans(info)
+        assert len(calls) == 1
+        switcher._usage_store.clock.now += subscription.FAILURE_RETRY_S
+        switcher._collect_subscription_plans(info)
+        assert len(calls) == 2
 
     def test_retry_after_outlasts_the_default_backoff(self, switcher, monkeypatch):
         info = [_info(1, "a@x", "o1", True, _creds("live", _future_ms()))]

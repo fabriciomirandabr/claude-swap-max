@@ -10407,6 +10407,10 @@ class TestProvenanceGuard:
             for p in patches:
                 p.stop()
         assert creds_store[("1", "test@example.com")] == "sk-ant-api03-old"
+        assert "sk-ant-api03-new" in [
+            _read_safety_copy(switcher, entry_id)
+            for entry_id in switcher.list_unclaimed_credentials()
+        ]
 
     _STALE_LOGIN = json.dumps({"claudeAiOauth": {
         "accessToken": "sk-other", "refreshToken": "rt-other",
@@ -15018,6 +15022,19 @@ class TestGateUltraReviewFixes:
         verdict, wrote = self._rescue(2_000)
         assert verdict is True
         wrote.assert_called_once()
+
+    def test_the_rescue_returns_false_when_the_attribution_guard_refuses(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        email = "account2@example.com"
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("2", email, self._OLD)
+        before, _ = s._read_account_credentials_ex("2", email)
+        data = {"accounts": {"2": {"email": email}}}
+
+        assert s._rescue_foreign_successor("2", data, self._NEW) is False
+        assert s._read_account_credentials_ex("2", email)[0] == before
+        assert before == self._OLD
 
     @pytest.mark.parametrize("refusal", ["blocked", ValueError, TypeError])
     def test_the_rescue_does_not_absorb_a_refused_backup_write(

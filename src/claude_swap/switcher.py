@@ -9035,7 +9035,9 @@ class ClaudeAccountSwitcher:
         no expiry to compare (a setup token). The caller has already written
         the safety copy, so this never removes the only copy of anything.
         Called inside the switch's locks. Store and lock faults return
-        False; a refusal from the write propagates.
+        False, and so does a refusal from the attribution guard (the write is
+        not attributed, so the guard refuses a lineage that differs from the
+        stored one); any other refusal from the write propagates.
         """
         try:
             live = oauth.extract_oauth_data(original_creds) or {}
@@ -9076,6 +9078,13 @@ class ClaudeAccountSwitcher:
                 foreign_slot,
             )
             return True
+        except CredentialWriteError:
+            self._logger.warning(
+                "The attribution guard refused to advance account %s's backup "
+                "to its newer live credential; the safety copy keeps it.",
+                foreign_slot,
+            )
+            return False
         except (OSError, LockError):
             self._logger.warning(
                 "Could not advance account %s's backup to its newer live "

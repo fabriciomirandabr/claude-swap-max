@@ -446,9 +446,9 @@ EXPECTED_WRITE_SITE_ROSTER: dict[tuple[str, str], int] = {
     ("switcher.py", "_fetch_active_usage"): 2,
     ("switcher.py", "_resync_rotated_backup"): 1,
     ("switcher.py", "_perform_switch_locked"): 1,
-    # Upstream 1.0 (#523/#571): advances the owning slot's backup to a strictly
-    # newer live generation. Not attributed=True, so the chokepoint still
-    # verifies the bytes belong to that slot before writing.
+    # Upstream 1.0 (#523/#571): tries to advance the owning slot's backup to a
+    # strictly newer live generation. The write is not attributed, so the guard
+    # refuses it when the lineage differs and the rescue returns False.
     ("switcher.py", "_rescue_foreign_successor"): 1,
     ("transfer.py", "import_accounts"): 1,
 }
